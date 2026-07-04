@@ -1,0 +1,15 @@
+[package]
+name = "draco-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Escalation state machine, ranking, and replay orchestrator for Draco."
+
+# The dependency graph is frozen here even though the skeleton does not yet call
+# every crate; WS-C wires Tier 0/1 (net + static), Slice 4 wires Tier 2 (jail + runtime).
+[dependencies]
+draco-types = { workspace = true }
+draco-net = { workspace = true }
+draco-static = { workspace = true }
+draco-jail = { workspace = true }
+draco-runtime = { workspace = true }

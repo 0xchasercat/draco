@@ -1,0 +1,10 @@
+[package]
+name = "draco-jail"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sandbox supervisor + jailed child (netns/Landlock/seccomp) for Draco."
+
+[dependencies]
+draco-types = { workspace = true }
+# Slice 2 spike adds (Linux, cfg-gated): seccompiler, landlock, nix per canonical doc §7 & §14.

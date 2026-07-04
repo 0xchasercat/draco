@@ -1,0 +1,17 @@
+[package]
+name = "draco-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Draco command-line interface."
+
+[[bin]]
+name = "draco"
+path = "src/main.rs"
+
+[dependencies]
+draco-core = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+# WS-D adds: serde_json_path (for --extract) per canonical doc §12 & §14.

@@ -1,0 +1,11 @@
+[package]
+name = "draco-static"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Static (Tier 0) + heuristic API-replay (Tier 1) extraction for Draco."
+
+[dependencies]
+draco-types = { workspace = true }
+serde_json = { workspace = true }
+# WS-B adds: tl (primary parser) and scraper (fallback) per canonical doc §10 & §14.

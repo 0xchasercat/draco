@@ -1,0 +1,11 @@
+[package]
+name = "draco-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Stealth TLS/JA4 HTTP client for Draco."
+
+[dependencies]
+draco-types = { workspace = true }
+bytes = { workspace = true }
+# WS-A adds: wreq = "6.0.0-rc.29", tokio, and robots/backoff deps per canonical doc §9 & §14.

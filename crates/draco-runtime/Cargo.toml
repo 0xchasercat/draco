@@ -1,0 +1,11 @@
+[package]
+name = "draco-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tier 2 V8 isolate + interceptor runtime for Draco."
+
+[dependencies]
+draco-types = { workspace = true }
+# Slice 3 adds: deno_core = "0.406.0", futures (block_on driver) per canonical doc §8 & §14.
+# Snapshot generation lives in build.rs with a vendored, pinned DOM polyfill (no build-time network).
