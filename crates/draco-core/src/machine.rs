@@ -430,7 +430,7 @@ where
 
     // --- Rank + replay the winner -----------------------------------------
     let t_rank = Instant::now();
-    match rank_and_replay(&capture_result, opts, fetcher).await {
+    match rank_and_replay(&capture_result, url, opts, fetcher).await {
         Ok(Some((data, detail))) => {
             // `runtime.rank` picked a viable winner; `runtime.replay` fetched
             // JSON. Charge the replay hop to the network bucket.

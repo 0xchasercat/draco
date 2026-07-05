@@ -96,13 +96,14 @@ pub(crate) fn jail_error(reason: JailKind, detail: impl Into<String>) -> DracoEr
 /// offline-unit-tested core (mock `PageFetcher` + a hand-built `CaptureResult`).
 pub(crate) async fn rank_and_replay<F>(
     capture: &CaptureResult,
+    target_url: &str,
     opts: &draco_net::SessionOpts,
     fetcher: &F,
 ) -> Result<Option<(serde_json::Value, String)>, DracoError>
 where
     F: PageFetcher + ?Sized,
 {
-    let Some((idx, score)) = best_candidate(&capture.candidates) else {
+    let Some((idx, score)) = best_candidate(&capture.candidates, Some(target_url)) else {
         return Ok(None);
     };
     let winner = &capture.candidates[idx];
@@ -612,7 +613,9 @@ mod tests {
             MockFetcher::ok_html(200, "<ignored>").with_replay_json(200, json!({ "price": 42 }));
         let opts = draco_net::SessionOpts::default();
 
-        let out = rank_and_replay(&capture, &opts, &fetcher).await.unwrap();
+        let out = rank_and_replay(&capture, "https://api.example.com/", &opts, &fetcher)
+            .await
+            .unwrap();
         let (data, detail) = out.expect("a viable winner");
         assert_eq!(data, json!({ "price": 42 }));
         assert!(detail.contains("/v1/items"), "detail: {detail}");
@@ -632,7 +635,9 @@ mod tests {
         let fetcher = MockFetcher::ok_html(200, "<ignored>");
         let opts = draco_net::SessionOpts::default();
 
-        let out = rank_and_replay(&capture, &opts, &fetcher).await.unwrap();
+        let out = rank_and_replay(&capture, "https://api.example.com/", &opts, &fetcher)
+            .await
+            .unwrap();
         assert!(out.is_none(), "no viable candidate should yield None");
         // Replay must not even be attempted when nothing is viable.
         assert_eq!(fetcher.replay_calls(), 0);
@@ -649,7 +654,9 @@ mod tests {
         let fetcher = MockFetcher::ok_html(200, "<ignored>").with_replay_status(200);
         let opts = draco_net::SessionOpts::default();
 
-        let out = rank_and_replay(&capture, &opts, &fetcher).await.unwrap();
+        let out = rank_and_replay(&capture, "https://api.example.com/", &opts, &fetcher)
+            .await
+            .unwrap();
         assert!(
             out.is_none(),
             "non-JSON replay body must not finalize success"
@@ -665,7 +672,9 @@ mod tests {
         )]);
         let fetcher = MockFetcher::ok_html(200, "<ignored>").with_replay_status(500);
         let opts = draco_net::SessionOpts::default();
-        let out = rank_and_replay(&capture, &opts, &fetcher).await.unwrap();
+        let out = rank_and_replay(&capture, "https://api.example.com/", &opts, &fetcher)
+            .await
+            .unwrap();
         assert!(out.is_none(), "5xx replay must not finalize success");
     }
 
@@ -682,7 +691,7 @@ mod tests {
             detail: "replay timed out".into(),
         });
         let opts = draco_net::SessionOpts::default();
-        let err = rank_and_replay(&capture, &opts, &fetcher)
+        let err = rank_and_replay(&capture, "https://api.example.com/", &opts, &fetcher)
             .await
             .unwrap_err();
         assert!(matches!(err, DracoError::Network { .. }));
