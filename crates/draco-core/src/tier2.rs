@@ -12,11 +12,13 @@
 //!    body, collect `Intercept`s until the terminal `Result`), and returns the
 //!    captured requests + outcome. With the feature OFF, the seam is
 //!    [`DisabledCapture`], which reports "built without tier2".
-//! 2. **Rank + replay.** [`best_candidate`](crate::ranking::best_candidate) picks
-//!    the most data-endpoint-like intercept; if it clears
-//!    [`MIN_VIABLE_SCORE`](crate::ranking::MIN_VIABLE_SCORE) it is replayed
-//!    through the [`PageFetcher`] seam. A JSON body finalizes `Success` /
-//!    `SourceTier::RuntimeInterception`; otherwise the run is `Unsupported`.
+//! 2. **Rank + replay.** [`best_replayable`](crate::ranking::best_replayable)
+//!    picks the most data-endpoint-like intercept that is *also* safe to replay;
+//!    if it clears [`MIN_VIABLE_SCORE`](crate::ranking::MIN_VIABLE_SCORE) it is
+//!    replayed through the [`PageFetcher`] seam. A JSON body finalizes `Success`
+//!    / `SourceTier::RuntimeInterception`; otherwise the run is `Unsupported`.
+//!    A state-changing request (unsafe method, not a GraphQL/JSON-RPC read) is
+//!    withheld from replay unless `Config::allow_unsafe_replay` is set.
 //!
 //! ## Why a capture *seam*
 //!
@@ -41,7 +43,7 @@ use async_trait::async_trait;
 use draco_types::{DracoError, JailKind, RuntimeOutcome};
 
 use crate::fetcher::PageFetcher;
-use crate::ranking::{best_candidate, Candidate};
+use crate::ranking::{best_candidate, best_replayable, Candidate};
 use crate::Config;
 
 // ===========================================================================
@@ -86,12 +88,67 @@ pub(crate) fn jail_error(reason: JailKind, detail: impl Into<String>) -> DracoEr
     }
 }
 
+/// Why a rank+replay produced no data — used to make an `Ok(None)` outcome
+/// observable in the ladder trace. Ranking-safety in particular must be visible:
+/// the operator needs to know a viable endpoint was *withheld* for safety (and
+/// that `--allow-unsafe-replay` would have replayed it), not merely that nothing
+/// looked like data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoReplayReason {
+    /// No intercept cleared [`MIN_VIABLE_SCORE`](crate::ranking::MIN_VIABLE_SCORE).
+    NoViableCandidate,
+    /// A viable top candidate existed but every viable candidate was an unsafe
+    /// state-changing request skipped by the mutation-safety policy. Nothing was
+    /// replayed; `--allow-unsafe-replay` would override this.
+    UnsafeSkipped,
+    /// The chosen winner replayed but the response was non-2xx or not JSON.
+    ReplayNotJson,
+}
+
+impl NoReplayReason {
+    /// A short, log-safe note for the `runtime.rank` trace step.
+    pub(crate) fn note(self) -> &'static str {
+        match self {
+            NoReplayReason::NoViableCandidate => "no viable JSON endpoint among intercepts",
+            NoReplayReason::UnsafeSkipped => {
+                "viable endpoint withheld: unsafe state-changing method \
+                 (use --allow-unsafe-replay to replay it)"
+            }
+            NoReplayReason::ReplayNotJson => "winner replay was non-2xx or not JSON",
+        }
+    }
+}
+
+/// Classify *why* [`rank_and_replay`] found nothing to replay, so the ladder can
+/// record a precise trace note. Distinguishes "nothing viable" from "a viable
+/// candidate was withheld purely for mutation-safety" (the latter only when
+/// `allow_unsafe` is off). Pure + cheap — re-derived from the same ranking fns.
+pub(crate) fn no_replay_reason(capture: &CaptureResult, target_url: &str) -> NoReplayReason {
+    // If a viable candidate exists at all but none is replay-eligible under the
+    // safe policy, the miss is a safety skip; otherwise nothing was viable.
+    let has_viable = best_candidate(&capture.candidates, Some(target_url)).is_some();
+    let has_safe_eligible = best_replayable(&capture.candidates, Some(target_url), false).is_some();
+    if has_viable && !has_safe_eligible {
+        NoReplayReason::UnsafeSkipped
+    } else {
+        NoReplayReason::NoViableCandidate
+    }
+}
+
 /// Rank a capture result and replay the winner, producing the finalized
-/// `(data, detail)` on success or `None` when nothing viable was found.
+/// `(data, detail)` on success or `None` when nothing viable/eligible was found.
+///
+/// Replay-selection applies the **mutation-safety policy**
+/// ([`best_replayable`]): a state-changing request (e.g. `POST /api/cart/add`)
+/// is never blind-replayed. When the top-ranked candidate is unsafe it is
+/// skipped in favor of the next eligible one; if nothing eligible remains this
+/// returns `Ok(None)` and the ladder finalizes `Unsupported`. `allow_unsafe`
+/// (from `Config::allow_unsafe_replay`) disables the screen so anything the
+/// ranker picks is replayed.
 ///
 /// Async because replay goes through the [`PageFetcher`] seam. Returns
 /// `Ok(Some((json, detail)))` on a JSON-bodied winner, `Ok(None)` when no
-/// candidate clears the viability bar, the replay was non-2xx, or the body is not
+/// candidate is viable+eligible, the replay was non-2xx, or the body is not
 /// JSON, and `Err(..)` only on a replay transport failure. This is the
 /// offline-unit-tested core (mock `PageFetcher` + a hand-built `CaptureResult`).
 pub(crate) async fn rank_and_replay<F>(
@@ -99,11 +156,19 @@ pub(crate) async fn rank_and_replay<F>(
     target_url: &str,
     opts: &draco_net::SessionOpts,
     fetcher: &F,
+    allow_unsafe: bool,
 ) -> Result<Option<(serde_json::Value, String)>, DracoError>
 where
     F: PageFetcher + ?Sized,
 {
-    let Some((idx, score)) = best_candidate(&capture.candidates, Some(target_url)) else {
+    let Some((idx, score)) = best_replayable(&capture.candidates, Some(target_url), allow_unsafe)
+    else {
+        // Surface *why* on stderr so the reason is visible even outside the
+        // trace (machine also records a precise note via `no_replay_reason`).
+        let reason = no_replay_reason(capture, target_url);
+        if reason == NoReplayReason::UnsafeSkipped {
+            eprintln!("draco-core: Tier 2 {}", reason.note());
+        }
         return Ok(None);
     };
     let winner = &capture.candidates[idx];
@@ -613,7 +678,7 @@ mod tests {
             MockFetcher::ok_html(200, "<ignored>").with_replay_json(200, json!({ "price": 42 }));
         let opts = draco_net::SessionOpts::default();
 
-        let out = rank_and_replay(&capture, "https://api.example.com/", &opts, &fetcher)
+        let out = rank_and_replay(&capture, "https://api.example.com/", &opts, &fetcher, false)
             .await
             .unwrap();
         let (data, detail) = out.expect("a viable winner");
@@ -635,7 +700,7 @@ mod tests {
         let fetcher = MockFetcher::ok_html(200, "<ignored>");
         let opts = draco_net::SessionOpts::default();
 
-        let out = rank_and_replay(&capture, "https://api.example.com/", &opts, &fetcher)
+        let out = rank_and_replay(&capture, "https://api.example.com/", &opts, &fetcher, false)
             .await
             .unwrap();
         assert!(out.is_none(), "no viable candidate should yield None");
@@ -654,7 +719,7 @@ mod tests {
         let fetcher = MockFetcher::ok_html(200, "<ignored>").with_replay_status(200);
         let opts = draco_net::SessionOpts::default();
 
-        let out = rank_and_replay(&capture, "https://api.example.com/", &opts, &fetcher)
+        let out = rank_and_replay(&capture, "https://api.example.com/", &opts, &fetcher, false)
             .await
             .unwrap();
         assert!(
@@ -672,7 +737,7 @@ mod tests {
         )]);
         let fetcher = MockFetcher::ok_html(200, "<ignored>").with_replay_status(500);
         let opts = draco_net::SessionOpts::default();
-        let out = rank_and_replay(&capture, "https://api.example.com/", &opts, &fetcher)
+        let out = rank_and_replay(&capture, "https://api.example.com/", &opts, &fetcher, false)
             .await
             .unwrap();
         assert!(out.is_none(), "5xx replay must not finalize success");
@@ -691,9 +756,82 @@ mod tests {
             detail: "replay timed out".into(),
         });
         let opts = draco_net::SessionOpts::default();
-        let err = rank_and_replay(&capture, "https://api.example.com/", &opts, &fetcher)
+        let err = rank_and_replay(&capture, "https://api.example.com/", &opts, &fetcher, false)
             .await
             .unwrap_err();
         assert!(matches!(err, DracoError::Network { .. }));
+    }
+
+    // ---- mutation-safety at replay time ----
+
+    /// Build a capture with a single unsafe state-changing POST (same-origin,
+    /// api path, JSON *intent* via Accept → viable at 23, but NOT a read: no
+    /// query-path marker and no JSON request content-type). The parallel body is
+    /// present so the `allow_unsafe` replay path exercises body attachment too.
+    fn unsafe_post_capture() -> CaptureResult {
+        CaptureResult {
+            candidates: vec![Candidate {
+                method: "POST".into(),
+                url: "https://shop.example.com/api/cart/add".into(),
+                headers: vec![("accept".into(), "application/json".into())],
+                via: InterceptVia::Fetch,
+            }],
+            bodies: vec![Some(br#"{"sku":"ABC","qty":1}"#.to_vec())],
+            outcome: RuntimeOutcome::Quiesced,
+        }
+    }
+
+    #[tokio::test]
+    async fn rank_and_replay_withholds_unsafe_post_by_default() {
+        let capture = unsafe_post_capture();
+        // Replay would 200-with-JSON *if* attempted — proving the None is a
+        // safety withhold, not a replay miss.
+        let fetcher =
+            MockFetcher::ok_html(200, "<ignored>").with_replay_json(200, json!({ "ok": true }));
+        let opts = draco_net::SessionOpts::default();
+
+        let out = rank_and_replay(
+            &capture,
+            "https://shop.example.com/",
+            &opts,
+            &fetcher,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.is_none(),
+            "an unsafe-POST-only capture must yield Ok(None) by default"
+        );
+        assert_eq!(
+            fetcher.replay_calls(),
+            0,
+            "the unsafe POST must never be replayed in safe mode"
+        );
+        // And the miss is classified as a safety skip (observable in the trace).
+        assert_eq!(
+            no_replay_reason(&capture, "https://shop.example.com/"),
+            NoReplayReason::UnsafeSkipped
+        );
+    }
+
+    #[tokio::test]
+    async fn rank_and_replay_replays_unsafe_post_when_allowed() {
+        let capture = unsafe_post_capture();
+        let fetcher = MockFetcher::ok_html(200, "<ignored>")
+            .with_replay_json(200, json!({ "cart": { "count": 1 } }));
+        let opts = draco_net::SessionOpts::default();
+
+        let out = rank_and_replay(&capture, "https://shop.example.com/", &opts, &fetcher, true)
+            .await
+            .unwrap();
+        let (data, detail) = out.expect("allow_unsafe must replay the winner");
+        assert_eq!(data, json!({ "cart": { "count": 1 } }));
+        assert!(detail.contains("/api/cart/add"), "detail: {detail}");
+        assert_eq!(
+            fetcher.replay_calls(),
+            1,
+            "the winner must be replayed once"
+        );
     }
 }

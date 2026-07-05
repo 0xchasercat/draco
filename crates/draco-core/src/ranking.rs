@@ -44,8 +44,10 @@
 //! particular there is no write-method penalty: GraphQL and JSON-RPC issue their
 //! *reads* over `POST`, so penalizing `POST` would wrongly demote the single most
 //! common POST-based data API. The flip side — never blind-replaying a genuine
-//! state-changing mutation — is a real concern tracked as a post-v0.1 refinement
-//! (a safe-method / dry-run policy), not something the flat §11 table addresses.
+//! state-changing mutation — is handled where it belongs, at **replay** time:
+//! see [`best_replayable`] and [`is_safe_method`] / [`is_read_style_post`]. It
+//! screens the ranked candidates so an unsafe non-read `POST` is skipped in
+//! favor of the next eligible one, without perturbing the scoring table.
 
 use draco_types::{HttpRequestSpec, InterceptVia};
 
@@ -279,7 +281,11 @@ fn is_versioned_path(path: &str) -> bool {
 /// for the same-origin signal. Ties break toward the earliest intercept
 /// (stable), matching capture order.
 ///
-/// This is the entry point Slice 4 calls with the collected Tier 2 intercepts.
+/// This is the pure ranking primitive. For **replay**, prefer
+/// [`best_replayable`], which additionally screens out unsafe state-changing
+/// methods before handing a winner to the network — ranking deliberately does
+/// not penalize `POST` (see the module docs), so mutation-safety must be applied
+/// at replay time.
 pub fn best_candidate(candidates: &[Candidate], target_url: Option<&str>) -> Option<(usize, i32)> {
     candidates
         .iter()
@@ -289,6 +295,112 @@ pub fn best_candidate(candidates: &[Candidate], target_url: Option<&str>) -> Opt
         // max_by keeps the *last* max on ties; reverse the index comparison so
         // the earliest capture wins instead.
         .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
+}
+
+// ---------------------------------------------------------------------------
+// Mutation-safety (replay policy)
+// ---------------------------------------------------------------------------
+//
+// Ranking scores a request by how *data-endpoint-like* it looks and never by
+// its HTTP method: GraphQL and JSON-RPC issue their reads over POST, so a
+// method penalty would demote the single most common POST-based data API. That
+// leaves a real hazard — blind-replaying a genuine state-changing mutation
+// (e.g. `POST /api/cart/add`) — which we address here, at *replay* selection
+// time rather than in the flat scoring table. A candidate is replay-eligible
+// only if it is an idempotent/safe method, OR it is a recognizable read issued
+// over POST (GraphQL/JSON-RPC), OR the operator has explicitly opted in to
+// replaying anything the ranker picks.
+
+/// HTTP methods considered inherently side-effect-free (safe to replay blindly):
+/// `GET`, `HEAD`, `OPTIONS`. Case-insensitive.
+pub fn is_safe_method(method: &str) -> bool {
+    let m = method.trim();
+    m.eq_ignore_ascii_case("GET")
+        || m.eq_ignore_ascii_case("HEAD")
+        || m.eq_ignore_ascii_case("OPTIONS")
+}
+
+/// URL-path markers that identify a POST/PUT body as a *read* transport
+/// (GraphQL / JSON-RPC / query endpoints) rather than a mutation.
+const READ_POST_PATH_MARKERS: &[&str] = &["/graphql", "/gql", "/rpc", "/query"];
+
+/// Is this candidate a **read issued over POST/PUT** — a GraphQL / JSON-RPC
+/// style query rather than a state-changing mutation? True when the method is
+/// `POST`/`PUT` *and* either the path names a query transport
+/// (`/graphql`, `/gql`, `/rpc`, `/query`) or the request carries a JSON/GraphQL
+/// content-type (the shape those reads use). Such requests are safe to replay
+/// even though they are not GET, because they fetch rather than mutate.
+///
+/// Note this is intentionally conservative: an unrecognized `POST /api/cart/add`
+/// with a JSON body is *not* a read (its path is not a query marker and — see
+/// below — a bare JSON content-type alone is not enough to make a mutation look
+/// like a read). We only treat a POST as read-style when its *path* is a query
+/// transport, or when JSON intent is present on a path that is not obviously a
+/// mutation endpoint. The bar is: query-marker path OR JSON/GraphQL body type.
+pub fn is_read_style_post(c: &Candidate) -> bool {
+    let m = c.method.trim();
+    if !(m.eq_ignore_ascii_case("POST") || m.eq_ignore_ascii_case("PUT")) {
+        return false;
+    }
+    let (_host, path, _q) = dissect(&c.url);
+    let path_lc = path.to_ascii_lowercase();
+    if READ_POST_PATH_MARKERS.iter().any(|m| path_lc.contains(m)) {
+        return true;
+    }
+    // A JSON/GraphQL request content-type is the other hallmark of a
+    // GraphQL/JSON-RPC read (they POST a JSON `{query|method|params}` envelope).
+    has_json_content_type(c)
+}
+
+/// True if the request declares a JSON or GraphQL *request body* content-type —
+/// the body shape GraphQL/JSON-RPC reads use. (Distinct from [`has_json_intent`],
+/// which also accepts an `Accept:` header — here we look only at what is being
+/// *sent*, since a mutation could also `Accept: application/json` back.)
+fn has_json_content_type(c: &Candidate) -> bool {
+    if let Some(ct) = header(&c.headers, "content-type") {
+        let ct = ct.to_ascii_lowercase();
+        return ct.contains("application/json")
+            || ct.contains("application/graphql")
+            || ct.contains("+json");
+    }
+    false
+}
+
+/// Rank a batch of intercepts like [`best_candidate`], but return the
+/// highest-scoring *viable* candidate that is also **replay-eligible** under the
+/// mutation-safety policy. Eligibility is
+/// `is_safe_method(method) || is_read_style_post(c) || allow_unsafe`.
+///
+/// Candidates are considered in descending score (ties → earliest, matching
+/// [`best_candidate`]); the first that is replay-eligible wins. So a top-scoring
+/// but unsafe non-read `POST` (e.g. `POST /api/cart/add`) is **skipped** in favor
+/// of the next eligible candidate — a lower-scored safe `GET`, say — and if none
+/// of the viable candidates are eligible, this returns `None`. With
+/// `allow_unsafe = true` the safety screen is disabled and this behaves exactly
+/// like [`best_candidate`].
+pub fn best_replayable(
+    candidates: &[Candidate],
+    target_url: Option<&str>,
+    allow_unsafe: bool,
+) -> Option<(usize, i32)> {
+    // Collect viable candidates, then sort by the same order best_candidate uses
+    // (score desc, earliest index on ties) and pick the first replay-eligible one.
+    let mut viable: Vec<(usize, i32)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i, score_request(c, target_url)))
+        .filter(|(_, s)| *s >= MIN_VIABLE_SCORE)
+        .collect();
+    // Descending score; on equal score, ascending index (earliest wins).
+    viable.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    viable
+        .into_iter()
+        .find(|(i, _)| is_replay_eligible(&candidates[*i], allow_unsafe))
+}
+
+/// Is this candidate allowed to be replayed under the mutation-safety policy?
+fn is_replay_eligible(c: &Candidate, allow_unsafe: bool) -> bool {
+    allow_unsafe || is_safe_method(&c.method) || is_read_style_post(c)
 }
 
 #[cfg(test)]
@@ -445,6 +557,156 @@ mod tests {
         let cands = vec![one, two];
         let (idx, _) = best_candidate(&cands, target).unwrap();
         assert_eq!(idx, 0, "ties should break toward the earliest capture");
+    }
+
+    // ---- mutation-safety replay policy ----
+
+    #[test]
+    fn is_safe_method_covers_read_verbs_case_insensitively() {
+        for m in ["GET", "get", "Head", "HEAD", "options", "OPTIONS"] {
+            assert!(is_safe_method(m), "{m} should be safe");
+        }
+        for m in ["POST", "put", "PATCH", "DELETE", "connect", ""] {
+            assert!(!is_safe_method(m), "{m} should NOT be safe");
+        }
+    }
+
+    #[test]
+    fn is_read_style_post_recognizes_graphql_and_jsonrpc() {
+        // GraphQL POST by path.
+        let gql_path = Candidate {
+            method: "POST".into(),
+            url: "https://shop.example.com/graphql".into(),
+            headers: Vec::new(),
+            via: InterceptVia::Fetch,
+        };
+        assert!(is_read_style_post(&gql_path));
+
+        // JSON-RPC style path.
+        let rpc = Candidate {
+            method: "POST".into(),
+            url: "https://shop.example.com/rpc".into(),
+            headers: Vec::new(),
+            via: InterceptVia::Fetch,
+        };
+        assert!(is_read_style_post(&rpc));
+
+        // POST with a JSON body content-type (GraphQL/JSON-RPC envelope) — read.
+        let json_body = Candidate {
+            method: "POST".into(),
+            url: "https://shop.example.com/data".into(),
+            headers: hdr(&[("content-type", "application/json")]),
+            via: InterceptVia::Fetch,
+        };
+        assert!(is_read_style_post(&json_body));
+
+        // PUT counts too (also a non-mutating query transport in some APIs).
+        let put_gql = Candidate {
+            method: "PUT".into(),
+            url: "https://shop.example.com/gql".into(),
+            headers: Vec::new(),
+            via: InterceptVia::Fetch,
+        };
+        assert!(is_read_style_post(&put_gql));
+    }
+
+    #[test]
+    fn is_read_style_post_rejects_plain_mutations_and_gets() {
+        // A bare state-changing POST with no JSON body / query path is NOT a read.
+        let cart_add = Candidate {
+            method: "POST".into(),
+            url: "https://shop.example.com/api/cart/add".into(),
+            headers: hdr(&[("content-type", "application/x-www-form-urlencoded")]),
+            via: InterceptVia::Fetch,
+        };
+        assert!(!is_read_style_post(&cart_add));
+
+        // A GET is never "read-style POST" (it's just safe) — the predicate is
+        // specifically about POST/PUT reads.
+        let get = Candidate::get("https://shop.example.com/api/products", InterceptVia::Fetch);
+        assert!(!is_read_style_post(&get));
+    }
+
+    #[test]
+    fn best_replayable_allows_same_origin_graphql_post_read() {
+        // A same-origin GraphQL POST read scores 23 and is replay-eligible.
+        let target = Some("https://shop.example.com/");
+        let cands = vec![Candidate {
+            method: "POST".into(),
+            url: "https://shop.example.com/graphql".into(),
+            headers: hdr(&[
+                ("content-type", "application/json"),
+                ("accept", "application/json"),
+            ]),
+            via: InterceptVia::Fetch,
+        }];
+        let (idx, score) = best_replayable(&cands, target, false).expect("eligible GraphQL read");
+        assert_eq!(idx, 0);
+        assert!(score >= MIN_VIABLE_SCORE);
+    }
+
+    #[test]
+    fn best_replayable_skips_unsafe_post_and_falls_through_to_safe_get() {
+        // The top-scoring intercept is an unsafe mutation POST (same-origin, api
+        // path, json body → 23). A lower-scored safe GET (same-origin api path →
+        // 18) is present. By default the unsafe POST is skipped and the GET wins.
+        let target = Some("https://shop.example.com/");
+        // Unsafe mutation POST: same-origin(10) + api-path(8) + json-intent(5 via
+        // the *Accept* header, NOT a JSON request body) = 23. It out-scores the
+        // GET, yet is not read-style (its path is not a query transport and it
+        // sends no JSON/GraphQL request content-type), so it must be skipped.
+        let unsafe_post = Candidate {
+            method: "POST".into(),
+            url: "https://shop.example.com/api/cart/add".into(),
+            headers: hdr(&[("accept", "application/json")]),
+            via: InterceptVia::Fetch,
+        };
+        // Safe GET: same-origin(10) + api-path(8, /api/ + /v1/) = 18.
+        let safe_get = Candidate::get(
+            "https://shop.example.com/api/v1/items?id=1",
+            InterceptVia::Fetch,
+        );
+        // Sanity: the POST really does out-score the GET (so we know we're
+        // testing the safety skip, not just ranking order), and is genuinely
+        // not read-style.
+        assert!(
+            score_request(&unsafe_post, target) > score_request(&safe_get, target),
+            "test premise: unsafe POST must out-score the safe GET"
+        );
+        assert!(
+            !is_read_style_post(&unsafe_post),
+            "test premise: the POST must be a genuine (non-read) mutation"
+        );
+        let cands = vec![unsafe_post, safe_get];
+
+        // Default (safe) mode: skip the POST, fall through to the GET at idx 1.
+        let (idx, _s) = best_replayable(&cands, target, false).expect("falls through to safe GET");
+        assert_eq!(idx, 1, "unsafe POST must be skipped for the safe GET");
+
+        // allow_unsafe: the top-scoring POST is now eligible and wins (idx 0),
+        // matching best_candidate.
+        let (uidx, _us) = best_replayable(&cands, target, true).expect("unsafe allowed");
+        assert_eq!(uidx, 0);
+        assert_eq!(best_candidate(&cands, target).map(|(i, _)| i), Some(0));
+    }
+
+    #[test]
+    fn best_replayable_none_when_only_unsafe_post_and_not_allowed() {
+        // The single viable candidate is an unsafe mutation POST. Default mode
+        // yields None (nothing eligible); allow_unsafe replays it.
+        let target = Some("https://shop.example.com/");
+        let cands = vec![Candidate {
+            method: "POST".into(),
+            url: "https://shop.example.com/api/cart/add".into(),
+            headers: hdr(&[("content-type", "application/x-www-form-urlencoded")]),
+            via: InterceptVia::Fetch,
+        }];
+        assert!(
+            best_replayable(&cands, target, false).is_none(),
+            "unsafe-only capture must yield no replayable candidate by default"
+        );
+        let (idx, _s) = best_replayable(&cands, target, true).expect("allowed under override");
+        assert_eq!(idx, 0);
     }
 
     #[test]

@@ -59,8 +59,9 @@ pub use machine::{clamp_tier_max, session_opts, ProdStatic, StaticEngine, TIER_C
 #[cfg(feature = "tier2")]
 pub use draco_jail::{run_jail_child, spawn_jail, JailHandle};
 pub use ranking::{
-    best_candidate, score_request, Candidate, MIN_VIABLE_SCORE, PENALTY_ANALYTICS,
-    PENALTY_STATIC_ASSET, SCORE_API_PATH, SCORE_JSON, SCORE_SAME_ORIGIN,
+    best_candidate, best_replayable, is_read_style_post, is_safe_method, score_request, Candidate,
+    MIN_VIABLE_SCORE, PENALTY_ANALYTICS, PENALTY_STATIC_ASSET, SCORE_API_PATH, SCORE_JSON,
+    SCORE_SAME_ORIGIN,
 };
 
 /// Orchestration configuration, assembled by the CLI from flags/env/config file.
@@ -75,6 +76,12 @@ pub struct Config {
     pub capture_window_ms: u64,
     /// Dev-only: run Tier 2 un-jailed.
     pub no_jail: bool,
+    /// Allow Tier 2 to replay a state-changing request (an unsafe HTTP method
+    /// that is not a GraphQL/JSON-RPC read) that the ranking picked. Off by
+    /// default: mutation-safety withholds such a request from replay and the run
+    /// falls through to `Unsupported` (see [`ranking::best_replayable`]). Set via
+    /// the CLI `--allow-unsafe-replay` flag when the side effect is intended.
+    pub allow_unsafe_replay: bool,
 }
 
 impl Default for Config {
@@ -87,6 +94,7 @@ impl Default for Config {
             tier_max: 2,
             capture_window_ms: 2_000,
             no_jail: false,
+            allow_unsafe_replay: false,
         }
     }
 }
