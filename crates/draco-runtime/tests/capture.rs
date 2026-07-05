@@ -505,3 +505,102 @@ fn static_body_content_survives_to_serialized_dom() {
         "missing static body: {dom}"
     );
 }
+
+// ---- ES-module + external-script support (run_capture_with_resources) --------
+use draco_runtime::run_capture_with_resources;
+use std::collections::HashMap;
+
+#[test]
+fn external_classic_script_from_resources_executes() {
+    // The app ships its bundle as an EXTERNAL classic <script src>. The supervisor
+    // prefetches it; the isolate runs it from the resource map and captures its fetch.
+    let html = r#"<!doctype html><html><head></head><body>
+        <div id="app"></div>
+        <script src="/static/app.js"></script>
+      </body></html>"#;
+    let mut res: HashMap<String, Vec<u8>> = HashMap::new();
+    res.insert(
+        "https://shop.example.com/static/app.js".into(),
+        b"fetch('/api/products', { headers: { accept: 'application/json' } });".to_vec(),
+    );
+    let report = run_capture_with_resources("https://shop.example.com/", html, &cfg(), res);
+    let req =
+        find(&report.requests, "/api/products").expect("no /api/products from external script");
+    assert_eq!(req.via, InterceptVia::Fetch);
+}
+
+#[test]
+fn inline_es_module_hydrates_and_fetches() {
+    // <script type="module"> uses import syntax — must run via the module loader,
+    // not execute_script. It mounts content and fires a data fetch.
+    let html = r#"<!doctype html><html><head></head><body>
+        <div id="root"></div>
+        <script type="module">
+          const el = document.getElementById('root');
+          const h = document.createElement('h1');
+          h.textContent = 'Module hydrated';
+          el.appendChild(h);
+          fetch('/api/data', { headers: { accept: 'application/json' } });
+        </script>
+      </body></html>"#;
+    let report =
+        run_capture_with_resources("https://app.example.com/", html, &cfg(), HashMap::new());
+    let req = find(&report.requests, "/api/data").expect("no /api/data from inline module");
+    assert_eq!(req.via, InterceptVia::Fetch);
+    // The module actually mutated the DOM.
+    let dom = report.rendered_html.expect("serialized DOM");
+    assert!(
+        dom.contains("Module hydrated"),
+        "module DOM mutation missing: {dom}"
+    );
+}
+
+#[test]
+fn external_module_with_static_and_dynamic_imports() {
+    // Entry module statically imports a helper and dynamically imports another;
+    // both are served from the prefetched map. The dynamic import drives a fetch.
+    let html = r#"<!doctype html><html><head></head><body>
+        <script type="module" src="/m/entry.js"></script>
+      </body></html>"#;
+    let mut res: HashMap<String, Vec<u8>> = HashMap::new();
+    res.insert(
+        "https://app.example.com/m/entry.js".into(),
+        b"import { tag } from './util.js'; document.title = tag('ready'); import('./lazy.js');"
+            .to_vec(),
+    );
+    res.insert(
+        "https://app.example.com/m/util.js".into(),
+        b"export const tag = (s) => '[' + s + ']';".to_vec(),
+    );
+    res.insert(
+        "https://app.example.com/m/lazy.js".into(),
+        b"fetch('/api/lazy', { headers: { accept: 'application/json' } });".to_vec(),
+    );
+    let report = run_capture_with_resources("https://app.example.com/page", html, &cfg(), res);
+    let req = find(&report.requests, "/api/lazy").expect("no /api/lazy from dynamic import");
+    assert_eq!(req.via, InterceptVia::Fetch);
+}
+
+#[test]
+fn missing_dynamic_import_does_not_crash() {
+    // A dynamic import the supervisor could not prefetch resolves to an empty
+    // module (graceful) rather than throwing — the earlier work still counts.
+    let html = r#"<!doctype html><html><head></head><body>
+        <script type="module">
+          document.title = 'before';
+          import('/chunks/never-fetched.js').catch(() => {});
+          fetch('/api/ok', { headers: { accept: 'application/json' } });
+        </script>
+      </body></html>"#;
+    let report =
+        run_capture_with_resources("https://app.example.com/", html, &cfg(), HashMap::new());
+    assert!(
+        matches!(
+            report.outcome,
+            RuntimeOutcome::Quiesced | RuntimeOutcome::WindowClosed
+        ),
+        "unexpected outcome: {:?}",
+        report.outcome
+    );
+    find(&report.requests, "/api/ok").expect("fetch after missing import should still fire");
+}
