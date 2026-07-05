@@ -8,6 +8,12 @@ description = "Sandbox supervisor + jailed child (netns/Landlock/seccomp) for Dr
 [dependencies]
 # Portable: the frozen wire contract + the IPC frame codec (spec §6).
 draco-types = { workspace = true }
+# Tier 2 (Slice 4): the jailed child hosts the V8 capture runtime. draco-jail is
+# itself an OPTIONAL, tier2-gated dependency of draco-core/draco-cli (canonical
+# §4), so pulling deno_core/V8 in transitively here only ever compiles into the
+# build when `tier2` is enabled upstream — the `--no-default-features` lean build
+# never reaches this crate at all.
+draco-runtime = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 

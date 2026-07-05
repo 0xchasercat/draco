@@ -16,14 +16,22 @@
 //! degrades to running the payload **un-jailed** with a loud warning (see
 //! [`spawn_jail`] / [`run_jail_child`]).
 //!
-//! ## Slice 2 scope
+//! ## Scope (Slice 4)
 //!
-//! This is the sandbox *scaffold*. The child payload here is a trivial echo loop,
-//! **not** a V8 isolate — deno_core/V8 arrives in Slice 3. The goal is a correct,
-//! compiling jail whose runtime enforcement (seccomp kills, netns, Landlock) is
-//! validated on bare-metal Linux (≥ 5.13 with unprivileged user namespaces);
-//! those behaviours cannot be exercised in every CI sandbox and their tests are
-//! marked `#[ignore]`.
+//! The jailed child now hosts the **real** Tier 2 capture: after the sandbox is
+//! armed, [`run_jail_child`] reads a `Hydrate` frame and drives
+//! `draco_runtime::run_capture` (a V8 isolate + fetch/XHR interceptor), streaming
+//! each captured request back as a `JailToSupervisor::Intercept` and a terminal
+//! `Result` (see [`runtime_payload`]). The Slice 2 echo ([`payload`]) is retained
+//! only for its portable frame-plumbing unit tests.
+//!
+//! Runtime enforcement of the sandbox (seccomp kills, netns air-gap, Landlock)
+//! and the *jailed* V8 syscall surface can only be validated on bare-metal Linux
+//! (kernel ≥ 5.13 with unprivileged user namespaces). Those behaviours cannot be
+//! exercised in the build sandbox (kernel 5.10, no unprivileged userns), so their
+//! tests are marked `#[ignore]` and the seccomp allowlist for V8 is built from
+//! knowledge and MUST be validated/iterated on bare metal (run under seccomp,
+//! observe `SIGSYS`, add the offending syscall, repeat).
 //!
 //! **Frozen public API** — the signatures of [`JailHandle`], [`JailError`],
 //! [`spawn_jail`], and [`run_jail_child`] are fixed by the workspace contract.
@@ -32,6 +40,10 @@
 pub mod frame;
 
 pub(crate) mod payload;
+
+/// Slice 4 runtime payload: the jailed child hosts `draco-runtime`'s V8 capture.
+/// Replaces the Slice 2 echo ([`payload`]) at the real child entry points.
+pub(crate) mod runtime_payload;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -117,9 +129,10 @@ pub fn spawn_jail() -> Result<JailHandle, JailError> {
 /// Child-side entry, invoked when the binary re-execs itself as `draco __jail`.
 ///
 /// Opens the inherited fd-3 socket, applies the namespace/Landlock/seccomp
-/// lockdown, then runs the Slice 2 payload loop (read a frame, echo a reply).
-/// Never returns: it exits the process on a clean shutdown or on any fatal setup
-/// error.
+/// lockdown, then runs the Tier 2 capture payload: read a `Hydrate`, drive the V8
+/// isolate via `draco-runtime`, stream `Intercept` frames + a terminal `Result`
+/// ([`runtime_payload`]). Never returns: it exits the process on a clean
+/// shutdown / completed capture or on any fatal setup error.
 pub fn run_jail_child() -> ! {
     #[cfg(target_os = "linux")]
     {
@@ -133,3 +146,14 @@ pub fn run_jail_child() -> ! {
 
 /// The raw fd the child inherits its IPC socket on (canonical spec §6/§7).
 pub const JAIL_IPC_FD: i32 = 3;
+
+/// Environment variable the supervisor sets on the re-exec'd child to request the
+/// **un-jailed** dev path (`--no-jail`): when present (any value), the Linux child
+/// entry SKIPS the namespace/rlimit/Landlock/seccomp lockdown and runs the capture
+/// payload directly. This exists so the `draco __jail` hook stays a single call
+/// (`run_jail_child`) — the child decides whether to arm based on this marker,
+/// which only the dev `no_jail` spawn ever sets.
+///
+/// SECURITY: production never sets this. It weakens the sandbox to nothing, so it
+/// is strictly a local-debugging affordance (the spawn logs a loud warning).
+pub const JAIL_NO_SANDBOX_ENV: &str = "DRACO_JAIL_NO_SANDBOX";

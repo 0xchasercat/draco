@@ -705,6 +705,7 @@ dependencies = [
  "draco-runtime",
  "draco-static",
  "draco-types",
+ "libc",
  "serde_json",
  "tokio",
  "url",
@@ -714,6 +715,7 @@ dependencies = [
 name = "draco-jail"
 version = "0.1.0"
 dependencies = [
+ "draco-runtime",
  "draco-types",
  "landlock",
  "libc",

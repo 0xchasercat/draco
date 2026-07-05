@@ -18,6 +18,9 @@ use draco_types::{DracoError, ExtractedData, HttpRequestSpec, HttpResponseMeta};
 
 use crate::fetcher::PageFetcher;
 use crate::machine::StaticEngine;
+use crate::ranking::Candidate;
+use crate::tier2::{CaptureResult, Tier2Capture};
+use draco_types::RuntimeOutcome;
 
 /// A scripted [`PageFetcher`]: `fetch` returns one canned response (or error),
 /// `replay` returns another. Records call counts so tests can assert a tier was
@@ -97,6 +100,17 @@ pub fn err_fetcher(e: DracoError) -> MockFetcher {
     MockFetcher {
         fetch_result: Err(e),
         replay_result: Ok(html_response(404, b"", &[])),
+        fetch_calls: AtomicUsize::new(0),
+        replay_calls: AtomicUsize::new(0),
+    }
+}
+
+/// A fetcher whose `fetch` succeeds (empty 200) but whose `replay` always errors
+/// — for exercising the Tier 2 replay-failure path.
+pub fn err_replay_fetcher(e: DracoError) -> MockFetcher {
+    MockFetcher {
+        fetch_result: Ok(html_response(200, b"", &[])),
+        replay_result: Err(e),
         fetch_calls: AtomicUsize::new(0),
         replay_calls: AtomicUsize::new(0),
     }
@@ -191,4 +205,77 @@ impl StaticEngine for MockStatic {
     fn is_app_router(&self, _html: &str) -> bool {
         self.app_router
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2 capture doubles
+// ---------------------------------------------------------------------------
+
+/// A [`Tier2Capture`] double that returns a canned set of intercepts (never
+/// spawns a real child). Lets ladder tests exercise the full Tier 2 rank/replay
+/// path offline. Records a call count so a test can assert capture was reached.
+pub struct MockCapture {
+    result: Result<CaptureResult, DracoError>,
+    calls: AtomicUsize,
+}
+
+impl MockCapture {
+    /// Capture yields the given candidates (no request bodies) with a
+    /// `Quiesced` outcome.
+    pub fn with_candidates(candidates: Vec<Candidate>) -> Self {
+        let bodies = vec![None; candidates.len()];
+        Self {
+            result: Ok(CaptureResult {
+                candidates,
+                bodies,
+                outcome: RuntimeOutcome::Quiesced,
+            }),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    /// Capture yields no intercepts (`NoIntercepts`) — the SPA never fetched.
+    pub fn empty() -> Self {
+        Self {
+            result: Ok(CaptureResult {
+                candidates: Vec::new(),
+                bodies: Vec::new(),
+                outcome: RuntimeOutcome::NoIntercepts,
+            }),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    /// Capture fails with the given jail error (spawn/protocol/killed).
+    pub fn failing(e: DracoError) -> Self {
+        Self {
+            result: Err(e),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Tier2Capture for MockCapture {
+    async fn capture(
+        &self,
+        _url: &str,
+        _html: &[u8],
+        _config: &crate::Config,
+    ) -> Result<CaptureResult, DracoError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.result.clone()
+    }
+}
+
+/// The default capture double for ladder tests that don't care about Tier 2:
+/// reaching Tier 2 with this seam yields no intercepts, so the ladder falls
+/// through to `Unsupported` exactly as the pre-Slice-4 skip did — without forking
+/// a child.
+pub fn noop_capture() -> MockCapture {
+    MockCapture::empty()
 }

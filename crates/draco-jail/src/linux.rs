@@ -28,7 +28,7 @@ use nix::sys::resource::{setrlimit, Resource};
 use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
 use nix::unistd::{execv, fork, ForkResult};
 
-use crate::{payload, JailError, JailHandle, JAIL_IPC_FD};
+use crate::{runtime_payload, JailError, JailHandle, JAIL_IPC_FD};
 
 mod seccomp;
 
@@ -36,9 +36,13 @@ mod seccomp;
 // rlimits
 // ---------------------------------------------------------------------------
 
-/// Address-space cap for the child (1 GiB). Generous for Slice 2's trivial
-/// payload; Slice 3 will raise this to fit a V8 heap.
-const RLIMIT_AS_BYTES: u64 = 1024 * 1024 * 1024;
+/// Address-space cap for the child. A jitless V8 isolate reserves large *virtual*
+/// regions for its managed heap and cage even though resident memory stays small,
+/// so `RLIMIT_AS` must be generous or `mmap` reservations fail at boot. 4 GiB
+/// comfortably fits a single default-heap isolate; tune on bare metal alongside
+/// the seccomp allowlist. (The supervisor's wall-clock `capture_window_ms` and
+/// `RLIMIT_CPU` bound runaway compute independently.)
+const RLIMIT_AS_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Max open file descriptors. The child needs stdio + fd 3 + a handful for the
 /// runtime; 64 is comfortable and still tight.
 const RLIMIT_NOFILE_MAX: u64 = 64;
@@ -294,6 +298,20 @@ pub fn run_jail_child() -> ! {
 
 /// Apply the lockdown layers in order, then hand off to the payload loop.
 fn arm_and_run() -> Result<(), JailError> {
+    // Dev escape hatch: `--no-jail` sets `JAIL_NO_SANDBOX_ENV` before re-exec, so
+    // the child runs the capture payload WITHOUT any lockdown. This keeps the
+    // `__jail` hook a single `run_jail_child()` call regardless of jail vs no-jail
+    // (the supervisor's env marker is the only difference). Never set in prod.
+    if std::env::var_os(crate::JAIL_NO_SANDBOX_ENV).is_some() {
+        eprintln!(
+            "draco-jail: WARNING — jailed child running UN-JAILED via {} (no seccomp/netns/\
+             Landlock). Dev use only.",
+            crate::JAIL_NO_SANDBOX_ENV
+        );
+        return runtime_payload::run_child_over_fd3()
+            .map_err(|e| JailError::new(JailKind::Protocol, format!("payload: {e}")));
+    }
+
     // 1. Namespaces (air-gap). A fallback-aware caller may tolerate failure here;
     //    for the scaffold we treat it as fatal so an un-air-gapped run is loud.
     enter_namespaces()?;
@@ -314,8 +332,11 @@ fn arm_and_run() -> Result<(), JailError> {
     seccomp::install_runtime_filter()
         .map_err(|e| JailError::new(JailKind::SeccompInstall, format!("phase-2: {e}")))?;
 
-    // 5. Payload: read a frame, echo a reply, until Shutdown/EOF.
-    payload::run_child_over_fd3()
+    // 5. Payload: host the Tier 2 V8 capture — read a `Hydrate`, drive
+    //    `draco-runtime`, stream `Intercept`s + a terminal `Result`, then exit.
+    //    Plain sync: `run_capture` owns its own current-thread tokio runtime, so
+    //    we must NOT be inside one here (nesting would panic).
+    runtime_payload::run_child_over_fd3()
         .map_err(|e| JailError::new(JailKind::Protocol, format!("payload: {e}")))
 }
 
@@ -565,7 +586,9 @@ mod redteam {
             }
         ));
 
-        // Shut the child down.
-        write_supervisor_frame(handle.ipc(), &SupervisorToJail::Shutdown, &[]).expect("shutdown");
+        // The Slice 4 child handles one Hydrate and exits (capture is
+        // once-per-process), so it may already be gone by now; a Shutdown write
+        // is best-effort (EPIPE if the child already closed the socket).
+        let _ = write_supervisor_frame(handle.ipc(), &SupervisorToJail::Shutdown, &[]);
     }
 }

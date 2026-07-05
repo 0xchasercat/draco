@@ -36,6 +36,7 @@ use draco_types::{
 
 use crate::challenge::detect_challenge;
 use crate::fetcher::{NetFetcher, PageFetcher};
+use crate::tier2::Tier2Capture;
 use crate::Config;
 
 // ---------------------------------------------------------------------------
@@ -200,21 +201,38 @@ impl Run {
 /// Run the full escalation ladder with the production adapters. This is what
 /// [`crate::extract`] calls; the generic [`run_ladder`] underneath is what
 /// tests drive with mocks.
+///
+/// The Tier 2 capture seam is chosen by the `tier2` feature: the real
+/// jail-spawning seam when on, a disabled seam (records "built without tier2")
+/// when off. Both keep `extract` returning a well-formed result.
 pub(crate) async fn run(url: &str, config: &Config) -> ExtractionResult {
-    run_ladder(url, config, &NetFetcher, &ProdStatic).await
+    #[cfg(feature = "tier2")]
+    let capture = crate::tier2::ProdTier2Capture;
+    #[cfg(not(feature = "tier2"))]
+    let capture = crate::tier2::DisabledCapture;
+    run_ladder(url, config, &NetFetcher, &ProdStatic, &capture).await
 }
 
-/// The escalation ladder, generic over its two effect seams so it can be
-/// exercised offline. See module docs.
-pub(crate) async fn run_ladder<F, S>(
+/// The escalation ladder, generic over its three effect seams (network, static
+/// extraction, Tier 2 capture) so it can be exercised offline. See module docs.
+///
+/// The `capture` seam abstracts the jail-hosted V8 capture: production passes the
+/// real jail-spawning seam, tests pass a mock that fabricates intercepts so the
+/// full ladder — including the Tier 2 rank/replay path — is exercisable without
+/// forking a child. When the crate is built without the `tier2` feature, the
+/// Tier 2 branch never touches `capture`; it records a "built without tier2" note
+/// and finalizes `Unsupported`.
+pub(crate) async fn run_ladder<F, S, T>(
     url: &str,
     config: &Config,
     fetcher: &F,
     statics: &S,
+    capture: &T,
 ) -> ExtractionResult
 where
     F: PageFetcher + ?Sized,
     S: StaticEngine + ?Sized,
+    T: Tier2Capture + ?Sized,
 {
     let mut run = Run::new(url);
     let opts = session_opts(config);
@@ -321,24 +339,11 @@ where
 
     // ---- Tier 2: runtime interception (Slice 4) ------------------------
     if tier_max >= 2 {
-        // TODO(Slice 4): boot the jail (`draco_jail::spawn_jail`), Hydrate the
-        // captured `body`, collect `JailToSupervisor::Intercept` frames into
-        // `ranking::Candidate`s, pick `ranking::best_candidate`, replay it via
-        // `fetcher.replay`, and (on a JSON body) finalize
-        // `Status::Success` / `SourceTier::RuntimeInterception`. The ranking
-        // policy and replay seam are already in place; this hook wires them.
-        #[cfg(feature = "tier2")]
+        if let Some(outcome) =
+            try_tier2(&mut run, url, &body, config, &opts, fetcher, capture).await
         {
-            compile_error!("Tier 2 not implemented in WS-C; enable in Slice 4");
+            return outcome;
         }
-        run.record(
-            SourceTier::RuntimeInterception,
-            "runtime.capture",
-            StepOutcome::Skipped,
-            0,
-            Bucket::None,
-            Some("tier 2 not implemented (Slice 4)".to_string()),
-        );
     } else {
         run.record(
             SourceTier::RuntimeInterception,
@@ -352,6 +357,164 @@ where
 
     // ---- Finalize: ran the whole (permitted) ladder, nothing matched ---
     run.finish(Status::Unsupported, None, None, None)
+}
+
+/// Tier 2 sub-flow: jail-hosted V8 capture → ranked replay. Returns
+/// `Some(result)` if the ladder should terminate here (a successful replay, or a
+/// hard jail failure), or `None` to fall through to `Unsupported`.
+///
+/// Trace steps: `runtime.spawn` (spawn+capture the child), `runtime.capture`
+/// (intercept count + outcome), `runtime.rank` (winning score / no viable
+/// candidate), `runtime.replay` (replaying the winner). Isolate wall time is
+/// charged to the [`Bucket::Runtime`] timing bucket.
+#[cfg(feature = "tier2")]
+async fn try_tier2<F, T>(
+    run: &mut Run,
+    url: &str,
+    body: &str,
+    config: &Config,
+    opts: &SessionOpts,
+    fetcher: &F,
+    capture: &T,
+) -> Option<ExtractionResult>
+where
+    F: PageFetcher + ?Sized,
+    T: Tier2Capture + ?Sized,
+{
+    use crate::tier2::rank_and_replay;
+
+    // --- Spawn + capture (jailed child hosts the isolate) ------------------
+    let t_cap = Instant::now();
+    let capture_result = match capture.capture(url, body.as_bytes(), config).await {
+        Ok(c) => c,
+        Err(e) => {
+            // A jail/IPC failure is a hard failure of Tier 2: record it and
+            // finalize `Error` carrying the mapped `DracoError::Jail`.
+            run.record(
+                SourceTier::RuntimeInterception,
+                "runtime.spawn",
+                StepOutcome::Failed,
+                t_cap.elapsed().as_millis() as u64,
+                Bucket::Runtime,
+                Some(error_summary(&e)),
+            );
+            let owned = run.take_for_finish();
+            return Some(owned.finish(Status::Error, None, None, Some(e)));
+        }
+    };
+    let cap_ms = t_cap.elapsed().as_millis() as u64;
+    run.record(
+        SourceTier::RuntimeInterception,
+        "runtime.spawn",
+        StepOutcome::Matched,
+        0,
+        Bucket::None,
+        None,
+    );
+    run.record(
+        SourceTier::RuntimeInterception,
+        "runtime.capture",
+        if capture_result.candidates.is_empty() {
+            StepOutcome::Missed
+        } else {
+            StepOutcome::Matched
+        },
+        cap_ms,
+        Bucket::Runtime,
+        Some(format!(
+            "{:?}, {} intercept(s)",
+            capture_result.outcome,
+            capture_result.candidates.len()
+        )),
+    );
+
+    // --- Rank + replay the winner -----------------------------------------
+    let t_rank = Instant::now();
+    match rank_and_replay(&capture_result, opts, fetcher).await {
+        Ok(Some((data, detail))) => {
+            // `runtime.rank` picked a viable winner; `runtime.replay` fetched
+            // JSON. Charge the replay hop to the network bucket.
+            run.record(
+                SourceTier::RuntimeInterception,
+                "runtime.rank",
+                StepOutcome::Matched,
+                0,
+                Bucket::None,
+                Some(detail.clone()),
+            );
+            run.record(
+                SourceTier::RuntimeInterception,
+                "runtime.replay",
+                StepOutcome::Matched,
+                t_rank.elapsed().as_millis() as u64,
+                Bucket::Network,
+                Some(detail),
+            );
+            let owned = run.take_for_finish();
+            Some(owned.finish(
+                Status::Success,
+                Some(SourceTier::RuntimeInterception),
+                Some(data),
+                None,
+            ))
+        }
+        Ok(None) => {
+            // Either nothing cleared the viability bar, or the winner's replay
+            // was non-2xx / not JSON. Record a Missed rank and fall through.
+            run.record(
+                SourceTier::RuntimeInterception,
+                "runtime.rank",
+                StepOutcome::Missed,
+                t_rank.elapsed().as_millis() as u64,
+                Bucket::None,
+                Some("no viable JSON endpoint among intercepts".to_string()),
+            );
+            None
+        }
+        Err(e) => {
+            // The replay itself failed at the transport level. Record it and
+            // finalize `Error` with the network error.
+            run.record(
+                SourceTier::RuntimeInterception,
+                "runtime.replay",
+                StepOutcome::Failed,
+                t_rank.elapsed().as_millis() as u64,
+                Bucket::Network,
+                Some(error_summary(&e)),
+            );
+            let owned = run.take_for_finish();
+            Some(owned.finish(Status::Error, None, None, Some(e)))
+        }
+    }
+}
+
+/// Tier 2 branch for the **lean** build (no `tier2` feature): there is no jail /
+/// runtime linked, so record a "built without tier2" note and fall through to
+/// `Unsupported`. Signature mirrors the tier2 version so the call site is
+/// feature-agnostic; `_capture` is unused here.
+#[cfg(not(feature = "tier2"))]
+async fn try_tier2<F, T>(
+    run: &mut Run,
+    _url: &str,
+    _body: &str,
+    _config: &Config,
+    _opts: &SessionOpts,
+    _fetcher: &F,
+    _capture: &T,
+) -> Option<ExtractionResult>
+where
+    F: PageFetcher + ?Sized,
+    T: Tier2Capture + ?Sized,
+{
+    run.record(
+        SourceTier::RuntimeInterception,
+        "runtime.capture",
+        StepOutcome::Skipped,
+        0,
+        Bucket::None,
+        Some("built without tier2: runtime interception not compiled in".to_string()),
+    );
+    None
 }
 
 /// Tier 1 sub-flow. Returns `Some(result)` if the ladder should terminate here
@@ -572,8 +735,9 @@ fn split_path_query(url: &str) -> (String, Vec<(String, String)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{err_fetcher, MockFetcher, MockStatic};
-    use draco_types::{ExtractOrigin, ExtractedData, NetKind};
+    use crate::ranking::Candidate;
+    use crate::testutil::{err_fetcher, noop_capture, MockCapture, MockFetcher, MockStatic};
+    use draco_types::{ExtractOrigin, ExtractedData, InterceptVia, NetKind};
     use serde_json::json;
 
     // ---- pure helpers -------------------------------------------------
@@ -649,7 +813,14 @@ mod tests {
             detail: "no such host".into(),
         });
         let statics = MockStatic::default(); // never consulted
-        let r = run_ladder("https://x.com", &cfg(2), &fetcher, &statics).await;
+        let r = run_ladder(
+            "https://x.com",
+            &cfg(2),
+            &fetcher,
+            &statics,
+            &noop_capture(),
+        )
+        .await;
         assert_eq!(r.status, Status::Error);
         assert!(r.error.is_some());
         assert_eq!(r.source_tier, None);
@@ -668,7 +839,14 @@ mod tests {
             .with_header("server", "cloudflare")
             .with_header("cf-mitigated", "challenge");
         let statics = MockStatic::hit_next_data(); // must NOT be consulted
-        let r = run_ladder("https://x.com/p", &cfg(2), &fetcher, &statics).await;
+        let r = run_ladder(
+            "https://x.com/p",
+            &cfg(2),
+            &fetcher,
+            &statics,
+            &noop_capture(),
+        )
+        .await;
         assert_eq!(r.status, Status::NeedsBrowser);
         assert_eq!(r.source_tier, None);
         assert!(r.data.is_none());
@@ -686,7 +864,14 @@ mod tests {
             origin: ExtractOrigin::NextData,
             data: json!({ "props": { "ok": true } }),
         });
-        let r = run_ladder("https://x.com/p", &cfg(2), &fetcher, &statics).await;
+        let r = run_ladder(
+            "https://x.com/p",
+            &cfg(2),
+            &fetcher,
+            &statics,
+            &noop_capture(),
+        )
+        .await;
         assert_eq!(r.status, Status::Success);
         assert_eq!(r.source_tier, Some(SourceTier::Static));
         assert_eq!(r.data, Some(json!({ "props": { "ok": true } })));
@@ -701,7 +886,14 @@ mod tests {
             // The Tier 1 replay returns JSON.
             .with_replay_json(200, json!({ "pageProps": { "price": 42 } }));
         let statics = MockStatic::miss_then_build_id("BUILDID123");
-        let r = run_ladder("https://shop.example.com/p/1", &cfg(2), &fetcher, &statics).await;
+        let r = run_ladder(
+            "https://shop.example.com/p/1",
+            &cfg(2),
+            &fetcher,
+            &statics,
+            &noop_capture(),
+        )
+        .await;
         assert_eq!(r.status, Status::Success);
         assert_eq!(r.source_tier, Some(SourceTier::HeuristicApiReplay));
         assert_eq!(r.data, Some(json!({ "pageProps": { "price": 42 } })));
@@ -727,8 +919,16 @@ mod tests {
     async fn app_router_skips_tier1() {
         let fetcher = MockFetcher::ok_html(200, "<html>rsc</html>");
         let statics = MockStatic::miss_app_router();
-        let r = run_ladder("https://x.com/p", &cfg(2), &fetcher, &statics).await;
-        // No build-id attempt; falls through to unsupported (tier 2 not impl).
+        let r = run_ladder(
+            "https://x.com/p",
+            &cfg(2),
+            &fetcher,
+            &statics,
+            &noop_capture(),
+        )
+        .await;
+        // No build-id attempt; Tier 2 runs but the mock capture yields nothing,
+        // so the ladder falls through to Unsupported.
         assert_eq!(r.status, Status::Unsupported);
         let bid = r
             .trace
@@ -743,7 +943,14 @@ mod tests {
     async fn tier_max_zero_skips_tier1_and_tier2() {
         let fetcher = MockFetcher::ok_html(200, "<html>plain</html>");
         let statics = MockStatic::miss_then_build_id("SHOULD_NOT_BE_USED");
-        let r = run_ladder("https://x.com/p", &cfg(0), &fetcher, &statics).await;
+        let r = run_ladder(
+            "https://x.com/p",
+            &cfg(0),
+            &fetcher,
+            &statics,
+            &noop_capture(),
+        )
+        .await;
         assert_eq!(r.status, Status::Unsupported);
         // Tier 1 and Tier 2 both recorded as Skipped with a tier_max reason.
         let t1 = r
@@ -767,7 +974,14 @@ mod tests {
     async fn tier_max_one_runs_tier1_but_skips_tier2() {
         let fetcher = MockFetcher::ok_html(200, "<html>plain</html>");
         let statics = MockStatic::miss_no_build_id();
-        let r = run_ladder("https://x.com/p", &cfg(1), &fetcher, &statics).await;
+        let r = run_ladder(
+            "https://x.com/p",
+            &cfg(1),
+            &fetcher,
+            &statics,
+            &noop_capture(),
+        )
+        .await;
         assert_eq!(r.status, Status::Unsupported);
         let t1 = r
             .trace
@@ -785,18 +999,149 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tier2_reached_but_unimplemented_is_unsupported() {
+    async fn tier2_no_intercepts_is_unsupported() {
+        // Tier 2 runs but the SPA never fetched: capture yields nothing, so the
+        // ladder finalizes Unsupported after recording the capture + a missed rank.
         let fetcher = MockFetcher::ok_html(200, "<html>spa</html>");
         let statics = MockStatic::miss_no_build_id();
-        let r = run_ladder("https://x.com/p", &cfg(2), &fetcher, &statics).await;
+        let r = run_ladder(
+            "https://x.com/p",
+            &cfg(2),
+            &fetcher,
+            &statics,
+            &noop_capture(),
+        )
+        .await;
         assert_eq!(r.status, Status::Unsupported);
-        let t2 = r
+        let actions: Vec<&str> = r.trace.iter().map(|t| t.action.as_str()).collect();
+        assert!(actions.contains(&"runtime.spawn"), "trace: {actions:?}");
+        let cap = r
             .trace
             .iter()
             .find(|t| t.action == "runtime.capture")
             .unwrap();
-        assert_eq!(t2.outcome, StepOutcome::Skipped);
-        assert!(t2.detail.as_deref().unwrap().contains("Slice 4"));
+        assert_eq!(cap.outcome, StepOutcome::Missed);
+        assert!(cap.detail.as_deref().unwrap().contains("NoIntercepts"));
+        let rank = r.trace.iter().find(|t| t.action == "runtime.rank").unwrap();
+        assert_eq!(rank.outcome, StepOutcome::Missed);
+    }
+
+    #[tokio::test]
+    async fn tier2_ranks_and_replays_winner_to_success() {
+        // Capture surfaces a junk asset + a strong JSON API; the ladder must pick
+        // the API, replay it, and finalize Success/RuntimeInterception.
+        let fetcher = MockFetcher::ok_html(200, "<html>spa</html>")
+            .with_replay_json(200, json!({ "price": 42, "title": "Widget" }));
+        let statics = MockStatic::miss_no_build_id();
+        let capture = MockCapture::with_candidates(vec![
+            Candidate::get("https://cdn.example.com/app.js", InterceptVia::Fetch),
+            Candidate {
+                method: "GET".into(),
+                url: "https://api.example.com/v1/items?id=1".into(),
+                headers: vec![("accept".into(), "application/json".into())],
+                via: InterceptVia::Fetch,
+            },
+        ]);
+        let r = run_ladder(
+            "https://shop.example.com/p",
+            &cfg(2),
+            &fetcher,
+            &statics,
+            &capture,
+        )
+        .await;
+        assert_eq!(r.status, Status::Success);
+        assert_eq!(r.source_tier, Some(SourceTier::RuntimeInterception));
+        assert_eq!(r.data, Some(json!({ "price": 42, "title": "Widget" })));
+        assert_eq!(capture.calls(), 1, "capture seam must be exercised once");
+        assert_eq!(fetcher.replay_calls(), 1, "the winner must be replayed");
+        // The trace records the full Tier 2 sequence.
+        let actions: Vec<&str> = r.trace.iter().map(|t| t.action.as_str()).collect();
+        for step in [
+            "runtime.spawn",
+            "runtime.capture",
+            "runtime.rank",
+            "runtime.replay",
+        ] {
+            assert!(actions.contains(&step), "missing {step} in {actions:?}");
+        }
+        let replay = r
+            .trace
+            .iter()
+            .find(|t| t.action == "runtime.replay")
+            .unwrap();
+        assert_eq!(replay.outcome, StepOutcome::Matched);
+        // Isolate capture time is charged to the runtime bucket.
+        // (The mock capture returns instantly, so we only assert the bucket
+        //  exists in the trace, not a positive duration.)
+        assert!(r.trace.iter().any(|t| t.action == "runtime.capture"));
+    }
+
+    #[tokio::test]
+    async fn tier2_all_junk_intercepts_is_unsupported() {
+        // Capture surfaces only assets/analytics: nothing clears MIN_VIABLE_SCORE,
+        // so no replay is attempted and the run is Unsupported.
+        let fetcher = MockFetcher::ok_html(200, "<html>spa</html>");
+        let statics = MockStatic::miss_no_build_id();
+        let capture = MockCapture::with_candidates(vec![
+            Candidate::get("https://cdn.example.com/app.js", InterceptVia::Fetch),
+            Candidate::get(
+                "https://www.google-analytics.com/collect",
+                InterceptVia::Xhr,
+            ),
+        ]);
+        let r = run_ladder("https://x.com/p", &cfg(2), &fetcher, &statics, &capture).await;
+        assert_eq!(r.status, Status::Unsupported);
+        assert_eq!(fetcher.replay_calls(), 0, "junk must not be replayed");
+        let rank = r.trace.iter().find(|t| t.action == "runtime.rank").unwrap();
+        assert_eq!(rank.outcome, StepOutcome::Missed);
+    }
+
+    #[tokio::test]
+    async fn tier2_jail_failure_finalizes_error() {
+        // A spawn/protocol failure in the capture seam maps to DracoError::Jail
+        // and finalizes Status::Error.
+        let fetcher = MockFetcher::ok_html(200, "<html>spa</html>");
+        let statics = MockStatic::miss_no_build_id();
+        let capture = MockCapture::failing(DracoError::Jail {
+            reason: draco_types::JailKind::Killed,
+            detail: "child SIGSYS".into(),
+        });
+        let r = run_ladder("https://x.com/p", &cfg(2), &fetcher, &statics, &capture).await;
+        assert_eq!(r.status, Status::Error);
+        assert!(matches!(r.error, Some(DracoError::Jail { .. })));
+        let spawn = r
+            .trace
+            .iter()
+            .find(|t| t.action == "runtime.spawn")
+            .unwrap();
+        assert_eq!(spawn.outcome, StepOutcome::Failed);
+        assert_eq!(fetcher.replay_calls(), 0, "no replay after a jail failure");
+    }
+
+    #[tokio::test]
+    async fn tier2_replay_transport_failure_finalizes_error() {
+        // A viable winner whose replay fails at the transport level → Error.
+        let fetcher = crate::testutil::err_replay_fetcher(DracoError::Network {
+            reason: NetKind::Timeout,
+            detail: "replay timed out".into(),
+        });
+        let statics = MockStatic::miss_no_build_id();
+        let capture = MockCapture::with_candidates(vec![Candidate {
+            method: "GET".into(),
+            url: "https://api.example.com/v1/items".into(),
+            headers: vec![("accept".into(), "application/json".into())],
+            via: InterceptVia::Fetch,
+        }]);
+        let r = run_ladder("https://x.com/p", &cfg(2), &fetcher, &statics, &capture).await;
+        assert_eq!(r.status, Status::Error);
+        assert!(matches!(r.error, Some(DracoError::Network { .. })));
+        let replay = r
+            .trace
+            .iter()
+            .find(|t| t.action == "runtime.replay")
+            .unwrap();
+        assert_eq!(replay.outcome, StepOutcome::Failed);
     }
 
     #[tokio::test]
@@ -807,7 +1152,14 @@ mod tests {
         // fabricated network_ms — assert each bucket on its own terms.
         let fetcher = MockFetcher::ok_html(200, "<html>x</html>");
         let statics = MockStatic::hit_next_data();
-        let r = run_ladder("https://x.com", &cfg(0), &fetcher, &statics).await;
+        let r = run_ladder(
+            "https://x.com",
+            &cfg(0),
+            &fetcher,
+            &statics,
+            &noop_capture(),
+        )
+        .await;
         // The fetch charged the mock's reported elapsed to the network bucket.
         assert_eq!(
             r.timing.network_ms, 1,
@@ -830,7 +1182,14 @@ mod tests {
     async fn tier1_non_2xx_replay_falls_through() {
         let fetcher = MockFetcher::ok_html(200, "<html>next</html>").with_replay_status(404); // _next/data 404s
         let statics = MockStatic::miss_then_build_id("BID");
-        let r = run_ladder("https://x.com/p", &cfg(2), &fetcher, &statics).await;
+        let r = run_ladder(
+            "https://x.com/p",
+            &cfg(2),
+            &fetcher,
+            &statics,
+            &noop_capture(),
+        )
+        .await;
         assert_eq!(r.status, Status::Unsupported);
         let replay = r.trace.iter().find(|t| t.action == "tier1.replay").unwrap();
         assert_eq!(replay.outcome, StepOutcome::Missed);
