@@ -14,6 +14,7 @@ fn draco_bin() -> &'static str {
 }
 
 #[test]
+#[ignore = "obsolete under real core: invokes the binary, which now runs the real ladder into draco-net's todo!() stub and panics. Rewrite against a local fixture server once Slice 1 net lands."]
 fn extract_wires_through_and_maps_stub_error_to_exit_1() {
     let output = Command::new(draco_bin())
         .args(["extract", "https://example.com/product/42"])
@@ -36,6 +37,7 @@ fn extract_wires_through_and_maps_stub_error_to_exit_1() {
 }
 
 #[test]
+#[ignore = "obsolete under real core: drives the binary into draco-net's todo!() stub. Rewrite against a fixture server once Slice 1 net lands."]
 fn extract_with_filter_still_runs_and_exits_1_on_stub_error() {
     // Passing --extract must not crash the pipeline even though the stub
     // produces no data to filter; the run still terminates with exit 1.
@@ -60,6 +62,7 @@ fn extract_with_filter_still_runs_and_exits_1_on_stub_error() {
 }
 
 #[test]
+#[ignore = "obsolete under real core: drives the binary into draco-net's todo!() stub. Rewrite against a fixture server once Slice 1 net lands."]
 fn invalid_jsonpath_is_rejected_at_parse_but_binary_still_runs() {
     // The stub returns no data, so a bad path is only reachable in unit tests;
     // here we simply confirm the flag is accepted by the parser and the binary
