@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <title>Gallery</title>
+  <base href="https://cdn.example/site/">
+  <meta name="description" content="Links and images stress test.">
+</head>
+<body>
+  <main>
+    <article>
+      <h1>Gallery</h1>
+      <p>A paragraph with enough length to keep this region as the article body, linking
+         to a <a href="rel/path">document-relative page</a>, an
+         <a href="https://external.example/x">absolute external page</a>, a
+         <a href="//other.example/y">protocol-relative page</a>, a
+         <a href="#top">fragment on this page</a>, and a
+         <a href="mailto:hi@example.com">mail link</a> that should stay as-is.</p>
+
+      <p>Here is an inline base64 image
+         <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" alt="tracking pixel">
+         followed by a real one
+         <img src="images/hero.png" alt="hero">
+         and a responsive one
+         <img srcset="images/small.jpg 480w, images/large.jpg 1200w" src="images/fallback.jpg" alt="responsive">.</p>
+    </article>
+  </main>
+</body>
+</html>

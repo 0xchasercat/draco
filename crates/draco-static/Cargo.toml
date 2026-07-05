@@ -11,10 +11,18 @@ serde_json = { workspace = true }
 # Tier 0/1 HTML parsing per canonical doc §10 & §14.
 tl = "0.7.8"          # primary: fast, zero-copy HTML parse
 scraper = "0.27.0"    # fallback: selector-based parse for gnarlier cases
-# Content engine (URL → Markdown scrape): readability main-content extraction +
-# HTML→Markdown conversion. dom_smoothie is a Mozilla Readability port (drops
-# nav/header/footer boilerplate and absolutizes links against the doc URL);
-# htmd renders headings/links/images/lists/blockquotes/code and GFM tables.
-dom_smoothie = "0.9"  # readability (main-content) extraction
-htmd = "0.2"          # HTML → Markdown (GFM tables)
+# Content engine (URL → Markdown scrape). The pipeline mirrors Firecrawl's
+# open-source HTML→Markdown path (`@mendable/firecrawl-rs`,
+# apps/api/native/src/html.rs): a `scraper`-based DOM pre-pass strips chrome and
+# boilerplate selectors, `htmd` (a Turndown-equivalent) renders GFM Markdown,
+# and `dom_smoothie` (a Mozilla Readability port) is the main-content fallback.
+dom_smoothie = "0.9"  # readability (main-content) fallback extraction
+htmd = "0.2"          # HTML → Markdown (GFM tables, fenced code, ATX headings)
 url = "2"             # absolutize relative href/src against the page URL
+# `scraper` is built on these; we take them as direct deps to mutate the DOM
+# (detach boilerplate nodes, rewrite attributes) through their public APIs.
+# Pinned to the exact versions `scraper` 0.27 resolves, so no new crates enter
+# the tree — only their direct nameability changes.
+ego-tree = "0.11"     # NodeId handles for `scraper`'s tree (node detach/mutate)
+html5ever = "0.39"    # QualName/LocalName for inserting attributes on elements
+                      # (matched to the version `scraper` 0.27 uses)
