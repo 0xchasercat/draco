@@ -29,6 +29,7 @@
 //! tokio runtime. `run_capture` owns its runtime; nesting a second one would
 //! panic. Everything here is blocking frame I/O over the inherited fd-3 socket.
 
+use std::collections::HashMap;
 use std::os::fd::FromRawFd;
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
@@ -129,56 +130,74 @@ pub fn run_capture_loop(
         )?;
     }
 
-    // Read a single control frame. A capture is once-per-process, so we do not
-    // loop over multiple Hydrates.
-    let msg = match frame::read_supervisor_frame(&mut stream) {
-        Ok(f) => f,
-        // Supervisor hung up without a Shutdown frame: orderly close.
-        Err(FrameError::Eof) => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
+    // Read control frames until Hydrate (or Shutdown / EOF). `Resource` frames
+    // arrive first, carrying the supervisor-prefetched script subresources; we
+    // accumulate them into the `{url -> source}` map the isolate's module loader
+    // serves. A capture is once-per-process, so we do not loop over Hydrates.
+    let mut resources: HashMap<String, Vec<u8>> = HashMap::new();
+    loop {
+        let msg = match frame::read_supervisor_frame(&mut stream) {
+            Ok(f) => f,
+            // Supervisor hung up without a Shutdown frame: orderly close.
+            Err(FrameError::Eof) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
 
-    match msg.header {
-        SupervisorToJail::Hydrate {
-            url,
-            capture_window_ms,
-            quiesce_ms,
-            max_intercepts,
-            stub_response_json,
-        } => {
-            // The frame body carries the raw page HTML (lossy-decoded: page bytes
-            // may not be valid UTF-8, and the capture engine wants a &str).
-            let html = String::from_utf8_lossy(&msg.body).into_owned();
-            let cfg = CaptureConfig {
+        match msg.header {
+            SupervisorToJail::Resource { url } => {
+                resources.insert(url, msg.body);
+            }
+            SupervisorToJail::Hydrate {
+                url,
                 capture_window_ms,
                 quiesce_ms,
                 max_intercepts,
                 stub_response_json,
-            };
+            } => {
+                // The frame body carries the raw page HTML (lossy-decoded: page
+                // bytes may not be valid UTF-8, and the capture engine wants a &str).
+                let html = String::from_utf8_lossy(&msg.body).into_owned();
+                let cfg = CaptureConfig {
+                    capture_window_ms,
+                    quiesce_ms,
+                    max_intercepts,
+                    stub_response_json,
+                };
 
-            // capture() owns its OWN current-thread tokio runtime and inits V8
-            // flags process-globally. We are plain sync here — do NOT wrap it.
-            let report = capture(&url, &html, &cfg);
-            emit_report(&mut stream, report)?;
-            // One capture per process: return so the child exits.
-            Ok(())
+                // capture() owns its OWN current-thread tokio runtime and inits V8
+                // flags process-globally. We are plain sync here — do NOT wrap it.
+                let report = capture(&url, &html, &cfg, resources);
+                emit_report(&mut stream, report)?;
+                // One capture per process: return so the child exits.
+                return Ok(());
+            }
+            SupervisorToJail::Shutdown => return Ok(()),
         }
-        SupervisorToJail::Shutdown => Ok(()),
     }
 }
 
-/// Indirection over [`draco_runtime::run_capture`] so the wiring tests can inject
-/// a canned [`CaptureReport`] instead of booting a real V8 isolate (which is
-/// exercised by draco-runtime's own integration tests and the `#[ignore]`d
-/// full-jail smoke test). Production always calls the real capture engine.
+/// Indirection over [`draco_runtime::run_capture_with_resources`] so the wiring
+/// tests can inject a canned [`CaptureReport`] instead of booting a real V8
+/// isolate (which is exercised by draco-runtime's own integration tests and the
+/// `#[ignore]`d full-jail smoke test). Production always calls the real engine.
 #[cfg(not(test))]
-fn capture(url: &str, html: &str, cfg: &CaptureConfig) -> CaptureReport {
-    draco_runtime::run_capture(url, html, cfg)
+fn capture(
+    url: &str,
+    html: &str,
+    cfg: &CaptureConfig,
+    resources: HashMap<String, Vec<u8>>,
+) -> CaptureReport {
+    draco_runtime::run_capture_with_resources(url, html, cfg, resources)
 }
 
 /// Test seam: return the [`CaptureReport`] queued by the current test.
 #[cfg(test)]
-fn capture(_url: &str, _html: &str, _cfg: &CaptureConfig) -> CaptureReport {
+fn capture(
+    _url: &str,
+    _html: &str,
+    _cfg: &CaptureConfig,
+    _resources: HashMap<String, Vec<u8>>,
+) -> CaptureReport {
     tests::CANNED
         .lock()
         .unwrap()
