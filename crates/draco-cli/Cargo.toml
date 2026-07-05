@@ -11,7 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 draco-core = { workspace = true }
+draco-types = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 # WS-D adds: serde_json_path (for --extract) per canonical doc §12 & §14.
+serde_json_path = "0.7"
