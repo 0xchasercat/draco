@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>The Great Article — Example Blog</title>
+  <meta name="description" content="An article about interesting things.">
+  <meta name="keywords" content="rust, extraction, markdown">
+  <meta name="robots" content="index,follow">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0a0a0a">
+  <meta property="og:title" content="The Great Article (OG)">
+  <meta property="og:description" content="OG description of the article.">
+  <meta property="og:type" content="article">
+  <meta property="og:image" content="/img/og.png">
+  <meta property="og:locale" content="en_US">
+  <meta property="og:locale:alternate" content="fr_FR">
+  <meta property="og:locale:alternate" content="de_DE">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="The Great Article (Twitter)">
+  <meta name="article:section" content="Engineering">
+  <meta name="article:tag" content="scraping">
+  <meta property="article:published_time" content="2026-01-02T10:00:00Z">
+  <meta property="article:modified_time" content="2026-01-03T12:00:00Z">
+  <meta name="dc.description" content="Dublin Core description.">
+  <link rel="canonical" href="/articles/great">
+  <link rel="icon" href="/favicon.ico">
+  <style>.chrome { color: red; }</style>
+  <script>window.analytics = function(){ /* tracker */ };</script>
+</head>
+<body>
+  <!-- top-of-page tracking comment that must never leak -->
+  <nav class="navbar"><a href="/">Home</a> <a href="/blog">Blog</a> <a href="/about">About</a></nav>
+  <header class="header"><h1>Example Blog</h1><p>Site tagline boilerplate that should be dropped.</p></header>
+  <aside class="sidebar">
+    <h3>Related</h3>
+    <ul><li><a href="/other-1">Other 1</a></li><li><a href="/other-2">Other 2</a></li></ul>
+    <div class="ad"><a href="https://ads.example/buy">Buy now</a></div>
+  </aside>
+  <main>
+    <article>
+      <h1>The Great Article</h1>
+      <p>An opening paragraph with a <a href="/relative/path">relative link</a>
+         and an <a href="https://external.example/page">external link</a> to set the scene,
+         plus a <a href="//cdn.example/asset">protocol-relative link</a> and a
+         <a href="#section-one">jump link</a>.</p>
+      <h2>Section One</h2>
+      <p>Some more prose here that continues the article body and gives the extractor
+         enough signal to treat this region as the main content of the page rather than
+         chrome. It runs comfortably past the length threshold so the article body is kept.</p>
+      <ul>
+        <li>First bullet point</li>
+        <li>Second bullet point
+          <ul><li>nested a</li><li>nested b</li></ul>
+        </li>
+      </ul>
+      <blockquote><p>A memorable and sufficiently long pull-quote from the piece.</p></blockquote>
+      <p>A closing paragraph with an image <img src="/img/photo.png" alt="a photo">
+         and yet more text to keep the article comfortably above the length threshold.</p>
+    </article>
+  </main>
+  <footer class="footer"><p>Copyright 2026 — footer boilerplate that must be stripped.</p></footer>
+  <noscript>Please enable JavaScript — this must not appear.</noscript>
+  <script src="/app.js"></script>
+</body>
+</html>

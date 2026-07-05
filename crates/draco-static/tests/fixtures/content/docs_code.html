@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <title>Installation — Docs</title>
+  <meta name="description" content="How to install and use the widget.">
+  <link rel="shortcut icon" href="/assets/favicon.png">
+</head>
+<body>
+  <header class="header"><nav class="navbar"><a href="/">Docs Home</a></nav></header>
+  <main id="main">
+    <article>
+      <h1>Installation</h1>
+      <p>Install the crate, then wire it into your project. The snippets below are
+         reproduced verbatim so that indentation and punctuation survive the round-trip
+         through the Markdown converter without being altered or re-escaped.</p>
+
+      <h2>Rust</h2>
+      <pre><code class="language-rust">fn main() {
+    let items = vec![1, 2, 3];
+    for i in &amp;items {
+        println!("item = {}", i);
+    }
+}</code></pre>
+
+      <h2>Python</h2>
+      <pre><code class="lang-python">def greet(name):
+    print(f"hello, {name}")</code></pre>
+
+      <h2>JavaScript</h2>
+      <pre><code class="hljs javascript">const x = [1, 2, 3];
+console.log(x.map((n) => n * 2));</code></pre>
+
+      <h2>Plain</h2>
+      <pre><code>$ cargo build --release
+   Compiling widget v0.1.0</code></pre>
+
+      <p>Use the inline form <code>Widget::new()</code> to construct one, and the
+         <code>*star*</code> token above should not be treated as emphasis.</p>
+    </article>
+  </main>
+  <footer class="footer">Docs footer boilerplate.</footer>
+</body>
+</html>
