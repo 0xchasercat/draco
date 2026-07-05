@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>SPA + analytics decoy</title>
+  </head>
+  <body>
+    <script>
+      // A real data endpoint AND an analytics beacon fire on load. Draco is
+      // rank-agnostic: it must capture BOTH; draco-core decides which matters.
+      (function () {
+        // Analytics decoy: POST a beacon to a telemetry host.
+        fetch("https://analytics.example.com/collect", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ event: "pageview", ts: Date.now() }),
+        });
+
+        // The endpoint we actually care about.
+        setTimeout(function () {
+          fetch("/api/products?category=widgets")
+            .then((r) => r.json())
+            .then(function (d) {
+              window.__products = d;
+            });
+        }, 20);
+      })();
+    </script>
+  </body>
+</html>

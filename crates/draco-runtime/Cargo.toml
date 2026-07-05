@@ -7,5 +7,21 @@ description = "Tier 2 V8 isolate + interceptor runtime for Draco."
 
 [dependencies]
 draco-types = { workspace = true }
-# Slice 3 adds: deno_core = "0.406.0", futures (block_on driver) per canonical doc §8 & §14.
-# Snapshot generation lives in build.rs with a vendored, pinned DOM polyfill (no build-time network).
+
+# Tier 2 (Slice 3): V8 isolate + fetch/XHR interception.
+# deno_core 0.406.0 ships a prebuilt V8; confirmed to build in-sandbox.
+deno_core = "0.406.0"
+# JsErrorBox is deno_core's op error type; pinned to match deno_core 0.406.0.
+deno_error = "=0.7.1"
+# futures::task primitives for the manual event-loop driver.
+futures = "0.3"
+# deno_core 0.406.0's only timer reactor is tokio-based (tokio::time::sleep_until),
+# so the event loop must run under a tokio time driver. We use a *current-thread*
+# runtime with `enable_time()` only (no worker pool, no I/O reactor) to keep the
+# eventual jailed child's syscall surface small. See lib.rs module docs.
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# Tests drive `run_capture` directly against in-repo HTML fixtures.

@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Throwing page</title>
+  </head>
+  <body>
+    <script>
+      // Top-level uncaught error before any fetch. run_capture must NOT panic;
+      // it must report RuntimeOutcome::Threw with an empty request list.
+      (function () {
+        const obj = null;
+        // Dereferencing null throws a TypeError synchronously.
+        return obj.definitelyMissing.deeper;
+      })();
+    </script>
+  </body>
+</html>
