@@ -1,0 +1,194 @@
+//! Offline test doubles for the [`PageFetcher`](crate::fetcher::PageFetcher)
+//! and [`StaticEngine`](crate::machine::StaticEngine) seams.
+//!
+//! Compiled only under `#[cfg(test)]`. These mocks return canned fixtures so
+//! the escalation ladder can be driven without a network or a live
+//! `draco-static` / `draco-net` (both are `todo!()` stubs in WS-C). Keeping
+//! them in their own module lets every `#[cfg(test)] mod tests` share one set.
+
+#![cfg(test)]
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use draco_net::{HtmlResponse, SessionOpts};
+use draco_static::StaticOutcome;
+use draco_types::{DracoError, ExtractedData, HttpRequestSpec, HttpResponseMeta};
+
+use crate::fetcher::PageFetcher;
+use crate::machine::StaticEngine;
+
+/// A scripted [`PageFetcher`]: `fetch` returns one canned response (or error),
+/// `replay` returns another. Records call counts so tests can assert a tier was
+/// (or was not) exercised.
+pub struct MockFetcher {
+    fetch_result: Result<HtmlResponse, DracoError>,
+    replay_result: Result<HtmlResponse, DracoError>,
+    fetch_calls: AtomicUsize,
+    replay_calls: AtomicUsize,
+}
+
+impl MockFetcher {
+    /// A fetcher whose `fetch` yields `status` + `body`, and whose `replay`
+    /// (until overridden) 404s — most ladder tests never reach replay, and the
+    /// ones that do set it explicitly.
+    pub fn ok_html(status: u16, body: &str) -> Self {
+        Self {
+            fetch_result: Ok(html_response(status, body.as_bytes(), &[])),
+            replay_result: Ok(html_response(404, b"", &[])),
+            fetch_calls: AtomicUsize::new(0),
+            replay_calls: AtomicUsize::new(0),
+        }
+    }
+
+    /// Add a response header to the canned `fetch` result.
+    pub fn with_header(mut self, k: &str, v: &str) -> Self {
+        if let Ok(resp) = &mut self.fetch_result {
+            resp.meta.headers.push((k.to_string(), v.to_string()));
+        }
+        self
+    }
+
+    /// Make `replay` return `status` + a JSON body.
+    pub fn with_replay_json(mut self, status: u16, value: serde_json::Value) -> Self {
+        let body = serde_json::to_vec(&value).unwrap();
+        self.replay_result = Ok(html_response(
+            status,
+            &body,
+            &[("content-type", "application/json")],
+        ));
+        self
+    }
+
+    /// Make `replay` return an arbitrary status with an empty body.
+    pub fn with_replay_status(mut self, status: u16) -> Self {
+        self.replay_result = Ok(html_response(status, b"", &[]));
+        self
+    }
+
+    pub fn fetch_calls(&self) -> usize {
+        self.fetch_calls.load(Ordering::SeqCst)
+    }
+    pub fn replay_calls(&self) -> usize {
+        self.replay_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl PageFetcher for MockFetcher {
+    async fn fetch(&self, _url: &str, _opts: &SessionOpts) -> Result<HtmlResponse, DracoError> {
+        self.fetch_calls.fetch_add(1, Ordering::SeqCst);
+        self.fetch_result.clone()
+    }
+
+    async fn replay(
+        &self,
+        _spec: &HttpRequestSpec,
+        _opts: &SessionOpts,
+    ) -> Result<HtmlResponse, DracoError> {
+        self.replay_calls.fetch_add(1, Ordering::SeqCst);
+        self.replay_result.clone()
+    }
+}
+
+/// A fetcher whose `fetch` always errors — for the fetch-failure path.
+pub fn err_fetcher(e: DracoError) -> MockFetcher {
+    MockFetcher {
+        fetch_result: Err(e),
+        replay_result: Ok(html_response(404, b"", &[])),
+        fetch_calls: AtomicUsize::new(0),
+        replay_calls: AtomicUsize::new(0),
+    }
+}
+
+fn html_response(status: u16, body: &[u8], headers: &[(&str, &str)]) -> HtmlResponse {
+    HtmlResponse {
+        meta: HttpResponseMeta {
+            status,
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            final_url: "https://x.com/".to_string(),
+            elapsed_ms: 1,
+        },
+        body: Bytes::copy_from_slice(body),
+    }
+}
+
+/// A scripted [`StaticEngine`]. Each field controls one frozen operation so a
+/// test can shape the exact Tier 0/1 path it wants without touching the real
+/// (stubbed) extractors.
+#[derive(Default)]
+pub struct MockStatic {
+    static_outcome: Option<ExtractedData>,
+    build_id: Option<String>,
+    app_router: bool,
+}
+
+impl MockStatic {
+    /// Tier 0 hits with the given extraction.
+    pub fn hit(data: ExtractedData) -> Self {
+        Self {
+            static_outcome: Some(data),
+            ..Self::default()
+        }
+    }
+
+    /// Tier 0 hits via `__NEXT_DATA__` with a trivial payload.
+    pub fn hit_next_data() -> Self {
+        Self::hit(ExtractedData {
+            tier: draco_types::SourceTier::Static,
+            origin: draco_types::ExtractOrigin::NextData,
+            data: serde_json::json!({ "ok": true }),
+        })
+    }
+
+    /// Tier 0 misses; Tier 1 discovers `build_id`.
+    pub fn miss_then_build_id(build_id: &str) -> Self {
+        Self {
+            static_outcome: None,
+            build_id: Some(build_id.to_string()),
+            app_router: false,
+        }
+    }
+
+    /// Tier 0 misses; Tier 1 finds no build id.
+    pub fn miss_no_build_id() -> Self {
+        Self::default()
+    }
+
+    /// Tier 0 misses; page is app-router (Tier 1 ineligible).
+    pub fn miss_app_router() -> Self {
+        Self {
+            app_router: true,
+            ..Self::default()
+        }
+    }
+}
+
+impl StaticEngine for MockStatic {
+    fn extract_static(&self, _html: &str) -> StaticOutcome {
+        match &self.static_outcome {
+            Some(d) => StaticOutcome::Hit(d.clone()),
+            None => StaticOutcome::Miss,
+        }
+    }
+    fn discover_build_id(&self, _html: &str) -> Option<String> {
+        self.build_id.clone()
+    }
+    fn next_data_url(&self, build_id: &str, pathname: &str, query: &[(String, String)]) -> String {
+        // Deterministic stand-in for the real constructor; shape mirrors spec §10.
+        let mut u = format!("/_next/data/{build_id}{pathname}.json");
+        if !query.is_empty() {
+            let qs: Vec<String> = query.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            u.push('?');
+            u.push_str(&qs.join("&"));
+        }
+        u
+    }
+    fn is_app_router(&self, _html: &str) -> bool {
+        self.app_router
+    }
+}

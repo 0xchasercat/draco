@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 description = "Escalation state machine, ranking, and replay orchestrator for Draco."
 
+[features]
+# Marker for the Tier 2 (runtime interception) wiring, landed in Slice 4. Off in
+# WS-C: the ladder reaches the Tier 2 hook but records it as Skipped. Enabling it
+# today trips a `compile_error!` in `machine.rs` — a guard so nobody flips it on
+# before the isolate/jail wiring exists.
+tier2 = []
+
 # The dependency graph is frozen here even though the skeleton does not yet call
 # every crate; WS-C wires Tier 0/1 (net + static), Slice 4 wires Tier 2 (jail + runtime).
 [dependencies]
@@ -13,3 +20,18 @@ draco-net = { workspace = true }
 draco-static = { workspace = true }
 draco-jail = { workspace = true }
 draco-runtime = { workspace = true }
+
+# WS-C additions:
+#   serde_json  — parse Tier 1 `_next/data` JSON bodies; carry `data: Value`.
+#   url         — origin/path parsing for challenge detection & ranking policy.
+#   async-trait — object-safe async `PageFetcher` seam so the ladder is mockable offline.
+serde_json = { workspace = true }
+url = "2"
+async-trait = "0.1"
+
+[dev-dependencies]
+# Drive the async ladder in unit tests. draco-core is the (all-platform) supervisor,
+# so a normal tokio runtime is appropriate here; only the jail *child* avoids tokio.
+tokio = { workspace = true }
+# Build `HtmlResponse { body: Bytes, .. }` fixtures in the mock PageFetcher.
+bytes = { workspace = true }
