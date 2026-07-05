@@ -9,8 +9,23 @@ description = "Draco command-line interface."
 name = "draco"
 path = "src/main.rs"
 
+[features]
+# DEFAULT ON. Forwards to `draco-core/tier2`, which pulls in the jail + runtime
+# (deno_core/V8). With `--no-default-features` the CLI builds V8-free: the
+# `__jail` re-exec hook and the Tier 2 branch compile out, and Tier 2 finalizes
+# `Unsupported`. Both configurations MUST build (canonical §4).
+default = ["tier2"]
+tier2 = ["draco-core/tier2"]
+
+# draco-core is brought in as a DIRECT path dep (not `workspace = true`) with
+# default-features off, so the CLI's own `tier2` feature is the single switch that
+# turns Tier 2 (and V8) on or off end-to-end. (Cargo ignores `default-features`
+# on an inherited `workspace = true` dep unless the workspace entry sets it; a
+# direct path dep honours it and keeps this change local to the CLI manifest.)
+# With `--no-default-features` the CLI's `tier2` is off ⇒ draco-core is built
+# without `tier2` ⇒ no draco-jail/draco-runtime ⇒ V8-free.
 [dependencies]
-draco-core = { workspace = true }
+draco-core = { path = "../draco-core", default-features = false }
 draco-types = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }

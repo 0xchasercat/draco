@@ -8,7 +8,7 @@
 
 use draco_types::JailKind;
 
-use crate::{payload, JailError, JailHandle};
+use crate::{runtime_payload, JailError, JailHandle};
 
 /// Un-jailed supervisor spawn: this platform has no namespaces/seccomp/Landlock,
 /// so no sandbox can be established.
@@ -30,13 +30,15 @@ pub fn spawn_jail() -> Result<JailHandle, JailError> {
     ))
 }
 
-/// Un-jailed child entry: run the payload loop over fd 3 with no lockdown.
+/// Un-jailed child entry: run the Tier 2 capture payload over fd 3 with no
+/// lockdown. Plain sync — `draco-runtime`'s `run_capture` owns its own
+/// current-thread tokio runtime, so we must not be inside one here.
 pub fn run_jail_child() -> ! {
     eprintln!(
         "draco-jail: WARNING — jailed child running UN-JAILED (no seccomp/Landlock/netns on this \
          platform)."
     );
-    match payload::run_child_over_fd3() {
+    match runtime_payload::run_child_over_fd3() {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("draco-jail: child exiting on error: {e}");

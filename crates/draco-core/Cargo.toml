@@ -6,20 +6,30 @@ license.workspace = true
 description = "Escalation state machine, ranking, and replay orchestrator for Draco."
 
 [features]
-# Marker for the Tier 2 (runtime interception) wiring, landed in Slice 4. Off in
-# WS-C: the ladder reaches the Tier 2 hook but records it as Skipped. Enabling it
-# today trips a `compile_error!` in `machine.rs` — a guard so nobody flips it on
-# before the isolate/jail wiring exists.
-tier2 = []
+# DEFAULT ON. Gates the Tier 2 (runtime interception) wiring landed in Slice 4:
+# the jail-hosted V8 capture, the ladder's Tier 2 branch, and the re-exported
+# `draco-jail` surface the CLI's `__jail` hook needs. Enabling it pulls in the
+# OPTIONAL `draco-jail` + `draco-runtime` deps (and, transitively, deno_core/V8).
+# Turning it OFF (`--no-default-features`) yields a lean, V8-free build in which
+# the Tier 2 branch finalizes `Unsupported` with a "built without tier2" note —
+# so both configurations compile (canonical §4).
+default = ["tier2"]
+# `dep:libc` is a target-specific optional dep (Linux only, below); enabling it
+# here is a no-op off Linux and arms the `--no-jail` dev fork's raw syscalls on it.
+# `dep:tokio` gives the production capture seam `spawn_blocking` (the ladder runs
+# under the caller's multi-thread runtime; the blocking jail IPC goes off-worker).
+tier2 = ["dep:draco-jail", "dep:draco-runtime", "dep:libc", "dep:tokio"]
 
 # The dependency graph is frozen here even though the skeleton does not yet call
-# every crate; WS-C wires Tier 0/1 (net + static), Slice 4 wires Tier 2 (jail + runtime).
+# every crate; WS-C wires Tier 0/1 (net + static), Slice 4 wires Tier 2 (jail +
+# runtime). draco-jail/draco-runtime are OPTIONAL: they are only compiled when the
+# `tier2` feature turns them on, keeping the lean build free of V8.
 [dependencies]
 draco-types = { workspace = true }
 draco-net = { workspace = true }
 draco-static = { workspace = true }
-draco-jail = { workspace = true }
-draco-runtime = { workspace = true }
+draco-jail = { workspace = true, optional = true }
+draco-runtime = { workspace = true, optional = true }
 
 # WS-C additions:
 #   serde_json  — parse Tier 1 `_next/data` JSON bodies; carry `data: Value`.
@@ -28,6 +38,16 @@ draco-runtime = { workspace = true }
 serde_json = { workspace = true }
 url = "2"
 async-trait = "0.1"
+# tier2-only: the production capture seam offloads the blocking jail spawn + IPC
+# onto `tokio::task::spawn_blocking`. Optional + tier2-gated so the lean build
+# does not require a tokio dependency here.
+tokio = { workspace = true, optional = true }
+
+# Linux-only, tier2-only: raw fork/dup2/exec/waitpid for the `--no-jail` dev path
+# (an un-jailed re-exec of `draco __jail`) and to reap the jailed child. Optional +
+# tier2-gated so the lean build never pulls it in.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2.186", optional = true }
 
 [dev-dependencies]
 # Drive the async ladder in unit tests. draco-core is the (all-platform) supervisor,

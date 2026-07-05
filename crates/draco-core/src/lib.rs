@@ -36,12 +36,28 @@ mod machine;
 mod ranking;
 #[cfg(test)]
 mod testutil;
+/// Tier 2 supervisor wiring (jail-hosted V8 capture → ranked replay). Always
+/// compiled: the capture *seam* + rank/replay logic are V8-free. Only the
+/// production capture seam that actually spawns the jail is behind the `tier2`
+/// feature — the lean build uses a disabled seam that reports "built without
+/// tier2" and finalizes `Unsupported`.
+mod tier2;
 
 // ---- Public API -----------------------------------------------------------
 
 pub use challenge::{detect_challenge, ChallengeKind};
 pub use fetcher::{NetFetcher, PageFetcher};
 pub use machine::{clamp_tier_max, session_opts, ProdStatic, StaticEngine, TIER_CEILING};
+
+/// Re-export the jailed-child entry so the CLI's `__jail` re-exec hook can call
+/// it without depending on `draco-jail` directly. Only present with `tier2` on;
+/// the lean CLI build has no `__jail` hook and never references this.
+///
+/// `run_jail_child` is the `draco __jail` child entry (arms the sandbox, hosts
+/// the V8 capture, and never returns). `spawn_jail` is the supervisor-side spawn,
+/// re-exported for completeness / external drivers.
+#[cfg(feature = "tier2")]
+pub use draco_jail::{run_jail_child, spawn_jail, JailHandle};
 pub use ranking::{
     best_candidate, confirm_score, score_request, Candidate, MIN_VIABLE_SCORE, PENALTY_ANALYTICS,
     PENALTY_HTML, PENALTY_STATIC_ASSET, PENALTY_WRITE_METHOD, SCORE_API_HOST, SCORE_API_PATH,
