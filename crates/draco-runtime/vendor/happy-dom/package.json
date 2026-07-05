@@ -1,0 +1,1 @@
+{"name":"domspike","private":true,"type":"module","dependencies":{"@ungap/structured-clone":"^1.3.2","fastestsmallesttextencoderdecoder":"^1.0.22","happy-dom":"^20.10.6","rolldown":"^1.1.4","whatwg-url":"^17.0.0"}}

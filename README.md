@@ -113,7 +113,7 @@ unavailable) falls back to the static shell — never a crash, never a regressio
 | `draco-net` | Stealth TLS/JA4 HTTP client (wreq/BoringSSL): cookie jar, proxy, robots, backoff |
 | `draco-static` | **Markdown + metadata extraction** (Firecrawl-parity) · JSON embedded-state · build-id replay |
 | `draco-jail` | Sandbox supervisor + jailed child: userns/netns air-gap, Landlock, seccomp, IPC codec |
-| `draco-runtime` | Tier 2 V8 isolate (jitless), DOM + scheduler polyfill, `fetch`/`XHR` interception |
+| `draco-runtime` | Tier 2 V8 isolate (jitless): real happy-dom DOM engine baked into a build-time V8 snapshot, `fetch`/`XHR` interception |
 | `draco-core` | Escalation state machine, challenge short-circuit, ranking, replay |
 | `draco-cli` | The `draco` CLI + output contract |
 
