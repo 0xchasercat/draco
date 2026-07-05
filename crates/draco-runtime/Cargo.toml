@@ -23,5 +23,10 @@ tokio = { version = "1", features = ["rt", "time", "macros"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[build-dependencies]
+# build.rs bakes the base + happy-dom IIFE bundles into a V8 startup snapshot so
+# each isolate restores the DOM engine in ~ms instead of re-parsing ~2.6 MB of JS.
+deno_core = "0.406.0"
+
 [dev-dependencies]
 # Tests drive `run_capture` directly against in-repo HTML fixtures.

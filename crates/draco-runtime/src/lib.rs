@@ -1,52 +1,52 @@
-//! # draco-runtime — Tier 2 V8 isolate + fetch/XHR interception (Slice 3)
+//! # draco-runtime — Tier 2 V8 isolate + fetch/XHR interception
 //!
-//! Boots a V8 isolate via `deno_core`, installs a hand-written DOM + scheduler
-//! polyfill and a `fetch`/`XMLHttpRequest` interceptor, evaluates a page's inline
-//! scripts, and drives a **capture window**: the isolate runs until the event
-//! loop goes idle for `quiesce_ms` or the hard `capture_window_ms` cap elapses,
-//! whichever comes first. Every intercepted request is recorded (rank-agnostic —
-//! ranking is `draco-core`'s job) and answered with a synthetic stub so the page
-//! keeps hydrating and reveals more endpoints.
+//! Boots a V8 isolate via `deno_core`, restores a **build-time snapshot** of the
+//! DOM engine (**happy-dom** on a base of ecosystem web-primitive polyfills; see
+//! `build.rs` + `vendor/happy-dom/`), runs the per-isolate glue (`js/glue.js`:
+//! construct a happy-dom `Window`, mirror its DOM globals, install the
+//! `fetch`/`XMLHttpRequest` interceptor, load the page HTML), evaluates the page's
+//! inline scripts, and drives a **capture window**: the isolate runs until the
+//! event loop goes idle for `quiesce_ms` or the hard `capture_window_ms` cap
+//! elapses, whichever comes first. Every intercepted request is recorded
+//! (rank-agnostic — ranking is `draco-core`'s job) and answered with a synthetic
+//! stub so the page keeps hydrating and reveals more endpoints; when the window
+//! closes the hydrated DOM is serialized for the render-then-Markdown escalation.
 //!
-//! This crate is **self-contained**: no IPC lives here. Slice 4 (`draco-jail`)
-//! calls [`run_capture`] from the jailed child and maps each [`CapturedRequest`]
-//! to `draco_types::JailToSupervisor::Intercept` and [`CaptureReport::outcome`]
-//! to a `Result`. The frozen contract is `draco-types` (we reuse its
+//! This crate is **self-contained**: no IPC lives here. `draco-jail` calls
+//! [`run_capture`] from the jailed child and maps each [`CapturedRequest`] to
+//! `draco_types::JailToSupervisor::Intercept` and [`CaptureReport::outcome`] to a
+//! `Result`. The frozen contract is `draco-types` (we reuse its
 //! [`draco_types::InterceptVia`] and [`draco_types::RuntimeOutcome`]); this
 //! crate's own API is designed for that wiring but is not itself frozen.
 //!
-//! ## Implementation notes (canonical §8)
+//! ## Implementation notes
 //!
-//! * **Polyfill loading — runtime execution, not a build.rs snapshot.** The spec
-//!   lists a `build.rs` snapshot as *preferred* but explicitly permits runtime
-//!   execution "if the 0.406.0 snapshot API proves finicky". We chose runtime
-//!   execution: a custom-extension snapshot must exactly match op registration
-//!   between snapshot-build and runtime and must exclude JS from the extension,
-//!   which turns `build.rs` into a second V8-linking compilation unit and
-//!   interacts badly with `--jitless`. Executing the (small, hand-written)
-//!   polyfill at startup costs a few ms per isolate, keeps the crate to a single
-//!   compilation unit, and is far easier to test. See `js/polyfill.js`.
+//! * **DOM engine via a V8 startup snapshot.** happy-dom + its polyfill base are
+//!   ~2.6 MB of JS; parsing that on every isolate spawn costs ~95 ms. Instead
+//!   `build.rs` evaluates it once and serializes the V8 heap into a snapshot that
+//!   each isolate restores in ~single-digit ms (see [`SNAPSHOT`]). The snapshot is
+//!   heap + compiled code only — ops are registered per-isolate and resolved
+//!   lazily by the baked JS (`Deno.core.ops.op_*`) after restore.
 //!
 //! * **`--jitless`.** We pass `--jitless` and `--single-threaded` via
-//!   `deno_core::v8_set_flags` *before* the first isolate is created. Both are
-//!   accepted by the V8 this deno_core ships (v8 149.x); `--jitless` disables
-//!   the JIT (no RWX pages) and the WASM tier, and `--single-threaded` avoids
-//!   V8 background compiler/GC threads — both reduce the syscall surface the
-//!   jail's future seccomp policy must allow. `--jitless` does not conflict
-//!   with anything here because we do **not** create a V8 heap snapshot of our
-//!   own (see the polyfill note above). Flags V8 rejects are reported by
-//!   `v8_set_flags` and skipped (best-effort) rather than aborting; we verified
-//!   `--no-expose-wasm` is rejected by this build, so we do not pass it.
+//!   `deno_core::v8_set_flags` *before* the first isolate is created. `--jitless`
+//!   disables the JIT (no RWX pages) so the jail's seccomp policy can forbid
+//!   executable memory; `--single-threaded` avoids V8 background threads. Both
+//!   reduce the jail's syscall surface. Measured cost is negligible: the isolate's
+//!   work is snapshot restore + DOM construction, not hot JIT-tier loops, so JIT
+//!   buys nothing here — we keep the W^X lockdown. Flags V8 rejects are reported
+//!   and skipped (best-effort).
 //!
 //! * **Timers / event-loop driver.** deno_core 0.406.0's only timer reactor is
 //!   tokio-based (`tokio::time::sleep_until`), so the event loop must run under a
 //!   tokio time driver — a pure `futures::executor::block_on` would panic the
 //!   moment a timer future is polled. Honoring the spec's *intent* (keep the
 //!   jailed child's syscall surface small), we use a **current-thread** tokio
-//!   runtime with **`enable_time()` only** — no worker pool, no I/O reactor. Our
-//!   `setTimeout`/`setInterval` polyfill is backed by the `op_sleep` async op
-//!   (tokio sleep); a pending `op_sleep` keeps `poll_event_loop` returning
-//!   `Pending`, which is exactly the "loop is busy" signal the driver watches.
+//!   runtime with **`enable_time()` only** — no worker pool, no I/O reactor. The
+//!   base bundle's `setTimeout`/`setInterval` scheduler is backed by the
+//!   `op_sleep` async op (tokio sleep); a pending `op_sleep` keeps
+//!   `poll_event_loop` returning `Pending`, which is exactly the "loop is busy"
+//!   signal the driver watches.
 
 #![allow(clippy::type_complexity)]
 
@@ -300,8 +300,18 @@ deno_core::extension!(
 // Boot sequence + capture-window driver
 // ===================================================================
 
-const POLYFILL_JS: &str = include_str!("../js/polyfill.js");
-const INTERCEPTOR_JS: &str = include_str!("../js/interceptor.js");
+/// The base web-primitive environment + happy-dom DOM engine, baked into a V8
+/// startup snapshot at build time (see `build.rs`). Restoring it gives each
+/// isolate the full DOM engine resident in ~ms instead of re-parsing ~2.6 MB of
+/// JS. Ops are *not* in the snapshot — they are registered per-isolate below and
+/// resolved lazily by the baked JS (`Deno.core.ops.op_*`) after restore.
+static SNAPSHOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/DRACO_SNAPSHOT.bin"));
+
+/// Per-isolate runtime glue (runs after snapshot restore): constructs a fresh
+/// happy-dom `Window` for the target URL, mirrors its DOM globals onto
+/// `globalThis`, installs the `op_raze_fetch` fetch/XHR interceptor, and loads the
+/// fetched HTML so the framework's mount container exists.
+const GLUE_JS: &str = include_str!("../js/glue.js");
 
 async fn run_capture_inner(url: &str, html: &str, cfg: &CaptureConfig) -> CaptureReport {
     let stub_body = normalize_stub_body(&cfg.stub_response_json);
@@ -309,84 +319,66 @@ async fn run_capture_inner(url: &str, html: &str, cfg: &CaptureConfig) -> Captur
     let cap = Rc::new(RefCell::new(CaptureState {
         requests: Vec::new(),
         max_intercepts: cfg.max_intercepts,
-        stub_body,
+        stub_body: stub_body.clone(),
         rendered_html: None,
     }));
 
+    // Restore the DOM-engine snapshot and register the ops for this isolate.
     let mut runtime = JsRuntime::new(RuntimeOptions {
+        startup_snapshot: Some(SNAPSHOT),
         extensions: vec![draco_runtime_ext::init(cap.clone())],
         ..Default::default()
     });
 
-    // 1. Inject the page URL (for location/history) and the page <body> markup
-    //    (so the polyfill can materialize a real, stable mount-container node
-    //    tree — e.g. `<div id="app">` — that a client framework can find and
-    //    render into) before the polyfill runs.
+    // 1. Inject page inputs, then run the glue: it builds the happy-dom Window,
+    //    mirrors DOM globals onto globalThis, installs the fetch/XHR interceptor,
+    //    and loads the HTML into the document.
     let url_lit = json_string_literal(url);
-    let body_lit = json_string_literal(&extract_body_inner(html));
+    let html_lit = json_string_literal(html);
+    let stub_lit = json_string_literal(&stub_body);
     if let Err(e) = runtime.execute_script(
-        "draco:url",
+        "draco:inputs",
         format!(
-            "globalThis.__DRACO_URL__ = {url_lit}; globalThis.__DRACO_BODY_HTML__ = {body_lit};"
+            "globalThis.__DRACO_URL__={url_lit}; globalThis.__DRACO_HTML__={html_lit}; \
+             globalThis.__DRACO_STUB__={stub_lit};"
         ),
     ) {
         return finish(cap, RuntimeOutcome::Threw, Some(e.to_string()));
     }
-
-    // 2. DOM + scheduler polyfill, then fetch/XHR interceptor.
-    if let Err(e) = runtime.execute_script("draco:polyfill", POLYFILL_JS) {
-        return finish(cap, RuntimeOutcome::Threw, Some(e.to_string()));
-    }
-    if let Err(e) = runtime.execute_script("draco:interceptor", INTERCEPTOR_JS) {
+    if let Err(e) = runtime.execute_script("draco:glue", GLUE_JS) {
         return finish(cap, RuntimeOutcome::Threw, Some(e.to_string()));
     }
 
-    // 3. Evaluate the page's inline <script> contents in order. A throw in page
-    //    script is *not* fatal to the whole run — later scripts and already-
-    //    scheduled async work may still surface intercepts — but if it happens
-    //    before anything is captured we remember it so the outcome is `Threw`.
-    //
-    //    Before each inline script we point `document.currentScript` at a fresh
-    //    synthetic <script> element (appended to <head> by the polyfill), so a
-    //    script that reads `document.currentScript.parentElement` / `.dataset` /
-    //    `.src` during hydration — a common analytics/tag-manager pattern, and
-    //    one of the observed real-page crashes — resolves against a real element
-    //    for the *currently running* script rather than a stale or null one.
-    //    After the loop we reset it to a non-null default (the polyfill keeps it
-    //    non-null so late async reads stay safe). The per-script set is
-    //    best-effort: if it ever fails we log and proceed (the polyfill's default
-    //    currentScript still guarantees `.parentElement` never throws).
+    // 2. Evaluate the page's inline <script> contents in order against the
+    //    happy-dom document. A throw in page script is *not* fatal — later scripts
+    //    and already-scheduled async work may still surface intercepts — but if it
+    //    happens before anything is captured we remember it so the outcome is
+    //    `Threw`.
     let scripts = extract_inline_scripts(html);
     let mut threw_in_page = false;
     for (i, code) in scripts.into_iter().enumerate() {
-        if let Err(e) = runtime.execute_script(
+        // Point document.currentScript at a fresh <script> for this inline block
+        // (analytics/tag scripts read currentScript.parentElement); best-effort.
+        let _ = runtime.execute_script(
             "draco:currentScript",
-            format!("try {{ globalThis.document.__dracoSetCurrentScript({i}); }} catch (_) {{}}"),
-        ) {
-            // Non-fatal: the polyfill already installed a non-null default.
-            eprintln!("draco-runtime: could not set currentScript for page {i}: {e}");
-        }
+            "try { globalThis.__dracoSetCurrentScript(); } catch (_) {}",
+        );
         let name = format!("draco:page[{i}]");
         if let Err(e) = runtime.execute_script(name, code) {
             threw_in_page = true;
             eprintln!("draco-runtime: page script {i} threw: {e}");
         }
     }
-    // Reset currentScript after the synchronous script pass (best-effort).
     let _ = runtime.execute_script(
         "draco:currentScript:clear",
-        "try { globalThis.document.__dracoClearCurrentScript(); } catch (_) {}",
+        "try { globalThis.__dracoClearCurrentScript(); } catch (_) {}",
     );
 
-    // 4. Capture window: pump the event loop until quiescence or the hard cap.
+    // 3. Capture window: pump the event loop until quiescence or the hard cap.
     let outcome = drive_capture_window(&mut runtime, &cap, cfg, threw_in_page).await;
 
-    // 5. Serialize the hydrated DOM for the render-then-Markdown escalation. Done
-    //    *after* the window so any content the framework mounted (into e.g.
-    //    `<div id="app">`) is present. The page side serializes
-    //    `document.documentElement.outerHTML` and hands it back through
-    //    `op_raze_dom`; best-effort — a failure here never fails the capture, and
-    //    the JSON-interception path does not depend on it.
+    // 4. Serialize the hydrated DOM for the render-then-Markdown escalation, after
+    //    the window so any content the framework mounted is present.
     serialize_dom(&mut runtime);
 
     let cs = cap.borrow();
@@ -397,16 +389,18 @@ async fn run_capture_inner(url: &str, html: &str, cfg: &CaptureConfig) -> Captur
     }
 }
 
-/// Ask the page side to serialize the live hydrated DOM
-/// (`document.documentElement.outerHTML`) and hand it back via `op_raze_dom`,
-/// which stashes it in [`CaptureState`]. Wrapped in an in-page `try/catch` so a
-/// throwing serializer getter can never propagate; a failure to even run the
-/// script is swallowed (the render escalation simply sees no rendered DOM).
+/// Serialize the live hydrated DOM (`document.documentElement.outerHTML`, via the
+/// glue's `__dracoSerialize`) and hand it back through `op_raze_dom`. Wrapped in
+/// an in-page `try/catch` so a throwing getter can never propagate; a failure to
+/// even run the script is swallowed (the render escalation simply sees no DOM).
 fn serialize_dom(runtime: &mut JsRuntime) {
     const SERIALIZE_JS: &str = r#"(function () {
         try {
-            var el = globalThis.document && globalThis.document.documentElement;
-            Deno.core.ops.op_raze_dom(el ? el.outerHTML : "");
+            var h = (typeof globalThis.__dracoSerialize === "function")
+                ? globalThis.__dracoSerialize()
+                : (globalThis.document && globalThis.document.documentElement
+                    ? globalThis.document.documentElement.outerHTML : "");
+            Deno.core.ops.op_raze_dom(h || "");
         } catch (_e) {
             try { Deno.core.ops.op_raze_dom(""); } catch (_e2) {}
         }
@@ -691,39 +685,6 @@ fn extract_inline_scripts(html: &str) -> Vec<String> {
         i = next_i;
     }
     out
-}
-
-/// Extract the inner HTML of the document `<body>` (the static mount scaffold),
-/// so the polyfill can build a real node tree for it.
-///
-/// This is intentionally coarse: a byte scan for the first `<body...>`'s `>` and
-/// the last `</body>`. The polyfill's own parser drops any `<script>` elements
-/// (their code is executed separately), so it is fine to hand it the whole body
-/// including inline scripts. If there is no `<body>` tag we return the region
-/// after `</head>` (or the whole document) — a framework that mounts into
-/// `#app` still finds its container wherever the markup lives.
-fn extract_body_inner(html: &str) -> String {
-    let lower = html.to_ascii_lowercase();
-    let lb = lower.as_bytes();
-
-    if let Some(rel) = find_subslice(lb, b"<body") {
-        // Advance to the end of the opening <body ...> tag.
-        if let Some(gt) = find_subslice(&lb[rel..], b">") {
-            let start = rel + gt + 1;
-            let end = match find_subslice(&lb[start..], b"</body") {
-                Some(c) => start + c,
-                None => html.len(),
-            };
-            return html[start..end].to_string();
-        }
-    }
-
-    // No <body>: use everything after </head> if present, else the whole doc.
-    if let Some(rel) = find_subslice(lb, b"</head>") {
-        let start = rel + b"</head>".len();
-        return html[start..].to_string();
-    }
-    html.to_string()
 }
 
 /// Decide whether an opening `<script ...>` tag is executable JS: skip if it has
