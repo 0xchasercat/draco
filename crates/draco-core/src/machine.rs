@@ -154,6 +154,10 @@ struct Run {
     markdown: Option<String>,
     /// Flat page metadata, staged alongside [`Run::markdown`].
     metadata: Option<serde_json::Value>,
+    /// The tier the staged Markdown came from: [`SourceTier::Static`] for a
+    /// plain fetch+parse, or [`SourceTier::RuntimeInterception`] once the
+    /// render-then-Markdown escalation hydrated a thin shell and re-scraped it.
+    md_tier: SourceTier,
 }
 
 /// Which timing bucket a step's elapsed time is charged to.
@@ -178,6 +182,7 @@ impl Run {
             timing: Timing::default(),
             markdown: None,
             metadata: None,
+            md_tier: SourceTier::Static,
         }
     }
 
@@ -335,9 +340,10 @@ where
         let scraped = statics.scrape(&body, url, resp.meta.status, &content_type, true);
         let md_ms = t_md.elapsed().as_millis() as u64;
 
-        // A thin, client-rendered SPA shell has almost no main content. We still
-        // return what there is, but note that an SPA render pass would help.
-        // (The render→markdown escalation itself is a deliberate follow-up.)
+        // A thin, client-rendered SPA shell has almost no static main content.
+        // When Tier 2 is permitted this triggers the render-then-Markdown
+        // escalation below; when it is capped out (`--tier-max < 2`) we return the
+        // shell as-is and say so.
         let thin = draco_static::content::is_thin_content(&scraped.markdown, THIN_CONTENT_CHARS);
         run.record(
             SourceTier::Static,
@@ -345,9 +351,14 @@ where
             StepOutcome::Matched,
             md_ms,
             Bucket::Parse,
-            Some(if thin {
+            Some(if thin && tier_max >= 2 {
                 format!(
-                    "{} chars (thin: client-rendered SPA shell — an SPA render pass would help)",
+                    "{} chars (thin client-rendered shell — escalating to render)",
+                    scraped.markdown.len()
+                )
+            } else if thin {
+                format!(
+                    "{} chars (thin client-rendered shell — render skipped, tier_max={tier_max})",
                     scraped.markdown.len()
                 )
             } else {
@@ -358,9 +369,31 @@ where
         run.markdown = Some(scraped.markdown);
         run.metadata = Some(scraped.metadata);
 
+        // Render-then-Markdown escalation: a thin client-rendered SPA shell has
+        // almost no static content, but the same Tier 2 isolate that leaks JSON
+        // endpoints also hydrates the DOM. When the shell is thin and Tier 2 is
+        // permitted, hydrate, serialize the live DOM, and re-scrape it — the
+        // isolate is the browser stand-in Firecrawl uses, feeding the identical
+        // HTML→Markdown transform. Upgrades `run.markdown`/`metadata` in place and
+        // records `runtime.render`; leaves them untouched if it can't do better.
+        if thin && tier_max >= 2 {
+            try_render_markdown(
+                &mut run,
+                url,
+                &body,
+                resp.meta.status,
+                &content_type,
+                config,
+                capture,
+            )
+            .await;
+        }
+
         if config.format == OutputFormat::Markdown {
-            // Terminal for the default path — no tier escalation.
-            return run.finish(Status::Success, Some(SourceTier::Static), None, None);
+            // Terminal for the default path (Static, or RuntimeInterception if
+            // the render escalation upgraded the Markdown).
+            let tier = run.md_tier;
+            return run.finish(Status::Success, Some(tier), None, None);
         }
         // `Both`: continue into the JSON ladder, carrying markdown+metadata.
     }
@@ -439,7 +472,8 @@ where
     // `Both` run with staged Markdown is a `Success` (source_tier: Static),
     // just without a `data` payload. A pure `Json` run stays `Unsupported`.
     if run.markdown.is_some() {
-        return run.finish(Status::Success, Some(SourceTier::Static), None, None);
+        let tier = run.md_tier;
+        return run.finish(Status::Success, Some(tier), None, None);
     }
     run.finish(Status::Unsupported, None, None, None)
 }
@@ -630,6 +664,143 @@ where
     None
 }
 
+/// Non-whitespace character count — the metric the thin-shell / render-gain
+/// checks are expressed in (a page's real "content mass", robust to reflowed
+/// whitespace).
+fn nonws_len(s: &str) -> usize {
+    s.chars().filter(|c| !c.is_whitespace()).count()
+}
+
+/// Render-then-Markdown escalation (feature-on). Hydrate the thin shell in the
+/// Tier 2 isolate, serialize the live DOM, merge it with the shell's real
+/// `<head>`, and re-run the content engine. On a material content gain it
+/// upgrades `run.markdown`/`run.metadata` and marks `run.md_tier` as
+/// [`SourceTier::RuntimeInterception`]; otherwise it leaves the static Markdown
+/// untouched. Always records a `runtime.render` trace step (and `runtime.sandbox`
+/// when the child reported a posture). Never returns a result — the Markdown path
+/// finalizes at its call site.
+#[cfg(feature = "tier2")]
+async fn try_render_markdown<T>(
+    run: &mut Run,
+    url: &str,
+    body: &str,
+    status: u16,
+    content_type: &str,
+    config: &Config,
+    capture: &T,
+) where
+    T: Tier2Capture + ?Sized,
+{
+    let t_cap = Instant::now();
+    let capture_result = match capture.capture(url, body.as_bytes(), config).await {
+        Ok(c) => c,
+        Err(e) => {
+            // A jail/IPC failure is not fatal to the Markdown path: we already
+            // have the static shell Markdown staged. Record the miss and keep it.
+            run.record(
+                SourceTier::RuntimeInterception,
+                "runtime.render",
+                StepOutcome::Failed,
+                t_cap.elapsed().as_millis() as u64,
+                Bucket::Runtime,
+                Some(error_summary(&e)),
+            );
+            return;
+        }
+    };
+    let cap_ms = t_cap.elapsed().as_millis() as u64;
+
+    // Surface the achieved sandbox posture (as the JSON Tier 2 path does).
+    if let Some(level) = capture_result.sandbox_level.as_deref() {
+        run.record(
+            SourceTier::RuntimeInterception,
+            "runtime.sandbox",
+            StepOutcome::Matched,
+            0,
+            Bucket::None,
+            Some(level.to_string()),
+        );
+    }
+
+    let Some(rendered) = capture_result.rendered_html.as_deref() else {
+        run.record(
+            SourceTier::RuntimeInterception,
+            "runtime.render",
+            StepOutcome::Missed,
+            cap_ms,
+            Bucket::Runtime,
+            Some(format!("{:?}, no DOM serialized", capture_result.outcome)),
+        );
+        return;
+    };
+
+    // Merge the shell's real <head> (title, OG, canonical, <base>) with the
+    // hydrated <body>, then re-run the identical Firecrawl-parity content engine.
+    let merged = draco_static::content::merge_rendered_document(body, rendered);
+    let rescraped = draco_static::content::scrape(&merged, url, status, content_type, true);
+
+    let prev_len = run.markdown.as_deref().map(nonws_len).unwrap_or(0);
+    let new_len = nonws_len(&rescraped.markdown);
+
+    // Upgrade only when hydration actually de-thinned the page: strictly more
+    // content than the shell *and* past the thin-shell bar (a hydration that
+    // produced nothing, or only chrome, must not replace a cleaner static parse).
+    if new_len > prev_len
+        && !draco_static::content::is_thin_content(&rescraped.markdown, THIN_CONTENT_CHARS)
+    {
+        run.markdown = Some(rescraped.markdown);
+        run.metadata = Some(rescraped.metadata);
+        run.md_tier = SourceTier::RuntimeInterception;
+        run.record(
+            SourceTier::RuntimeInterception,
+            "runtime.render",
+            StepOutcome::Matched,
+            cap_ms,
+            Bucket::Runtime,
+            Some(format!(
+                "hydrated DOM re-scraped to {new_len} chars (shell had {prev_len})"
+            )),
+        );
+    } else {
+        run.record(
+            SourceTier::RuntimeInterception,
+            "runtime.render",
+            StepOutcome::Missed,
+            cap_ms,
+            Bucket::Runtime,
+            Some(format!(
+                "hydration added no usable content ({new_len} vs {prev_len} chars); kept static shell"
+            )),
+        );
+    }
+}
+
+/// Render-then-Markdown escalation (lean build, no `tier2` feature): there is no
+/// isolate linked, so record that the render pass was skipped and keep the static
+/// Markdown. Signature mirrors the feature-on version so the call site is
+/// feature-agnostic.
+#[cfg(not(feature = "tier2"))]
+async fn try_render_markdown<T>(
+    run: &mut Run,
+    _url: &str,
+    _body: &str,
+    _status: u16,
+    _content_type: &str,
+    _config: &Config,
+    _capture: &T,
+) where
+    T: Tier2Capture + ?Sized,
+{
+    run.record(
+        SourceTier::RuntimeInterception,
+        "runtime.render",
+        StepOutcome::Skipped,
+        0,
+        Bucket::None,
+        Some("built without tier2: render-then-markdown not compiled in".to_string()),
+    );
+}
+
 /// Tier 1 sub-flow. Returns `Some(result)` if the ladder should terminate here
 /// (a successful build-id replay), or `None` to fall through to Tier 2.
 async fn try_tier1<F, S>(
@@ -778,6 +949,7 @@ impl Run {
             timing: std::mem::take(&mut self.timing),
             markdown: self.markdown.take(),
             metadata: self.metadata.take(),
+            md_tier: self.md_tier,
         }
     }
 }
@@ -1342,7 +1514,10 @@ mod tests {
         // must never be reached (it would panic on the real jail).
         let fetcher = MockFetcher::ok_html(200, "<html><body><h1>Hi</h1></body></html>")
             .with_header("content-type", "text/html; charset=utf-8");
-        let statics = MockStatic::default().with_markdown("# Hi\n\nSome body text here.");
+        // A normal (non-thin) content page: static extraction already found the
+        // article, so the render escalation must not fire.
+        let article = "# Hi\n\n".to_string() + &"Some real body text here. ".repeat(20);
+        let statics = MockStatic::default().with_markdown(&article);
         // A capture double that *panics* if the ladder ever reaches Tier 2.
         let capture = MockCapture::failing(DracoError::Jail {
             reason: draco_types::JailKind::Killed,
@@ -1360,7 +1535,7 @@ mod tests {
         assert_eq!(r.status, Status::Success);
         assert_eq!(r.source_tier, Some(SourceTier::Static));
         assert!(r.data.is_none(), "markdown path carries no JSON data");
-        assert_eq!(r.markdown.as_deref(), Some("# Hi\n\nSome body text here."));
+        assert_eq!(r.markdown.as_deref(), Some(article.as_str()));
         // Metadata carries the synthetic keys from the (mock) scrape.
         let meta = r.metadata.expect("metadata present");
         assert_eq!(meta["statusCode"], 200);
@@ -1378,9 +1553,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn markdown_thin_spa_notes_render_pass() {
-        // A near-empty (thin) scrape still succeeds but the trace notes that an
-        // SPA render pass would help.
+    async fn markdown_thin_spa_escalates_to_render() {
+        // A thin shell triggers the render escalation. With a capture double that
+        // returns no serialized DOM, the run still succeeds on the shell markdown
+        // but the trace shows the attempted render pass (Missed, no DOM).
         let fetcher = MockFetcher::ok_html(200, "<html><body><div id=root></div></body></html>");
         let statics = MockStatic::default().with_markdown("x"); // 1 char → thin
         let r = run_ladder(
@@ -1392,6 +1568,9 @@ mod tests {
         )
         .await;
         assert_eq!(r.status, Status::Success);
+        // Still Static: no DOM came back, so the shell markdown is retained.
+        assert_eq!(r.source_tier, Some(SourceTier::Static));
+
         let md_step = r
             .trace
             .iter()
@@ -1402,8 +1581,107 @@ mod tests {
                 .detail
                 .as_deref()
                 .unwrap()
-                .contains("SPA render pass"),
-            "thin content should note an SPA render pass: {:?}",
+                .contains("escalating to render"),
+            "thin content should note the render escalation: {:?}",
+            md_step.detail
+        );
+        // The render pass was attempted and recorded as a miss (no DOM serialized).
+        let render_step = r
+            .trace
+            .iter()
+            .find(|t| t.action == "runtime.render")
+            .expect("a runtime.render step should be recorded");
+        assert_eq!(render_step.outcome, StepOutcome::Missed);
+    }
+
+    #[tokio::test]
+    async fn markdown_render_escalation_upgrades_thin_shell() {
+        // The full render-then-Markdown win: a thin shell whose Tier 2 hydration
+        // returns a content-rich serialized DOM. The engine re-scrapes it, the
+        // Markdown is upgraded, and the source tier becomes RuntimeInterception.
+        let shell = "<html><head><title>Docs</title>\
+            <meta property=\"og:title\" content=\"Realtime Docs\"></head>\
+            <body><div id=app></div></body></html>";
+        let fetcher = MockFetcher::ok_html(200, shell)
+            .with_header("content-type", "text/html; charset=utf-8");
+        let statics = MockStatic::default().with_markdown("Loading…"); // thin shell
+
+        // The hydrated DOM the isolate "serialized": a real article body.
+        let hydrated = format!(
+            "<html><head></head><body><main><article><h1>Realtime Docs</h1>{}</article></main></body></html>",
+            "<p>Draco hydrates the SPA in a jitless V8 isolate, serializes the live DOM, \
+             and re-runs the Firecrawl-parity content engine over it to produce Markdown.</p>"
+                .repeat(3)
+        );
+        let capture = MockCapture::rendered(hydrated);
+
+        let r = run_ladder(
+            "https://docs.example/guide",
+            &cfg_markdown(),
+            &fetcher,
+            &statics,
+            &capture,
+        )
+        .await;
+
+        assert_eq!(r.status, Status::Success);
+        assert_eq!(
+            r.source_tier,
+            Some(SourceTier::RuntimeInterception),
+            "a successful render escalation should be attributed to Tier 2"
+        );
+        let md = r.markdown.expect("markdown present");
+        assert!(
+            md.contains("Realtime Docs") && md.contains("Firecrawl-parity content engine"),
+            "upgraded markdown should carry the hydrated article: {md:?}"
+        );
+        assert!(
+            !draco_static::content::is_thin_content(&md, THIN_CONTENT_CHARS),
+            "upgraded markdown should no longer be thin"
+        );
+        // Metadata is recovered from the shell's real <head> via the merge.
+        let meta = r.metadata.expect("metadata present");
+        assert_eq!(meta["title"], "Docs");
+        assert_eq!(meta["og:title"], "Realtime Docs");
+
+        let render_step = r
+            .trace
+            .iter()
+            .find(|t| t.action == "runtime.render")
+            .expect("a runtime.render step should be recorded");
+        assert_eq!(render_step.outcome, StepOutcome::Matched);
+    }
+
+    #[tokio::test]
+    async fn markdown_thin_shell_render_skipped_when_tier_capped() {
+        // With `--tier-max 1`, a thin shell must NOT boot the isolate: the render
+        // escalation is gated on tier_max >= 2. The shell markdown is returned and
+        // the trace says the render was skipped.
+        let fetcher = MockFetcher::ok_html(200, "<html><body><div id=root></div></body></html>");
+        let statics = MockStatic::default().with_markdown("x"); // thin
+        let capture = MockCapture::failing(DracoError::Jail {
+            reason: draco_types::JailKind::Killed,
+            detail: "must not be reached when tier-capped".into(),
+        });
+        let mut cfg = cfg_markdown();
+        cfg.tier_max = 1;
+        let r = run_ladder("https://spa.example/", &cfg, &fetcher, &statics, &capture).await;
+
+        assert_eq!(r.status, Status::Success);
+        assert_eq!(r.source_tier, Some(SourceTier::Static));
+        assert_eq!(capture.calls(), 0, "isolate must not boot when tier-capped");
+        let md_step = r
+            .trace
+            .iter()
+            .find(|t| t.action == "static.markdown")
+            .unwrap();
+        assert!(
+            md_step
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("render skipped"),
+            "tier-capped thin shell should note render skipped: {:?}",
             md_step.detail
         );
     }

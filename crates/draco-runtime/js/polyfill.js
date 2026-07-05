@@ -359,20 +359,69 @@
     "area", "base", "br", "col", "embed", "hr", "img", "input",
     "link", "meta", "param", "source", "track", "wbr",
   ]);
+  // HTML-escape text/attribute values so the serialized DOM re-parses cleanly on
+  // the Rust side (the render-then-Markdown escalation feeds outerHTML straight
+  // into html5ever). Raw `<`, `&`, `>` in framework-rendered text would otherwise
+  // corrupt the tree.
+  function escapeText(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+  function escapeAttr(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;");
+  }
+  // Decode the HTML entities that matter for text/attribute fidelity, in a single
+  // pass (so `&amp;lt;` decodes to the literal `&lt;`, not `<`). Applied when
+  // *parsing* markup into the DOM, so the in-memory text model is decoded and the
+  // serializer's escaping round-trips losslessly — matching real DOM semantics.
+  function decodeEntities(s) {
+    return String(s == null ? "" : s).replace(
+      /&(#x[0-9a-fA-F]+|#[0-9]+|[a-zA-Z][a-zA-Z0-9]*);/g,
+      function (m, ent) {
+        if (ent[0] === "#") {
+          var code =
+            ent[1] === "x" || ent[1] === "X"
+              ? parseInt(ent.slice(2), 16)
+              : parseInt(ent.slice(1), 10);
+          if (isFinite(code)) {
+            try {
+              return String.fromCodePoint(code);
+            } catch (_e) {
+              return m;
+            }
+          }
+          return m;
+        }
+        switch (ent) {
+          case "amp": return "&";
+          case "lt": return "<";
+          case "gt": return ">";
+          case "quot": return '"';
+          case "apos": return "'";
+          case "nbsp": return " ";
+          default: return m;
+        }
+      },
+    );
+  }
   function serializeChildren(node) {
     let out = "";
     for (const c of node.childNodes) out += serializeNode(c);
     return out;
   }
   function serializeNode(node) {
-    if (node.nodeType === 3) return String(node.data == null ? "" : node.data);
+    if (node.nodeType === 3) return escapeText(node.data);
     if (node.nodeType === 8) return "<!--" + String(node.data || "") + "-->";
     if (node.nodeType === 11) return serializeChildren(node);
     if (node.nodeType !== 1) return "";
     const tag = String(node.tagName || "div").toLowerCase();
     let attrs = "";
     for (const k of Object.keys(node.attributes)) {
-      attrs += " " + k + '="' + String(node.attributes[k]) + '"';
+      attrs += " " + k + '="' + escapeAttr(node.attributes[k]) + '"';
     }
     if (VOID_TAGS.has(tag)) return "<" + tag + attrs + ">";
     return "<" + tag + attrs + ">" + serializeChildren(node) + "</" + tag + ">";
@@ -877,11 +926,20 @@
       insertBeforeImpl(top(), el, null);
       const lower = tag.toLowerCase();
       if (lower === "script" || lower === "style" || lower === "textarea" || lower === "title") {
-        // Rawtext element: consume verbatim to its close tag.
+        // Rawtext element: consume verbatim to its close tag. `<script>`/`<style>`
+        // hold code (never entity-decode); `<textarea>`/`<title>` hold character
+        // data (decode, as a real parser does).
         const close = "</" + lower;
         const ci = html.toLowerCase().indexOf(close, end + 1);
         const stop = ci < 0 ? n : ci;
-        if (stop > end + 1) appendText(el, html.slice(end + 1, stop), ownerDoc);
+        if (stop > end + 1) {
+          const rawContent = html.slice(end + 1, stop);
+          if (lower === "script" || lower === "style") {
+            appendRawText(el, rawContent, ownerDoc);
+          } else {
+            appendText(el, rawContent, ownerDoc);
+          }
+        }
         const gi = ci < 0 ? n : html.indexOf(">", ci);
         i = gi < 0 ? n : gi + 1;
         continue;
@@ -892,6 +950,14 @@
     return frag;
   }
   function appendText(parent, text, ownerDoc) {
+    if (!text) return;
+    const t = makeNode(3, null, decodeEntities(text));
+    t.ownerDocument = ownerDoc;
+    insertBeforeImpl(parent, t, null);
+  }
+  // Append verbatim text (no entity decoding) — for raw-text elements
+  // (`<script>`/`<style>`) whose contents are code, not HTML character data.
+  function appendRawText(parent, text, ownerDoc) {
     if (!text) return;
     const t = makeNode(3, null, text);
     t.ownerDocument = ownerDoc;
@@ -910,7 +976,7 @@
       let v = am[2];
       if (v == null) v = "";
       else if (v[0] === '"' || v[0] === "'") v = v.slice(1, -1);
-      attrs.push([k, v]);
+      attrs.push([k, decodeEntities(v)]);
     }
     return { tag, attrs };
   }

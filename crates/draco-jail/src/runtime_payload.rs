@@ -191,8 +191,15 @@ fn capture(_url: &str, _html: &str, _cfg: &CaptureConfig) -> CaptureReport {
 ///
 /// `seq` is the 0-based capture index; header order within each request is
 /// preserved verbatim by `run_capture`, and we do not reorder it.
+///
+/// The terminal `Result` frame's **body** carries the hydrated DOM serialized by
+/// the runtime (`CaptureReport::rendered_html`), when present — this is the raw
+/// material for the supervisor's render-then-Markdown escalation. Reusing the
+/// frame body keeps the frozen `JailToSupervisor::Result` header unchanged while
+/// still returning the rendered markup; an absent DOM is an empty body.
 fn emit_report(stream: &mut UnixStream, report: CaptureReport) -> Result<(), PayloadError> {
     let intercept_count = report.requests.len() as u32;
+    let rendered_html = report.rendered_html;
 
     for (seq, req) in report.requests.into_iter().enumerate() {
         let CapturedRequest {
@@ -218,13 +225,14 @@ fn emit_report(stream: &mut UnixStream, report: CaptureReport) -> Result<(), Pay
         )?;
     }
 
+    let result_body = rendered_html.unwrap_or_default();
     frame::write_jail_frame(
         stream,
         &JailToSupervisor::Result {
             outcome: report.outcome,
             intercept_count,
         },
-        &[],
+        result_body.as_bytes(),
     )?;
     Ok(())
 }
@@ -266,6 +274,7 @@ mod tests {
                 cap("https://x.com/api/a", InterceptVia::Fetch, None),
                 cap("https://x.com/api/b", InterceptVia::Xhr, Some("{\"q\":1}")),
             ],
+            rendered_html: None,
         });
 
         let (sup, child) = UnixStream::pair().unwrap();
@@ -340,6 +349,55 @@ mod tests {
                 intercept_count: 2,
             }
         );
+        // No rendered DOM in this report → empty Result body.
+        assert!(result.body.is_empty(), "expected empty Result body");
+
+        drop(sup);
+        child_handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn rendered_dom_rides_the_result_frame_body() {
+        let _guard = CAPTURE_TEST_LOCK.lock().unwrap();
+        let dom = "<html><head></head><body><h1>Hydrated</h1></body></html>";
+        set_canned(CaptureReport {
+            outcome: RuntimeOutcome::Quiesced,
+            requests: vec![],
+            rendered_html: Some(dom.to_string()),
+        });
+
+        let (sup, child) = UnixStream::pair().unwrap();
+        let child_handle = thread::spawn(move || run_capture_loop(child, None));
+        let mut sup = sup;
+
+        let _ready = read_jail_frame(&mut sup).unwrap();
+        write_supervisor_frame(
+            &mut sup,
+            &SupervisorToJail::Hydrate {
+                url: "https://spa.example/".into(),
+                capture_window_ms: 500,
+                quiesce_ms: 50,
+                max_intercepts: 8,
+                stub_response_json: "{}".into(),
+            },
+            b"<html><body><div id=app></div></body></html>",
+        )
+        .unwrap();
+
+        // The terminal Result carries the serialized hydrated DOM in its body.
+        let result = read_jail_frame(&mut sup).unwrap();
+        assert_eq!(
+            result.header,
+            JailToSupervisor::Result {
+                outcome: RuntimeOutcome::Quiesced,
+                intercept_count: 0,
+            }
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&result.body),
+            dom,
+            "serialized DOM should ride the Result frame body"
+        );
 
         drop(sup);
         child_handle.join().unwrap().unwrap();
@@ -351,6 +409,7 @@ mod tests {
         set_canned(CaptureReport {
             outcome: RuntimeOutcome::NoIntercepts,
             requests: vec![],
+            rendered_html: None,
         });
 
         let (sup, child) = UnixStream::pair().unwrap();
@@ -406,6 +465,7 @@ mod tests {
         set_canned(CaptureReport {
             outcome: RuntimeOutcome::NoIntercepts,
             requests: vec![],
+            rendered_html: None,
         });
 
         let (sup, child) = UnixStream::pair().unwrap();

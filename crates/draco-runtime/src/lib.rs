@@ -110,6 +110,13 @@ pub struct CapturedRequest {
 pub struct CaptureReport {
     pub outcome: RuntimeOutcome,
     pub requests: Vec<CapturedRequest>,
+    /// The hydrated DOM serialized as `document.documentElement.outerHTML` once
+    /// the capture window closes — the raw material for the render-then-Markdown
+    /// escalation (a thin client-rendered shell is hydrated here, then the
+    /// content engine runs over *this* markup instead of the empty shell).
+    /// `None` when serialization was not attempted or produced nothing usable
+    /// (e.g. the isolate failed to boot, or the page left an empty body).
+    pub rendered_html: Option<String>,
 }
 
 /// Boot an isolate, evaluate `html`'s inline scripts under `url`, run the capture
@@ -133,6 +140,7 @@ pub fn run_capture(url: &str, html: &str, cfg: &CaptureConfig) -> CaptureReport 
             return CaptureReport {
                 outcome: RuntimeOutcome::Threw,
                 requests: Vec::new(),
+                rendered_html: None,
             };
         }
     };
@@ -162,6 +170,9 @@ struct CaptureState {
     max_intercepts: u32,
     /// Verbatim stub body (already normalized; never empty).
     stub_body: String,
+    /// The hydrated DOM serialized after the capture window (via `op_raze_dom`),
+    /// for the render-then-Markdown escalation. `None` until serialization runs.
+    rendered_html: Option<String>,
 }
 
 /// JSON shape `op_raze_fetch` receives from the interceptor JS.
@@ -225,6 +236,19 @@ fn op_raze_fetch(
     Ok(resp.to_string())
 }
 
+/// Receive the hydrated DOM serialized by the page side
+/// (`document.documentElement.outerHTML`) and stash it in [`CaptureState`] for the
+/// render-then-Markdown escalation. Called once, after the capture window closes.
+/// An empty or whitespace-only string is treated as "nothing to render".
+#[deno_core::op2(fast)]
+fn op_raze_dom(state: &mut OpState, #[string] html: String) {
+    if html.trim().is_empty() {
+        return;
+    }
+    let cap = state.borrow::<Rc<RefCell<CaptureState>>>().clone();
+    cap.borrow_mut().rendered_html = Some(html);
+}
+
 /// Sleep `ms` milliseconds, then resolve. Backs the polyfill's timer scheduler.
 /// A pending `op_sleep` future keeps the deno_core event loop non-idle.
 ///
@@ -265,7 +289,7 @@ fn op_resolve_url(#[string] base: String, #[string] rel: String) -> String {
 
 deno_core::extension!(
     draco_runtime_ext,
-    ops = [op_raze_fetch, op_sleep, op_resolve_url],
+    ops = [op_raze_fetch, op_sleep, op_resolve_url, op_raze_dom],
     options = { cap: Rc<RefCell<CaptureState>> },
     state = |state, options| {
         state.put::<Rc<RefCell<CaptureState>>>(options.cap);
@@ -286,6 +310,7 @@ async fn run_capture_inner(url: &str, html: &str, cfg: &CaptureConfig) -> Captur
         requests: Vec::new(),
         max_intercepts: cfg.max_intercepts,
         stub_body,
+        rendered_html: None,
     }));
 
     let mut runtime = JsRuntime::new(RuntimeOptions {
@@ -356,8 +381,40 @@ async fn run_capture_inner(url: &str, html: &str, cfg: &CaptureConfig) -> Captur
     // 4. Capture window: pump the event loop until quiescence or the hard cap.
     let outcome = drive_capture_window(&mut runtime, &cap, cfg, threw_in_page).await;
 
-    let requests = cap.borrow().requests.clone();
-    CaptureReport { outcome, requests }
+    // 5. Serialize the hydrated DOM for the render-then-Markdown escalation. Done
+    //    *after* the window so any content the framework mounted (into e.g.
+    //    `<div id="app">`) is present. The page side serializes
+    //    `document.documentElement.outerHTML` and hands it back through
+    //    `op_raze_dom`; best-effort — a failure here never fails the capture, and
+    //    the JSON-interception path does not depend on it.
+    serialize_dom(&mut runtime);
+
+    let cs = cap.borrow();
+    CaptureReport {
+        outcome,
+        requests: cs.requests.clone(),
+        rendered_html: cs.rendered_html.clone(),
+    }
+}
+
+/// Ask the page side to serialize the live hydrated DOM
+/// (`document.documentElement.outerHTML`) and hand it back via `op_raze_dom`,
+/// which stashes it in [`CaptureState`]. Wrapped in an in-page `try/catch` so a
+/// throwing serializer getter can never propagate; a failure to even run the
+/// script is swallowed (the render escalation simply sees no rendered DOM).
+fn serialize_dom(runtime: &mut JsRuntime) {
+    const SERIALIZE_JS: &str = r#"(function () {
+        try {
+            var el = globalThis.document && globalThis.document.documentElement;
+            Deno.core.ops.op_raze_dom(el ? el.outerHTML : "");
+        } catch (_e) {
+            try { Deno.core.ops.op_raze_dom(""); } catch (_e2) {}
+        }
+    })()"#;
+
+    if let Err(e) = runtime.execute_script("draco:serialize-dom", SERIALIZE_JS) {
+        eprintln!("draco-runtime: DOM serialization script failed: {e}");
+    }
 }
 
 /// Drive `poll_event_loop` manually, tracking wall-clock deadline and an
@@ -479,7 +536,14 @@ fn finish(
         eprintln!("draco-runtime: {outcome:?}: {d}");
     }
     let requests = cap.borrow().requests.clone();
-    CaptureReport { outcome, requests }
+    // `finish` is only reached on a pre-hydration boot failure (URL inject /
+    // polyfill / interceptor threw), so there is no meaningful hydrated DOM to
+    // serialize.
+    CaptureReport {
+        outcome,
+        requests,
+        rendered_html: None,
+    }
 }
 
 // ===================================================================

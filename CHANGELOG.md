@@ -3,6 +3,50 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.4.0] — 2026-07-06
+
+**Render-then-Markdown escalation** — Draco now scrapes client-rendered SPAs to
+clean Markdown, not just static pages. This closes the v0.3.0 roadmap item: a
+page whose *content* only exists after JavaScript runs is no longer returned as
+an empty shell.
+
+### Added
+- **Render-then-Markdown for thin client-rendered shells.** When the initial
+  fetch yields a thin shell (almost no static main content) and Tier 2 is
+  permitted (`--tier-max >= 2`, the default), Draco hydrates the page in the same
+  jitless V8 isolate it uses for JSON interception, serializes the *live* DOM
+  (`document.documentElement.outerHTML`), splices the shell's real `<head>`
+  (title, Open Graph, canonical, `<base>`) onto the hydrated `<body>`, and re-runs
+  the identical Firecrawl-parity content engine over it. This mirrors how a real
+  browser render feeds an HTML→Markdown transform — the isolate is the browser
+  stand-in. One hydration now serves both `--format markdown` (DOM serialization)
+  and `--format json` (endpoint interception).
+- The result `trace` gains a **`runtime.render`** step (with the re-scraped
+  character count), and a successful escalation is attributed to
+  `source_tier: runtime_interception`. A thin shell that can't be improved (no
+  DOM, hydration added nothing, or the isolate was unavailable) keeps the static
+  shell and says so in the trace — never a regression, never a crash.
+
+### Changed
+- The runtime serializes the hydrated DOM after the capture window and returns it
+  on the terminal IPC `Result` frame body (the frozen `JailToSupervisor::Result`
+  header is unchanged — the DOM rides the frame body). `CaptureReport` /
+  `CaptureResult` gain a `rendered_html` field.
+- The isolate's DOM serializer now HTML-escapes text and attribute values, and
+  the DOM parser decodes HTML entities into the in-memory text model — so the
+  serialized markup re-parses losslessly (and `textContent` is finally correct
+  for entity-bearing text). Raw-text elements (`<script>`/`<style>`) are left
+  verbatim.
+
+### Notes
+- `--tier-max 1`/`0` skips the render pass (returns the static shell, noted in the
+  trace). The lean `--no-default-features` build has no isolate and reports the
+  render as skipped.
+- As with `--format json` Tier 2, the OS-level jail requires Linux ≥ 5.13 with
+  unprivileged user namespaces (or macOS's isolate mode); on hosts without it the
+  render escalation degrades to the static shell. See
+  `docs/BARE_METAL_VALIDATION.md`.
+
 ## [0.3.0] — 2026-07-05
 
 Draco is now a **Markdown-first web scraper** — a lighter Firecrawl/Browserbase

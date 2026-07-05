@@ -70,6 +70,12 @@ pub(crate) struct CaptureResult {
     /// (macos)"`), surfaced as the `runtime.sandbox` trace step. `None` if the
     /// child did not report one (e.g. the offline mock capture).
     pub sandbox_level: Option<String>,
+    /// The hydrated DOM the runtime serialized (`document.documentElement.
+    /// outerHTML`), carried on the terminal `Result` frame body. `Some` when the
+    /// isolate produced usable markup — the input to the render-then-Markdown
+    /// escalation ([`crate::machine`]); `None` otherwise (empty body, or the
+    /// offline mock capture).
+    pub rendered_html: Option<String>,
 }
 
 /// The Tier 2 capture seam: given the page URL + Tier-0 HTML, produce a
@@ -364,6 +370,7 @@ mod prod {
         let mut candidates = Vec::new();
         let mut bodies = Vec::new();
         let mut sandbox_level: Option<String> = None;
+        let mut rendered_html: Option<String> = None;
         let outcome: RuntimeOutcome = loop {
             let f = match frame::read_jail_frame(ipc) {
                 Ok(f) => f,
@@ -392,7 +399,15 @@ mod prod {
                     });
                     bodies.push(if has_body { Some(f.body) } else { None });
                 }
-                JailToSupervisor::Result { outcome, .. } => break outcome,
+                JailToSupervisor::Result { outcome, .. } => {
+                    // The Result frame's body carries the hydrated DOM the runtime
+                    // serialized (empty when there was none) — the raw material for
+                    // the render-then-Markdown escalation.
+                    if !f.body.is_empty() {
+                        rendered_html = Some(String::from_utf8_lossy(&f.body).into_owned());
+                    }
+                    break outcome;
+                }
                 // A Log prefixed with the sandbox-level marker carries the achieved
                 // posture; other Logs are diagnostic only.
                 JailToSupervisor::Log { msg, .. } => {
@@ -422,6 +437,7 @@ mod prod {
             bodies,
             outcome,
             sandbox_level,
+            rendered_html,
         })
     }
 
@@ -658,6 +674,7 @@ mod tests {
             bodies,
             outcome: RuntimeOutcome::Quiesced,
             sandbox_level: None,
+            rendered_html: None,
         }
     }
 
@@ -804,6 +821,7 @@ mod tests {
             bodies: vec![Some(br#"{"sku":"ABC","qty":1}"#.to_vec())],
             outcome: RuntimeOutcome::Quiesced,
             sandbox_level: None,
+            rendered_html: None,
         }
     }
 
