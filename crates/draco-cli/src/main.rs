@@ -49,6 +49,11 @@ enum Command {
         /// Dev-only: run Tier 2 un-jailed.
         #[arg(long)]
         no_jail: bool,
+        /// Allow Tier 2 to replay a state-changing request (an unsafe HTTP
+        /// method that is not a GraphQL/JSON-RPC read) picked by ranking. Off by
+        /// default: such requests are withheld from replay for mutation-safety.
+        #[arg(long)]
+        allow_unsafe_replay: bool,
         /// Bypass robots.txt.
         #[arg(long)]
         ignore_robots: bool,
@@ -198,6 +203,7 @@ async fn async_main() {
             tier_max,
             capture_window_ms,
             no_jail,
+            allow_unsafe_replay,
             ignore_robots,
             pretty,
         } => {
@@ -209,6 +215,7 @@ async fn async_main() {
                 tier_max,
                 capture_window_ms,
                 no_jail,
+                allow_unsafe_replay,
             };
             let mut result = extract(&url, &config).await;
             if let Some(expr) = extract_expr.as_deref() {

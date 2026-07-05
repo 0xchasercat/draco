@@ -381,7 +381,7 @@ where
     F: PageFetcher + ?Sized,
     T: Tier2Capture + ?Sized,
 {
-    use crate::tier2::rank_and_replay;
+    use crate::tier2::{no_replay_reason, rank_and_replay};
 
     // --- Spawn + capture (jailed child hosts the isolate) ------------------
     let t_cap = Instant::now();
@@ -429,8 +429,19 @@ where
     );
 
     // --- Rank + replay the winner -----------------------------------------
+    // Mutation-safety (see `ranking::best_replayable`) is applied here at replay
+    // time: `config.allow_unsafe_replay` decides whether a state-changing request
+    // the ranker picked may be replayed.
     let t_rank = Instant::now();
-    match rank_and_replay(&capture_result, url, opts, fetcher).await {
+    match rank_and_replay(
+        &capture_result,
+        url,
+        opts,
+        fetcher,
+        config.allow_unsafe_replay,
+    )
+    .await
+    {
         Ok(Some((data, detail))) => {
             // `runtime.rank` picked a viable winner; `runtime.replay` fetched
             // JSON. Charge the replay hop to the network bucket.
@@ -459,15 +470,18 @@ where
             ))
         }
         Ok(None) => {
-            // Either nothing cleared the viability bar, or the winner's replay
-            // was non-2xx / not JSON. Record a Missed rank and fall through.
+            // Either nothing cleared the viability bar, a viable candidate was
+            // withheld for mutation-safety, or the winner's replay was non-2xx /
+            // not JSON. Record a Missed rank with the precise reason (so a safety
+            // withhold — and the `--allow-unsafe-replay` escape hatch — is
+            // observable in the trace) and fall through to Unsupported.
             run.record(
                 SourceTier::RuntimeInterception,
                 "runtime.rank",
                 StepOutcome::Missed,
                 t_rank.elapsed().as_millis() as u64,
                 Bucket::None,
-                Some("no viable JSON endpoint among intercepts".to_string()),
+                Some(no_replay_reason(&capture_result, url).note().to_string()),
             );
             None
         }

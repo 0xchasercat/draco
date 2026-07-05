@@ -517,6 +517,15 @@ fn normalize_stub_body(raw: &str) -> String {
 /// everything verbatim between each `<script ...>`'s `>` and the next
 /// case-insensitive `</script>`.
 ///
+/// HTML **comments** (`<!-- … -->`) are skipped wholesale before we ever look
+/// for a tag: a `<script>` written inside a comment is not a real element, so
+/// treating it as an opening tag would desync extraction (we'd scan for a
+/// `</script>` that closes the *real* script and swallow everything between).
+/// When the scanner meets `<!--` at (or before) the next `<script`, it advances
+/// past the matching `-->` and interprets nothing inside as markup. Note this is
+/// only for comments *outside* a script body — a `<!--` appearing inside rawtext
+/// script content is captured verbatim like any other byte.
+///
 /// External scripts (`src=...`) and non-executable `type`s (JSON-LD, importmap,
 /// `application/json`, `__NEXT_DATA__`, `speculationrules`, templates, …) are
 /// skipped — we only run real JS.
@@ -529,6 +538,26 @@ fn extract_inline_scripts(html: &str) -> Vec<String> {
 
     while let Some(rel) = find_subslice(&lb[i..], b"<script") {
         let tag_start = i + rel;
+
+        // Skip any HTML comment that opens at or before this `<script`. A comment
+        // is markup we must ignore entirely (§ rawtext note above): if `<!--`
+        // begins before `tag_start`, this `<script` is inside a comment (or a
+        // comment sits between us and it), so jump past the comment's `-->` and
+        // re-scan. Advancing past the *matching* `-->` is what keeps a
+        // `<script>` mention inside the comment from being read as a real tag.
+        if let Some(crel) = find_subslice(&lb[i..], b"<!--") {
+            let comment_start = i + crel;
+            if comment_start <= tag_start {
+                // Find the comment terminator; an unterminated comment eats the
+                // rest of the document (matching how browsers treat it).
+                i = match find_subslice(&lb[comment_start + b"<!--".len()..], b"-->") {
+                    Some(erel) => comment_start + b"<!--".len() + erel + b"-->".len(),
+                    None => bytes.len(),
+                };
+                continue;
+            }
+        }
+
         // The char right after "<script" must be whitespace, '>' or '/' — else
         // it's something like "<scripting" and we skip past this match.
         let after = tag_start + b"<script".len();
@@ -791,6 +820,66 @@ mod tests {
         assert_eq!(scripts.len(), 2, "got: {scripts:?}");
         assert!(scripts[0].contains("var a=1"));
         assert!(scripts[1].contains("var b=2"));
+    }
+
+    #[test]
+    fn extract_scripts_skips_script_tag_inside_html_comment() {
+        // A `<script>` *mentioned inside* an HTML comment must NOT be read as a
+        // real opening tag — otherwise the scanner would pair it with the real
+        // script's `</script>` and desync extraction. Only the one real inline
+        // script should be extracted (and thus evaluated).
+        let html = r#"<html><body>
+            <!-- disabled during rollout:
+                 <script>fetch("/api/legacy"); var x = a < b;</script>
+                 keep this commented out -->
+            <script>fetch("/api/real");</script>
+            <!-- trailing note, also <script>ignored()</script> -->
+        </body></html>"#;
+        let scripts = extract_inline_scripts(html);
+        assert_eq!(scripts.len(), 1, "only the real script; got: {scripts:?}");
+        assert!(
+            scripts[0].contains(r#"fetch("/api/real")"#),
+            "wrong script extracted: {:?}",
+            scripts[0]
+        );
+        // The commented-out script's contents must never surface.
+        assert!(
+            !scripts[0].contains("/api/legacy"),
+            "commented script leaked into extraction: {:?}",
+            scripts[0]
+        );
+        assert!(
+            !scripts[0].contains("ignored()"),
+            "trailing commented script leaked: {:?}",
+            scripts[0]
+        );
+    }
+
+    #[test]
+    fn extract_scripts_preserves_comment_syntax_inside_rawtext_body() {
+        // A `<!--` (or `-->`) appearing *inside* a real script body is rawtext,
+        // not a comment: it must be captured verbatim and must not cause the
+        // scanner to skip the script. (Legacy "hide from ancient browsers" trick.)
+        let html =
+            "<script><!--\nvar keep = 1; if (a < b) go(); //--></script><script>var two=2;</script>";
+        let scripts = extract_inline_scripts(html);
+        assert_eq!(scripts.len(), 2, "got: {scripts:?}");
+        assert!(
+            scripts[0].contains("var keep = 1"),
+            "body 1: {:?}",
+            scripts[0]
+        );
+        assert!(
+            scripts[0].contains("<!--"),
+            "lost `<!--` in body: {:?}",
+            scripts[0]
+        );
+        assert!(
+            scripts[0].contains("//-->"),
+            "lost `//-->` in body: {:?}",
+            scripts[0]
+        );
+        assert!(scripts[1].contains("var two=2"), "body 2: {:?}", scripts[1]);
     }
 
     #[test]
