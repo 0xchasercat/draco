@@ -224,6 +224,107 @@ fn framework_scheduler_hydration_surfaces_endpoints() {
     );
 }
 
+/// Compose the Vue fixture: inline the *real* vendored Vue 3 global build in
+/// place of the `__VUE_GLOBAL_BUILD__` marker, so the document handed to the
+/// runtime has the genuine Vue source as its first inline `<script>`.
+fn vue_fixture_html() -> String {
+    let vue = include_str!("fixtures/vendor/vue.global.prod.js");
+    let fixture = include_str!("fixtures/vue_app.html");
+    // The marker sits inside the first <script>; replacing it inlines Vue there.
+    let html = fixture.replace("__VUE_GLOBAL_BUILD__;", vue);
+    assert!(
+        html.contains("Vue=function") || html.contains("Vue = function"),
+        "vendored Vue source did not get inlined into the fixture"
+    );
+    html
+}
+
+/// End-to-end proof that a *real framework bundle* hydrates inside the isolate
+/// and leaks its data fetch(es).
+///
+/// This is the crate's headline case: the vendored Vue 3.5.39 global build runs
+/// verbatim, compiles a template, mounts into the real `#app` node the polyfill
+/// materialized from the page `<body>`, fires the component's `mounted()`
+/// lifecycle hook, and — because the interceptor answers each fetch with a stub
+/// so reactivity keeps flowing — reveals a *dependent* fetch (a `watch` on state
+/// that the first response mutates) plus a paint-deferred child fetch. If Vue
+/// did not truly mount into the DOM tree, `mounted()` would never run and
+/// nothing would surface.
+#[test]
+fn real_vue_bundle_hydrates_and_leaks_fetch() {
+    let html = vue_fixture_html();
+    // Stub the primary response with a concrete item id so the dependent fetch
+    // carries a deterministic `id=42` (proving the stub body flowed back into
+    // the app and drove the chained request).
+    let mut c = cfg();
+    c.stub_response_json = r#"{"ok":true,"items":[{"id":42}]}"#.to_string();
+    let report = run_capture("https://dashboard.example.com/", &html, &c);
+
+    assert!(
+        matches!(
+            report.outcome,
+            RuntimeOutcome::Quiesced | RuntimeOutcome::WindowClosed
+        ),
+        "unexpected outcome: {:?} (captured: {:?})",
+        report.outcome,
+        report.requests,
+    );
+
+    // 1. Primary fetch from the mounted() lifecycle hook.
+    let data = find(&report.requests, "/api/data").unwrap_or_else(|| {
+        panic!(
+            "Vue did not leak its mounted() fetch — captured: {:?}",
+            report.requests
+        )
+    });
+    assert_eq!(data.method, "GET");
+    assert_eq!(data.via, InterceptVia::Fetch);
+    assert!(
+        data.url.starts_with("https://dashboard.example.com/"),
+        "url not absolutized: {}",
+        data.url
+    );
+    assert!(
+        data.headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("accept") && v.contains("application/json")),
+        "accept header lost through the real Vue fetch wrapper: {:?}",
+        data.headers
+    );
+
+    // 2. Dependent fetch: discoverable only after the primary response mutated
+    //    reactive state and Vue's watcher ran. The stub body drives the id=42.
+    let detail = find(&report.requests, "/api/detail").unwrap_or_else(|| {
+        panic!(
+            "dependent (watcher-triggered) fetch never surfaced — captured: {:?}",
+            report.requests
+        )
+    });
+    assert_eq!(detail.via, InterceptVia::Fetch);
+    assert!(
+        detail.url.contains("id=42"),
+        "dependent fetch did not carry the id from the stub response: {}",
+        detail.url
+    );
+
+    // 3. Paint-deferred fetch from a mounted child component (setTimeout path).
+    let panel = find(&report.requests, "/api/panel/config").unwrap_or_else(|| {
+        panic!(
+            "paint-deferred child fetch never surfaced — captured: {:?}",
+            report.requests
+        )
+    });
+    assert_eq!(panel.via, InterceptVia::Fetch);
+
+    // All three endpoints leaked from one real bundle.
+    assert!(
+        report.requests.len() >= 3,
+        "expected >=3 captures from the Vue app, got {}: {:?}",
+        report.requests.len(),
+        report.requests,
+    );
+}
+
 #[test]
 fn post_with_json_body_captures_body_bytes() {
     let html = r#"

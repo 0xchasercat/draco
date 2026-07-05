@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Real Vue 3 hydration fixture</title>
+  </head>
+  <body>
+    <!-- The static mount scaffold. draco-runtime parses this <body> into a real
+         node tree, so `#app` below is a stable node Vue actually mounts into. -->
+    <div id="app"></div>
+
+    <!-- FIRST inline block: the *real*, vendored Vue 3.5.39 global build.
+         The test inlines the contents of tests/fixtures/vendor/vue.global.prod.js
+         in place of the __VUE_GLOBAL_BUILD__ marker before calling run_capture,
+         so the document handed to the runtime has the genuine Vue source as its
+         first inline script (which defines the global `Vue`). We keep it as a
+         marker rather than a 165 KB copy checked in twice. -->
+    <script>
+      __VUE_GLOBAL_BUILD__;
+    </script>
+
+    <!-- SECOND inline block: a real Vue app.
+         Two components exercise the full hydration path draco-runtime must
+         survive and observe:
+
+         1. <App> compiles a template with reactive interpolation, mounts into
+            the real #app node, and in its mounted() lifecycle hook issues the
+            primary data fetch. If Vue did not truly mount into the DOM tree,
+            mounted() would never fire and no request would surface.
+
+         2. When that fetch resolves, App writes the response into reactive
+            state (`detailId`). A `watch` on that state — i.e. a dependent load
+            that is only discoverable AFTER the first response mutates the
+            component — issues a SECOND, dependent fetch. A child <Panel>
+            component additionally schedules a paint-deferred fetch via
+            setTimeout, mirroring frameworks that defer secondary loads.
+
+         All three requests must be intercepted with via: Fetch. -->
+    <script>
+      const { createApp, defineComponent, h, ref, watch, onMounted } = Vue;
+
+      const Panel = defineComponent({
+        setup() {
+          // Paint-deferred secondary load, scheduled from a mounted child.
+          onMounted(() => {
+            setTimeout(() => {
+              fetch("/api/panel/config", { headers: { accept: "application/json" } });
+            }, 5);
+          });
+          return () => h("section", { class: "panel" }, "panel ready");
+        },
+      });
+
+      const App = defineComponent({
+        setup() {
+          const status = ref("loading");
+          const detailId = ref(0);
+
+          // Dependent fetch: only discoverable once the primary response has
+          // mutated reactive state. Proves deferred, chained requests surface.
+          watch(detailId, (id) => {
+            if (id > 0) {
+              fetch("/api/detail?id=" + id, { headers: { accept: "application/json" } })
+                .then((r) => r.json())
+                .then(() => {
+                  status.value = "ready";
+                });
+            }
+          });
+
+          // Primary data fetch, fired from the mounted lifecycle hook.
+          onMounted(() => {
+            fetch("/api/data", { headers: { accept: "application/json" } })
+              .then((r) => r.json())
+              .then((data) => {
+                const first = data && data.items && data.items[0];
+                detailId.value = (first && first.id) || 7;
+              });
+          });
+
+          return () =>
+            h("main", { class: "app", "data-status": status.value }, [
+              h("h1", null, "Dashboard"),
+              h("p", null, "status: " + status.value),
+              h(Panel),
+            ]);
+        },
+      });
+
+      createApp(App).mount("#app");
+    </script>
+  </body>
+</html>
