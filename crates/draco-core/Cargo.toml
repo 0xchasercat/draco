@@ -18,7 +18,7 @@ default = ["tier2"]
 # here is a no-op off Linux and arms the `--no-jail` dev fork's raw syscalls on it.
 # `dep:tokio` gives the production capture seam `spawn_blocking` (the ladder runs
 # under the caller's multi-thread runtime; the blocking jail IPC goes off-worker).
-tier2 = ["dep:draco-jail", "dep:draco-runtime", "dep:libc", "dep:tokio"]
+tier2 = ["dep:draco-jail", "dep:draco-runtime", "dep:libc", "dep:tokio", "dep:regex"]
 
 # The dependency graph is frozen here even though the skeleton does not yet call
 # every crate; WS-C wires Tier 0/1 (net + static), Slice 4 wires Tier 2 (jail +
@@ -42,6 +42,9 @@ async-trait = "0.1"
 # onto `tokio::task::spawn_blocking`. Optional + tier2-gated so the lean build
 # does not require a tokio dependency here.
 tokio = { workspace = true, optional = true }
+# tier2-only: extract `<script src>` + ES-module import specifiers from the page
+# so the supervisor can pre-fetch the script subresources for the isolate.
+regex = { version = "1", optional = true }
 
 # Linux-only, tier2-only: raw fork/dup2/exec/waitpid for the `--no-jail` dev path
 # (an un-jailed re-exec of `draco __jail`) and to reap the jailed child. Optional +

@@ -3,6 +3,38 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.6.0] — 2026-07-06
+
+**ES-module & external-script apps now hydrate.** Previously the Tier 2 isolate
+ran only *inline classic* `<script>` — so real SPAs (external bundles,
+`<script type="module">`, dynamic `import()`) never executed. Draco now runs
+them, with the (air-gapped) isolate fed by a supervisor-side prefetch.
+
+### Added
+- **In-isolate ES-module execution** (`draco-runtime`): a `deno_core` module
+  loader (`MapModuleLoader`) backed by a `{url → source}` map serves static +
+  dynamic imports; a module not in the map resolves to an **empty module**
+  (graceful) so a missing lazy chunk can't crash hydration. Scripts run in
+  document order — classic (inline/external) via `execute_script`, ES modules via
+  `load_side_es_module` + `mod_evaluate`. New entry
+  `run_capture_with_resources(url, html, cfg, resources)`.
+- **Supervisor script prefetch + module-graph crawl** (`draco-core`):
+  `prefetch_scripts` seeds from every `<script src>`, then BFS-crawls the ES
+  module graph (static/dynamic/`export … from` specifiers, resolved per importer)
+  via `draco-net`, bounded by file-count + total-byte caps. The air-gap holds —
+  the **supervisor** fetches; the isolate never does. (Import extraction is regex
+  today; an `oxc_parser` pass is the planned upgrade.)
+- **IPC**: `SupervisorToJail::Resource { url }` frames (body = source) stream the
+  prefetched subresources to the jailed child before `Hydrate`; the child
+  accumulates them into the module-loader map.
+
+### Notes
+- Verified end-to-end: an empty-shell SPA whose entire article is delivered by an
+  external module + static import + dynamic `import()` hydrates and extracts to
+  clean Markdown (`source_tier: runtime_interception`).
+- `--tier-max 1`/`0` still skips the isolate; the lean `--no-default-features`
+  build compiles with the prefetch/regex path gated out.
+
 ## [0.5.0] — 2026-07-06
 
 **Tier 2 DOM engine replaced: real happy-dom, baked into a V8 snapshot.** The

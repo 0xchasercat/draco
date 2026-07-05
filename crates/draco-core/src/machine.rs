@@ -398,6 +398,8 @@ where
                 &content_type,
                 incomplete,
                 config,
+                &opts,
+                fetcher,
                 capture,
             )
             .await;
@@ -517,9 +519,15 @@ where
 {
     use crate::tier2::{no_replay_reason, rank_and_replay};
 
-    // --- Spawn + capture (jailed child hosts the isolate) ------------------
+    // --- Prefetch script subresources, then spawn + capture ----------------
+    // The air-gapped isolate can't fetch, so the supervisor pre-fetches the page's
+    // scripts (external `<script src>`, module graph) and hands them to the child.
     let t_cap = Instant::now();
-    let capture_result = match capture.capture(url, body.as_bytes(), config).await {
+    let resources = prefetch_scripts(url, body, opts, fetcher).await;
+    let capture_result = match capture
+        .capture(url, body.as_bytes(), &resources, config)
+        .await
+    {
         Ok(c) => c,
         Err(e) => {
             // A jail/IPC failure is a hard failure of Tier 2: record it and
@@ -685,6 +693,131 @@ fn nonws_len(s: &str) -> usize {
     s.chars().filter(|c| !c.is_whitespace()).count()
 }
 
+/// Pre-fetch the page's script subresources so the (air-gapped) Tier 2 isolate
+/// can run external `<script src>` and resolve `import`/`import()` for
+/// `type="module"` apps without ever touching the network itself.
+///
+/// Seeds from every `<script src>` in the HTML, then BFS-crawls the ES-module
+/// graph (static + dynamic import specifiers) via `draco-net`, resolving each
+/// against its importer. Bounded by a file count and total-byte cap so a
+/// pathological graph can't blow up. Bare/unresolvable specifiers (npm bare
+/// names, `data:` URLs) and non-2xx fetches are skipped. Best-effort: any fetch
+/// error just omits that resource (the isolate degrades gracefully).
+#[cfg(feature = "tier2")]
+async fn prefetch_scripts<F>(
+    page_url: &str,
+    html: &str,
+    opts: &SessionOpts,
+    fetcher: &F,
+) -> Vec<crate::tier2::ScriptResource>
+where
+    F: PageFetcher + ?Sized,
+{
+    use crate::tier2::ScriptResource;
+    use std::collections::{HashSet, VecDeque};
+
+    const MAX_FILES: usize = 64;
+    const MAX_TOTAL_BYTES: usize = 12 * 1024 * 1024;
+
+    let Ok(base) = url::Url::parse(page_url) else {
+        return Vec::new();
+    };
+
+    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut out: Vec<ScriptResource> = Vec::new();
+    let mut total = 0usize;
+
+    for src in scan_script_srcs(html) {
+        if let Ok(u) = base.join(&src) {
+            if u.scheme() == "http" || u.scheme() == "https" {
+                queue.push_back(u.to_string());
+            }
+        }
+    }
+
+    while let Some(u) = queue.pop_front() {
+        if out.len() >= MAX_FILES || total >= MAX_TOTAL_BYTES {
+            break;
+        }
+        if !visited.insert(u.clone()) {
+            continue;
+        }
+        let resp = match fetcher.fetch(&u, opts).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if !(200..300).contains(&resp.meta.status) {
+            continue;
+        }
+        let bytes = resp.body.to_vec();
+        total = total.saturating_add(bytes.len());
+
+        // Crawl this module's imports (resolved against its own URL).
+        if let Ok(mod_url) = url::Url::parse(&u) {
+            let src = String::from_utf8_lossy(&bytes);
+            for spec in extract_module_imports(&src) {
+                if let Ok(child) = mod_url.join(&spec) {
+                    if (child.scheme() == "http" || child.scheme() == "https")
+                        && !visited.contains(child.as_str())
+                    {
+                        queue.push_back(child.to_string());
+                    }
+                }
+            }
+        }
+
+        out.push(ScriptResource {
+            url: u,
+            source: bytes,
+        });
+    }
+
+    out
+}
+
+/// Extract every `<script … src="…">` URL from HTML, in document order.
+#[cfg(feature = "tier2")]
+fn scan_script_srcs(html: &str) -> Vec<String> {
+    use std::sync::LazyLock;
+    static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r#"(?is)<script\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']"#).unwrap()
+    });
+    RE.captures_iter(html)
+        .filter_map(|c| c.get(1).map(|m| m.as_str().trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Extract ES-module import/export specifiers (static `from "…"`, side-effect
+/// `import "…"`, re-export `export … from "…"`, and dynamic `import("…")`).
+/// Approximate (regex, not a full parse) — over-matching only causes a few
+/// harmless extra same-origin GETs; a future pass can swap in `oxc_parser`.
+#[cfg(feature = "tier2")]
+fn extract_module_imports(src: &str) -> Vec<String> {
+    use std::sync::LazyLock;
+    static RE: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
+        vec![
+            // import ... from "x"  /  export ... from "x"
+            regex::Regex::new(r#"(?s)\b(?:import|export)\b[^;'"]*?\bfrom\s*["']([^"']+)["']"#)
+                .unwrap(),
+            // bare side-effect import "x"
+            regex::Regex::new(r#"(?s)\bimport\s*["']([^"']+)["']"#).unwrap(),
+            // dynamic import("x")
+            regex::Regex::new(r#"(?s)\bimport\s*\(\s*["']([^"']+)["']\s*\)"#).unwrap(),
+        ]
+    });
+    let mut out = Vec::new();
+    for re in RE.iter() {
+        for c in re.captures_iter(src) {
+            if let Some(m) = c.get(1) {
+                out.push(m.as_str().to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Render-then-Markdown escalation (feature-on). Hydrate the thin shell in the
 /// Tier 2 isolate, serialize the live DOM, merge it with the shell's real
 /// `<head>`, and re-run the content engine. On a material content gain it
@@ -695,7 +828,7 @@ fn nonws_len(s: &str) -> usize {
 /// finalizes at its call site.
 #[cfg(feature = "tier2")]
 #[allow(clippy::too_many_arguments)]
-async fn try_render_markdown<T>(
+async fn try_render_markdown<F, T>(
     run: &mut Run,
     url: &str,
     body: &str,
@@ -703,12 +836,19 @@ async fn try_render_markdown<T>(
     content_type: &str,
     shell_incomplete: bool,
     config: &Config,
+    opts: &SessionOpts,
+    fetcher: &F,
     capture: &T,
 ) where
+    F: PageFetcher + ?Sized,
     T: Tier2Capture + ?Sized,
 {
     let t_cap = Instant::now();
-    let capture_result = match capture.capture(url, body.as_bytes(), config).await {
+    let resources = prefetch_scripts(url, body, opts, fetcher).await;
+    let capture_result = match capture
+        .capture(url, body.as_bytes(), &resources, config)
+        .await
+    {
         Ok(c) => c,
         Err(e) => {
             // A jail/IPC failure is not fatal to the Markdown path: we already
@@ -812,7 +952,7 @@ async fn try_render_markdown<T>(
 /// feature-agnostic.
 #[cfg(not(feature = "tier2"))]
 #[allow(clippy::too_many_arguments)]
-async fn try_render_markdown<T>(
+async fn try_render_markdown<F, T>(
     run: &mut Run,
     _url: &str,
     _body: &str,
@@ -820,8 +960,11 @@ async fn try_render_markdown<T>(
     _content_type: &str,
     _shell_incomplete: bool,
     _config: &Config,
+    _opts: &SessionOpts,
+    _fetcher: &F,
     _capture: &T,
 ) where
+    F: PageFetcher + ?Sized,
     T: Tier2Capture + ?Sized,
 {
     run.record(
@@ -1070,6 +1213,68 @@ mod tests {
     use crate::testutil::{err_fetcher, noop_capture, MockCapture, MockFetcher, MockStatic};
     use draco_types::{ExtractOrigin, ExtractedData, InterceptVia, NetKind};
     use serde_json::json;
+
+    // ---- ES-module subresource prefetch ------------------------------
+
+    #[test]
+    fn scan_script_srcs_finds_external_scripts_only() {
+        let html = r#"<html><head>
+            <script src="/a.js"></script>
+            <script type="module" src="https://cdn.example/b.mjs"></script>
+            <script>inline(); // no src</script>
+            <script src='c.js' defer></script>
+          </head></html>"#;
+        let srcs = scan_script_srcs(html);
+        assert_eq!(srcs, vec!["/a.js", "https://cdn.example/b.mjs", "c.js"]);
+    }
+
+    #[test]
+    fn extract_module_imports_covers_static_dynamic_reexport() {
+        let src = r#"
+            import a from "./a.js";
+            import { b } from '/x/b.js';
+            import "./side-effect.js";
+            export { c } from "./c.js";
+            const p = import("./lazy.js");
+            const bare = "not an import";
+        "#;
+        let mut got = extract_module_imports(src);
+        got.sort();
+        got.dedup();
+        for want in [
+            "./a.js",
+            "/x/b.js",
+            "./side-effect.js",
+            "./c.js",
+            "./lazy.js",
+        ] {
+            assert!(got.contains(&want.to_string()), "missing {want}: {got:?}");
+        }
+        assert!(!got.iter().any(|s| s == "not an import"));
+    }
+
+    #[tokio::test]
+    async fn prefetch_scripts_fetches_external_seed_scripts() {
+        // Each fetched script (fixed mock body) is returned as a ScriptResource,
+        // keyed by its URL resolved against the page.
+        let html = r#"<html><head>
+            <script src="/static/app.js"></script>
+            <script type="module" src="/static/entry.mjs"></script>
+          </head><body></body></html>"#;
+        let fetcher = MockFetcher::ok_html(200, "console.log('bundle');");
+        let opts = SessionOpts::default();
+        let res = prefetch_scripts("https://shop.example.com/p", html, &opts, &fetcher).await;
+        let urls: Vec<&str> = res.iter().map(|r| r.url.as_str()).collect();
+        assert!(
+            urls.contains(&"https://shop.example.com/static/app.js"),
+            "{urls:?}"
+        );
+        assert!(
+            urls.contains(&"https://shop.example.com/static/entry.mjs"),
+            "{urls:?}"
+        );
+        assert!(res.iter().all(|r| !r.source.is_empty()));
+    }
 
     // ---- pure helpers -------------------------------------------------
 

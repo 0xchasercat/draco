@@ -102,6 +102,13 @@ of length) and escalated the same way. `Loading…` placeholder lines are always
 stripped from the output, so that noise never reaches you even if the render pass
 is capped (`--tier-max 1`) or can't improve the page.
 
+**External scripts & ES modules** are handled too. The isolate runs a page's
+external `<script src>` and `<script type="module">` (with `import` / dynamic
+`import()`), not just inline scripts. Because the isolate is network-isolated, the
+supervisor pre-fetches the script subresources — seeding from the `<script>` tags
+and crawling the ES-module import graph — and hands them to the isolate; the page
+JS itself still performs zero I/O.
+
 A thin shell that can't be improved (hydration adds nothing, or the isolate is
 unavailable) falls back to the static shell — never a crash, never a regression.
 

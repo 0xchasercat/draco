@@ -226,6 +226,15 @@ pub enum ExtractOrigin {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum SupervisorToJail {
+    /// A pre-fetched script subresource for the upcoming `Hydrate`. The frame
+    /// **body** carries the raw source bytes; `url` is its absolute URL (the key
+    /// the isolate's module loader resolves against). Sent zero or more times
+    /// *before* `Hydrate`; the child accumulates them so `<script src>` and
+    /// `import`/`import()` for `type="module"` apps resolve without the
+    /// (air-gapped) child ever touching the network.
+    Resource {
+        url: String,
+    },
     /// Evaluate a page. The frame **body** carries the raw HTML bytes.
     Hydrate {
         url: String,
