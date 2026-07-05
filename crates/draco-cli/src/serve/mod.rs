@@ -40,6 +40,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
+/// `POST /v1/crawl` + `GET|DELETE /v1/crawl/{id}` — async whole-site crawl jobs.
+pub(crate) mod crawl;
+/// `POST /v1/map` — fast site URL discovery (sitemap + on-page links).
+pub(crate) mod map;
+
 // ===================================================================
 // Options & state
 // ===================================================================
@@ -53,9 +58,11 @@ pub struct ServeOptions {
     pub defaults: Config,
 }
 
-struct AppState {
-    defaults: Config,
-    gate: Semaphore,
+pub(crate) struct AppState {
+    pub(crate) defaults: Config,
+    pub(crate) gate: Semaphore,
+    /// In-memory registry of async crawl jobs (`/v1/crawl`).
+    pub(crate) crawl: crawl::JobStore,
 }
 
 // ===================================================================
@@ -68,6 +75,7 @@ pub async fn serve(opts: ServeOptions) -> Result<(), String> {
     let state = Arc::new(AppState {
         defaults: opts.defaults,
         gate: Semaphore::new(opts.max_concurrency.max(1)),
+        crawl: crawl::JobStore::default(),
     });
     let addr = format!("{}:{}", opts.host, opts.port);
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -85,6 +93,13 @@ fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/scrape", post(scrape))
+        .route("/v1/map", post(map::map_handler))
+        .route("/v1/crawl", post(crawl::start_handler))
+        .route(
+            "/v1/crawl/{id}",
+            get(crawl::status_handler).delete(crawl::cancel_handler),
+        )
+        .route("/mcp", post(crate::mcp::http_handler))
         .with_state(state)
 }
 
@@ -200,7 +215,7 @@ async fn scrape(
 /// Markdown (Firecrawl's default). Recognized-but-unsupported formats fail
 /// loudly — a client asking for `rawHtml` should not get a silently different
 /// payload.
-fn parse_formats(formats: &[String]) -> Result<OutputFormat, String> {
+pub(crate) fn parse_formats(formats: &[String]) -> Result<OutputFormat, String> {
     let (mut markdown, mut json) = (false, false);
     for f in formats {
         match f.as_str() {
@@ -234,12 +249,12 @@ fn parse_formats(formats: &[String]) -> Result<OutputFormat, String> {
 }
 
 /// Firecrawl error envelope.
-fn error_body(message: &str) -> Value {
+pub(crate) fn error_body(message: &str) -> Value {
     json!({ "success": false, "error": message })
 }
 
 /// Map a terminal [`ExtractionResult`] to (HTTP status, Firecrawl body).
-fn to_firecrawl(result: &ExtractionResult, format: OutputFormat) -> (StatusCode, Value) {
+pub(crate) fn to_firecrawl(result: &ExtractionResult, format: OutputFormat) -> (StatusCode, Value) {
     let draco_ext = json!({
         "sourceTier": result.source_tier,
         "timing": result.timing,
@@ -323,6 +338,7 @@ mod tests {
         Arc::new(AppState {
             defaults,
             gate: Semaphore::new(2),
+            crawl: crawl::JobStore::default(),
         })
     }
 
