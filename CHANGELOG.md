@@ -3,6 +3,23 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.2.1] — 2026-07-05
+
+### Fixed
+- **Tier 2 hydration no longer crashes on standard Web APIs.** Real page scripts
+  (and third-party analytics/fingerprinting like Cloudflare Zaraz) were throwing
+  `ReferenceError: btoa is not defined`, `document.currentScript` was `undefined`
+  (`…reading 'parentElement'`), and an unhandled promise rejection from any script
+  aborted the whole capture loop — so the app never reached its data fetch. The
+  isolate polyfill now provides `btoa`/`atob`, `crypto` (`getRandomValues`,
+  `randomUUID`, `subtle` stub), `TextEncoder`/`TextDecoder`, `structuredClone`,
+  `Blob`/`File`, `AbortController`/`AbortSignal`, `DOMException`, a per-script
+  non-null `document.currentScript`, and richer `navigator`. A throwing or
+  rejecting third-party script is now swallowed and the page keeps running —
+  matching browser behavior — so a later script's data fetch is still captured.
+  (Also fixed a latent bug: the fetch interceptor used `TextEncoder` without it
+  being defined.)
+
 ## [0.2.0] — 2026-07-05
 
 Tier 2 sandbox reframed for real-world use — **macOS is now first-class** and
@@ -112,6 +129,7 @@ buildable Rust workspace (7 crates) with a `draco` CLI.
   polyfill execution is used instead).
 - **musl fully-static** single-binary build is deferred.
 
+[0.2.1]: https://github.com/0xchasercat/draco/releases/tag/v0.2.1
 [0.2.0]: https://github.com/0xchasercat/draco/releases/tag/v0.2.0
 [0.1.1]: https://github.com/0xchasercat/draco/releases/tag/v0.1.1
 [0.1.0]: https://github.com/0xchasercat/draco/releases/tag/v0.1.0
