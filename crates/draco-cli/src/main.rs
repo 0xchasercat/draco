@@ -1,12 +1,20 @@
-//! # draco (CLI — WS-D)
+//! # draco (CLI)
 //!
-//! Command-line interface + output contract. Implements canonical spec §12:
-//! the `--extract <JSONPATH>` filter over `result.data` and the
-//! status→exit-code mapping. All flags are wired into [`draco_core::Config`];
-//! the well-formed [`ExtractionResult`] is always emitted as JSON on stdout.
+//! Command-line interface + output contract. Draco is first a **URL → Markdown
+//! scraper** (Firecrawl-style): `draco extract <url>` fetches a page and prints
+//! clean Markdown of its main content to stdout. `--format json` switches to the
+//! tiered JSON-API extraction (embedded state → build-id replay → runtime
+//! interception), and `--format both` returns Markdown, metadata, and JSON in
+//! one envelope.
+//!
+//! Output rules: for the default `markdown` format the raw Markdown string is
+//! printed (pipeable: `draco extract url > page.md`); `--json` instead prints the
+//! full [`ExtractionResult`] envelope. For `json`/`both` the envelope is always
+//! printed. The `--extract <JSONPATH>` filter runs over `result.data`, and the
+//! status→exit-code mapping (spec §12) is preserved in all modes.
 
-use clap::{Parser, Subcommand};
-use draco_core::{extract, Config};
+use clap::{Parser, Subcommand, ValueEnum};
+use draco_core::{extract, Config, OutputFormat};
 use draco_types::{DracoError, ExtractionResult, SourceTier, Status, StepOutcome, TraceStep};
 use serde_json::Value;
 use serde_json_path::JsonPath;
@@ -15,20 +23,56 @@ use serde_json_path::JsonPath;
 #[command(
     name = "draco",
     version,
-    about = "Browserless, tiered data-extraction engine"
+    about = "URL → Markdown scraper (with an optional tiered JSON-API extraction mode)",
+    long_about = "Draco — a browserless URL → Markdown scraper.\n\n\
+        By default `draco extract <url>` fetches a page and prints clean Markdown of \
+        its main content (headings, links, lists, code, tables), dropping nav/header/\
+        footer boilerplate — the fast, static-only path. Use `--format json` for the \
+        tiered JSON-API extraction (embedded state → Next.js build-id replay → runtime \
+        interception) or `--format both` to get Markdown, metadata, and JSON together."
 )]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
+/// CLI surface for [`OutputFormat`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lower")]
+enum FormatArg {
+    /// Clean Markdown + metadata of the page's main content (default).
+    Markdown,
+    /// Tiered JSON-API extraction, populating `data`.
+    Json,
+    /// Both Markdown + metadata AND the JSON-API extraction.
+    Both,
+}
+
+impl From<FormatArg> for OutputFormat {
+    fn from(f: FormatArg) -> Self {
+        match f {
+            FormatArg::Markdown => OutputFormat::Markdown,
+            FormatArg::Json => OutputFormat::Json,
+            FormatArg::Both => OutputFormat::Both,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
-    /// Extract structured data from a URL.
+    /// Scrape a URL to Markdown (default), or extract JSON with `--format json`.
     Extract {
         /// Target URL.
         url: String,
-        /// JSONPath filter applied to `.data` before printing (WS-D).
+        /// Output format: `markdown` (default), `json`, or `both`.
+        #[arg(long, value_enum, default_value_t = FormatArg::Markdown)]
+        format: FormatArg,
+        /// For `--format markdown`: print the full ExtractionResult JSON envelope
+        /// instead of the raw Markdown string. (No effect for json/both, which
+        /// always print the envelope.)
+        #[arg(long)]
+        json: bool,
+        /// JSONPath filter applied to `.data` before printing.
         #[arg(long)]
         extract: Option<String>,
         /// http/https/socks5 proxy URL.
@@ -62,7 +106,7 @@ enum Command {
         /// Bypass robots.txt.
         #[arg(long)]
         ignore_robots: bool,
-        /// Pretty-print the JSON output.
+        /// Pretty-print the JSON envelope (no effect on raw Markdown output).
         #[arg(long)]
         pretty: bool,
     },
@@ -162,6 +206,28 @@ fn render(result: &ExtractionResult, pretty: bool) -> String {
     }
 }
 
+/// Decide what to print to stdout, and return it **with a trailing newline**.
+///
+/// * `markdown` format (the default) prints the raw `markdown` string — clean
+///   and pipeable (`draco extract url > page.md`) — unless `--json` is set, in
+///   which case the full envelope is printed. If a `markdown` run produced no
+///   markdown (e.g. a challenge → `NeedsBrowser`, or a fetch error), we fall
+///   back to the envelope so the failure is still legible on stdout.
+/// * `json` / `both` always print the full [`ExtractionResult`] envelope.
+///
+/// `pretty` only affects envelope output.
+fn render_output(result: &ExtractionResult, format: FormatArg, json: bool, pretty: bool) -> String {
+    let print_envelope = json || !matches!(format, FormatArg::Markdown);
+    if !print_envelope {
+        if let Some(md) = result.markdown.as_deref() {
+            return format!("{md}\n");
+        }
+        // No markdown to print (non-success markdown run): show the envelope so
+        // the status/error is visible rather than emitting an empty line.
+    }
+    format!("{}\n", render(result, pretty))
+}
+
 fn main() {
     // ---- Jailed-child re-exec hook (canonical §6/§7) -----------------------
     //
@@ -201,6 +267,8 @@ async fn async_main() {
     match cli.command {
         Command::Extract {
             url,
+            format,
+            json,
             extract: extract_expr,
             proxy,
             delay,
@@ -214,6 +282,7 @@ async fn async_main() {
             pretty,
         } => {
             let config = Config {
+                format: format.into(),
                 proxy,
                 delay_ms: delay,
                 timeout_ms: timeout,
@@ -228,7 +297,7 @@ async fn async_main() {
             if let Some(expr) = extract_expr.as_deref() {
                 result = filter_result(result, expr);
             }
-            println!("{}", render(&result, pretty));
+            print!("{}", render_output(&result, format, json, pretty));
             std::process::exit(status_to_exit_code(result.status));
         }
         Command::Jail => {
@@ -328,6 +397,8 @@ mod tests {
             status: Status::Success,
             source_tier: Some(SourceTier::Static),
             data: Some(data),
+            markdown: None,
+            metadata: None,
             timing: Timing::default(),
             trace: Vec::new(),
             error: None,
@@ -393,5 +464,82 @@ mod tests {
     fn render_pretty_is_multiline() {
         let s = render(&success_result(json!({ "a": 1 })), true);
         assert!(s.contains('\n'));
+    }
+
+    // ---- render_output: markdown vs envelope ----
+
+    /// A Markdown-scrape result (markdown + metadata, no data).
+    fn markdown_result() -> ExtractionResult {
+        ExtractionResult {
+            url: "https://example.com".into(),
+            status: Status::Success,
+            source_tier: Some(SourceTier::Static),
+            data: None,
+            markdown: Some("# Title\n\nBody text.".into()),
+            metadata: Some(json!({ "title": "Title", "statusCode": 200 })),
+            timing: Timing::default(),
+            trace: Vec::new(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn markdown_format_prints_raw_markdown() {
+        let out = render_output(&markdown_result(), FormatArg::Markdown, false, false);
+        // Raw markdown string, newline-terminated, NOT JSON.
+        assert_eq!(out, "# Title\n\nBody text.\n");
+        assert!(!out.contains("\"status\""));
+    }
+
+    #[test]
+    fn markdown_format_with_json_flag_prints_envelope() {
+        let out = render_output(&markdown_result(), FormatArg::Markdown, true, false);
+        let json: Value = serde_json::from_str(out.trim()).expect("envelope is JSON");
+        assert_eq!(json["status"], "success");
+        assert_eq!(json["markdown"], "# Title\n\nBody text.");
+        assert_eq!(json["metadata"]["title"], "Title");
+    }
+
+    #[test]
+    fn json_format_prints_envelope_not_markdown() {
+        // Even if markdown were present, json format prints the envelope.
+        let out = render_output(&markdown_result(), FormatArg::Json, false, false);
+        let json: Value = serde_json::from_str(out.trim()).expect("envelope is JSON");
+        assert_eq!(json["status"], "success");
+    }
+
+    #[test]
+    fn both_format_prints_envelope() {
+        let mut r = markdown_result();
+        r.data = Some(json!({ "ok": true }));
+        let out = render_output(&r, FormatArg::Both, false, true);
+        assert!(out.contains('\n'), "pretty envelope is multi-line");
+        let json: Value = serde_json::from_str(out.trim()).expect("envelope is JSON");
+        assert_eq!(json["data"]["ok"], true);
+        assert_eq!(json["markdown"], "# Title\n\nBody text.");
+    }
+
+    #[test]
+    fn markdown_format_falls_back_to_envelope_when_no_markdown() {
+        // A challenged/errored markdown run has no markdown; show the envelope
+        // so the failure is legible rather than printing an empty line.
+        let mut r = markdown_result();
+        r.status = Status::NeedsBrowser;
+        r.markdown = None;
+        r.metadata = None;
+        r.source_tier = None;
+        let out = render_output(&r, FormatArg::Markdown, false, false);
+        let json: Value = serde_json::from_str(out.trim()).expect("envelope is JSON");
+        assert_eq!(json["status"], "needs_browser");
+    }
+
+    #[test]
+    fn format_arg_maps_to_output_format() {
+        assert_eq!(
+            OutputFormat::from(FormatArg::Markdown),
+            OutputFormat::Markdown
+        );
+        assert_eq!(OutputFormat::from(FormatArg::Json), OutputFormat::Json);
+        assert_eq!(OutputFormat::from(FormatArg::Both), OutputFormat::Both);
     }
 }

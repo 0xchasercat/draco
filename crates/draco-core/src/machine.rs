@@ -29,6 +29,7 @@
 use std::time::Instant;
 
 use draco_net::SessionOpts;
+use draco_static::content::ScrapeResult;
 use draco_static::StaticOutcome;
 use draco_types::{
     DracoError, ExtractionResult, SourceTier, Status, StepOutcome, Timing, TraceStep,
@@ -37,7 +38,7 @@ use draco_types::{
 use crate::challenge::detect_challenge;
 use crate::fetcher::{NetFetcher, PageFetcher};
 use crate::tier2::Tier2Capture;
-use crate::Config;
+use crate::{Config, OutputFormat};
 
 // ---------------------------------------------------------------------------
 // Tier ceilings (spec §11 `tier_max`)
@@ -45,6 +46,11 @@ use crate::Config;
 
 /// Highest tier index Draco implements (2 = runtime interception).
 pub const TIER_CEILING: u8 = 2;
+
+/// Below this many non-whitespace Markdown characters, the scraped page is
+/// treated as a thin client-rendered SPA shell and the `static.markdown` trace
+/// step notes that an SPA render pass would help.
+const THIN_CONTENT_CHARS: usize = 200;
 
 /// Clamp a caller-supplied `tier_max` into the implemented range `0..=2`.
 ///
@@ -63,6 +69,15 @@ pub fn clamp_tier_max(tier_max: u8) -> u8 {
 /// ladder is drivable offline (see module docs). Mirrors the frozen
 /// `draco-static` free functions one-to-one.
 pub trait StaticEngine: Send + Sync {
+    /// Markdown scrape: HTML → clean Markdown + metadata (the default path).
+    fn scrape(
+        &self,
+        html: &str,
+        url: &str,
+        status: u16,
+        content_type: &str,
+        only_main_content: bool,
+    ) -> ScrapeResult;
     /// Tier 0: scan HTML for embedded state.
     fn extract_static(&self, html: &str) -> StaticOutcome;
     /// Tier 1: discover a Next.js build id, if present.
@@ -82,6 +97,16 @@ pub trait StaticEngine: Send + Sync {
 pub struct ProdStatic;
 
 impl StaticEngine for ProdStatic {
+    fn scrape(
+        &self,
+        html: &str,
+        url: &str,
+        status: u16,
+        content_type: &str,
+        only_main_content: bool,
+    ) -> ScrapeResult {
+        draco_static::content::scrape(html, url, status, content_type, only_main_content)
+    }
     fn extract_static(&self, html: &str) -> StaticOutcome {
         draco_static::extract_static(html)
     }
@@ -123,6 +148,12 @@ struct Run {
     started: Instant,
     trace: Vec<TraceStep>,
     timing: Timing,
+    /// Markdown-scrape output, staged before [`Run::finish`] bakes the result.
+    /// Populated by the Markdown path (and the `Both` path); `None` on the
+    /// pure-JSON (`Json`) path.
+    markdown: Option<String>,
+    /// Flat page metadata, staged alongside [`Run::markdown`].
+    metadata: Option<serde_json::Value>,
 }
 
 /// Which timing bucket a step's elapsed time is charged to.
@@ -145,6 +176,8 @@ impl Run {
             started: Instant::now(),
             trace: Vec::new(),
             timing: Timing::default(),
+            markdown: None,
+            metadata: None,
         }
     }
 
@@ -187,6 +220,8 @@ impl Run {
             status,
             source_tier,
             data,
+            markdown: self.markdown,
+            metadata: self.metadata,
             timing: self.timing,
             trace: self.trace,
             error,
@@ -288,6 +323,48 @@ where
         return run.finish(Status::NeedsBrowser, None, None, None);
     }
 
+    // ---- Markdown scrape (the DEFAULT fast path; spec: Firecrawl-style) --
+    //
+    // For `Markdown` this is terminal: fetch → challenge → scrape → Success,
+    // never touching V8/the jail (~300ms). For `Both` we stage the Markdown +
+    // metadata onto the run and fall through to the JSON ladder below. For
+    // `Json` the scrape is skipped entirely.
+    if matches!(config.format, OutputFormat::Markdown | OutputFormat::Both) {
+        let t_md = Instant::now();
+        let content_type = content_type_of(&resp.meta.headers);
+        let scraped = statics.scrape(&body, url, resp.meta.status, &content_type, true);
+        let md_ms = t_md.elapsed().as_millis() as u64;
+
+        // A thin, client-rendered SPA shell has almost no main content. We still
+        // return what there is, but note that an SPA render pass would help.
+        // (The render→markdown escalation itself is a deliberate follow-up.)
+        let thin = draco_static::content::is_thin_content(&scraped.markdown, THIN_CONTENT_CHARS);
+        run.record(
+            SourceTier::Static,
+            "static.markdown",
+            StepOutcome::Matched,
+            md_ms,
+            Bucket::Parse,
+            Some(if thin {
+                format!(
+                    "{} chars (thin: client-rendered SPA shell — an SPA render pass would help)",
+                    scraped.markdown.len()
+                )
+            } else {
+                format!("{} chars", scraped.markdown.len())
+            }),
+        );
+
+        run.markdown = Some(scraped.markdown);
+        run.metadata = Some(scraped.metadata);
+
+        if config.format == OutputFormat::Markdown {
+            // Terminal for the default path — no tier escalation.
+            return run.finish(Status::Success, Some(SourceTier::Static), None, None);
+        }
+        // `Both`: continue into the JSON ladder, carrying markdown+metadata.
+    }
+
     // ---- Tier 0: static embedded state ---------------------------------
     let t0 = Instant::now();
     match statics.extract_static(&body) {
@@ -356,6 +433,14 @@ where
     }
 
     // ---- Finalize: ran the whole (permitted) ladder, nothing matched ---
+    //
+    // Under `Both`, the JSON ladder found nothing — but we already produced
+    // Markdown + metadata, which is the primary deliverable of that mode. So a
+    // `Both` run with staged Markdown is a `Success` (source_tier: Static),
+    // just without a `data` payload. A pure `Json` run stays `Unsupported`.
+    if run.markdown.is_some() {
+        return run.finish(Status::Success, Some(SourceTier::Static), None, None);
+    }
     run.finish(Status::Unsupported, None, None, None)
 }
 
@@ -691,6 +776,8 @@ impl Run {
             started: self.started,
             trace: std::mem::take(&mut self.trace),
             timing: std::mem::take(&mut self.timing),
+            markdown: self.markdown.take(),
+            metadata: self.metadata.take(),
         }
     }
 }
@@ -714,6 +801,17 @@ fn action_for_origin(origin: draco_types::ExtractOrigin) -> &'static str {
 /// Is this an HTTP 2xx status?
 fn is_2xx(status: u16) -> bool {
     (200..300).contains(&status)
+}
+
+/// Pull the `Content-Type` value from a response header list (case-insensitive
+/// header name), defaulting to `text/html` when absent — the Markdown scrape
+/// surfaces this verbatim as the `contentType` metadata key.
+fn content_type_of(headers: &[(String, String)]) -> String {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| "text/html".to_string())
 }
 
 /// One-line, log-safe summary of a [`DracoError`] for a trace `detail`.
@@ -827,8 +925,12 @@ mod tests {
 
     // ---- ladder via mocks (offline) -----------------------------------
 
+    /// A `Json`-format config with the given `tier_max`. The JSON tiers (0/1/2)
+    /// are what these ladder tests exercise; the default `Markdown` format is
+    /// covered by its own tests below.
     fn cfg(tier_max: u8) -> Config {
         Config {
+            format: OutputFormat::Json,
             tier_max,
             ..Config::default()
         }
@@ -1221,5 +1323,207 @@ mod tests {
         assert_eq!(r.status, Status::Unsupported);
         let replay = r.trace.iter().find(|t| t.action == "tier1.replay").unwrap();
         assert_eq!(replay.outcome, StepOutcome::Missed);
+    }
+
+    // ---- Markdown (default) path --------------------------------------
+
+    /// A Markdown-format config.
+    fn cfg_markdown() -> Config {
+        Config {
+            format: OutputFormat::Markdown,
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn markdown_is_the_fast_path_and_never_touches_tier2() {
+        // Default Markdown format: fetch → scrape → Success/Static, with a
+        // `static.markdown` step and NO tier1/tier2 escalation. The capture seam
+        // must never be reached (it would panic on the real jail).
+        let fetcher = MockFetcher::ok_html(200, "<html><body><h1>Hi</h1></body></html>")
+            .with_header("content-type", "text/html; charset=utf-8");
+        let statics = MockStatic::default().with_markdown("# Hi\n\nSome body text here.");
+        // A capture double that *panics* if the ladder ever reaches Tier 2.
+        let capture = MockCapture::failing(DracoError::Jail {
+            reason: draco_types::JailKind::Killed,
+            detail: "must not be reached on the markdown path".into(),
+        });
+        let r = run_ladder(
+            "https://x.com/p",
+            &cfg_markdown(),
+            &fetcher,
+            &statics,
+            &capture,
+        )
+        .await;
+
+        assert_eq!(r.status, Status::Success);
+        assert_eq!(r.source_tier, Some(SourceTier::Static));
+        assert!(r.data.is_none(), "markdown path carries no JSON data");
+        assert_eq!(r.markdown.as_deref(), Some("# Hi\n\nSome body text here."));
+        // Metadata carries the synthetic keys from the (mock) scrape.
+        let meta = r.metadata.expect("metadata present");
+        assert_eq!(meta["statusCode"], 200);
+        assert_eq!(meta["contentType"], "text/html; charset=utf-8");
+
+        // Trace: fetch + static.markdown only. No tier1/tier2 steps, no capture.
+        let actions: Vec<&str> = r.trace.iter().map(|t| t.action.as_str()).collect();
+        assert_eq!(actions, vec!["net.fetch", "static.markdown"]);
+        assert_eq!(
+            capture.calls(),
+            0,
+            "Tier 2 capture must NOT run on the markdown path"
+        );
+        assert_eq!(fetcher.replay_calls(), 0, "no replay on the markdown path");
+    }
+
+    #[tokio::test]
+    async fn markdown_thin_spa_notes_render_pass() {
+        // A near-empty (thin) scrape still succeeds but the trace notes that an
+        // SPA render pass would help.
+        let fetcher = MockFetcher::ok_html(200, "<html><body><div id=root></div></body></html>");
+        let statics = MockStatic::default().with_markdown("x"); // 1 char → thin
+        let r = run_ladder(
+            "https://spa.example/",
+            &cfg_markdown(),
+            &fetcher,
+            &statics,
+            &noop_capture(),
+        )
+        .await;
+        assert_eq!(r.status, Status::Success);
+        let md_step = r
+            .trace
+            .iter()
+            .find(|t| t.action == "static.markdown")
+            .unwrap();
+        assert!(
+            md_step
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("SPA render pass"),
+            "thin content should note an SPA render pass: {:?}",
+            md_step.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn markdown_still_short_circuits_on_challenge() {
+        // The challenge short-circuit runs before the markdown scrape, so a
+        // bot-wall still yields NeedsBrowser with no markdown.
+        let html = "<html><head><title>Just a moment...</title></head>\
+            <body>cloudflare challenge-platform cf_chl_opt</body></html>";
+        let fetcher = MockFetcher::ok_html(503, html)
+            .with_header("server", "cloudflare")
+            .with_header("cf-mitigated", "challenge");
+        let statics = MockStatic::default().with_markdown("should not be produced");
+        let r = run_ladder(
+            "https://x.com/p",
+            &cfg_markdown(),
+            &fetcher,
+            &statics,
+            &noop_capture(),
+        )
+        .await;
+        assert_eq!(r.status, Status::NeedsBrowser);
+        assert!(r.markdown.is_none(), "no markdown when challenged");
+    }
+
+    // ---- Both path ----------------------------------------------------
+
+    fn cfg_both() -> Config {
+        Config {
+            format: OutputFormat::Both,
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn both_populates_markdown_and_json_when_tier0_hits() {
+        // Both: markdown+metadata AND the JSON ladder. Tier 0 hits here, so all
+        // three of markdown/metadata/data are populated.
+        let fetcher = MockFetcher::ok_html(200, "<html>__NEXT_DATA__</html>");
+        let statics = MockStatic::hit(ExtractedData {
+            tier: SourceTier::Static,
+            origin: ExtractOrigin::NextData,
+            data: json!({ "props": { "ok": true } }),
+        })
+        .with_markdown("# From Both");
+        let r = run_ladder(
+            "https://x.com/p",
+            &cfg_both(),
+            &fetcher,
+            &statics,
+            &noop_capture(),
+        )
+        .await;
+
+        assert_eq!(r.status, Status::Success);
+        assert_eq!(r.source_tier, Some(SourceTier::Static));
+        assert_eq!(r.data, Some(json!({ "props": { "ok": true } })));
+        assert_eq!(r.markdown.as_deref(), Some("# From Both"));
+        assert!(r.metadata.is_some());
+        // Both the markdown step and the JSON tier-0 step are recorded.
+        let actions: Vec<&str> = r.trace.iter().map(|t| t.action.as_str()).collect();
+        assert!(actions.contains(&"static.markdown"), "trace: {actions:?}");
+        assert!(actions.contains(&"static.next_data"), "trace: {actions:?}");
+    }
+
+    #[tokio::test]
+    async fn both_succeeds_with_markdown_even_when_json_ladder_finds_nothing() {
+        // Both: markdown is produced but the JSON ladder finds nothing. The run
+        // is still Success (source_tier: Static) with markdown but no data.
+        let fetcher = MockFetcher::ok_html(200, "<html><body>plain</body></html>");
+        let statics = MockStatic::miss_no_build_id().with_markdown("# Only markdown");
+        let r = run_ladder(
+            "https://x.com/p",
+            &cfg_both(),
+            &fetcher,
+            &statics,
+            &noop_capture(),
+        )
+        .await;
+
+        assert_eq!(r.status, Status::Success);
+        assert_eq!(r.source_tier, Some(SourceTier::Static));
+        assert!(r.data.is_none(), "JSON ladder found nothing");
+        assert_eq!(r.markdown.as_deref(), Some("# Only markdown"));
+        // The JSON tiers still ran (and missed) — the markdown step precedes them.
+        let actions: Vec<&str> = r.trace.iter().map(|t| t.action.as_str()).collect();
+        assert!(actions.contains(&"static.markdown"), "trace: {actions:?}");
+        assert!(actions.contains(&"static.scan"), "trace: {actions:?}");
+    }
+
+    #[tokio::test]
+    async fn json_format_skips_the_markdown_scrape() {
+        // Pure Json: no markdown/metadata, and no `static.markdown` trace step.
+        let fetcher = MockFetcher::ok_html(200, "<html>__NEXT_DATA__</html>");
+        let statics = MockStatic::hit(ExtractedData {
+            tier: SourceTier::Static,
+            origin: ExtractOrigin::NextData,
+            data: json!({ "ok": true }),
+        })
+        .with_markdown("should be ignored");
+        let r = run_ladder(
+            "https://x.com/p",
+            &cfg(2),
+            &fetcher,
+            &statics,
+            &noop_capture(),
+        )
+        .await;
+
+        assert_eq!(r.status, Status::Success);
+        assert!(
+            r.markdown.is_none(),
+            "json format must not produce markdown"
+        );
+        assert!(
+            r.metadata.is_none(),
+            "json format must not produce metadata"
+        );
+        let actions: Vec<&str> = r.trace.iter().map(|t| t.action.as_str()).collect();
+        assert!(!actions.contains(&"static.markdown"), "trace: {actions:?}");
     }
 }

@@ -11,3 +11,10 @@ serde_json = { workspace = true }
 # Tier 0/1 HTML parsing per canonical doc §10 & §14.
 tl = "0.7.8"          # primary: fast, zero-copy HTML parse
 scraper = "0.27.0"    # fallback: selector-based parse for gnarlier cases
+# Content engine (URL → Markdown scrape): readability main-content extraction +
+# HTML→Markdown conversion. dom_smoothie is a Mozilla Readability port (drops
+# nav/header/footer boilerplate and absolutizes links against the doc URL);
+# htmd renders headings/links/images/lists/blockquotes/code and GFM tables.
+dom_smoothie = "0.9"  # readability (main-content) extraction
+htmd = "0.2"          # HTML → Markdown (GFM tables)
+url = "2"             # absolutize relative href/src against the page URL
