@@ -141,6 +141,8 @@ pub struct MockStatic {
     app_router: bool,
     /// Canned Markdown for the `scrape` seam; `None` → a small default body.
     markdown: Option<String>,
+    /// Canned `incomplete` (skeleton) flag the `scrape` seam reports.
+    incomplete: bool,
 }
 
 impl MockStatic {
@@ -188,6 +190,13 @@ impl MockStatic {
         self.markdown = Some(md.to_string());
         self
     }
+
+    /// Make the `scrape` seam report an incomplete (skeleton) render, so tests can
+    /// exercise the render escalation triggered by a non-thin skeleton page.
+    pub fn with_incomplete(mut self, incomplete: bool) -> Self {
+        self.incomplete = incomplete;
+        self
+    }
 }
 
 impl StaticEngine for MockStatic {
@@ -213,6 +222,7 @@ impl StaticEngine for MockStatic {
                 "statusCode": status,
                 "contentType": content_type,
             }),
+            incomplete: self.incomplete,
         }
     }
     fn extract_static(&self, _html: &str) -> StaticOutcome {

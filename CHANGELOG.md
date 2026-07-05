@@ -3,6 +3,30 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.4.1] — 2026-07-06
+
+### Fixed
+- **Skeleton / `Loading…` screens are no longer returned as content, and now
+  trigger the render pass.** The escalation trigger was purely length-based
+  (`is_thin_content`), so a client-rendered page with lots of nav/promo chrome
+  but whose actual content rails were still `Loading…` (e.g. a large retail
+  homepage) cleared the thin-content bar and was returned verbatim — a wall of
+  `Loading…` placeholders — *without* escalating to Tier 2. Now:
+  - A new **incomplete-render detector** flags a page as a skeleton when it has
+    several repeated `Loading…` / `Please wait` placeholder lines, **independent
+    of length**. A skeleton escalates to the render-then-Markdown pass just like a
+    thin shell does (when `--tier-max >= 2`).
+  - **`Loading…` placeholder lines are stripped from the Markdown** in every case
+    (even when the render pass is capped out or can't improve the page), so that
+    noise never reaches the user. Real text that merely contains the word
+    (`Loading dock tours`), buttons (`Load More`), and spinner images
+    (`![loading](…)`) are left untouched.
+  - The render upgrade now prefers a hydrated re-scrape that **resolves the
+    skeleton** (real content replacing placeholders) even when it isn't longer,
+    and refuses a hydration that is *still* a skeleton. `ScrapeResult` gains an
+    `incomplete` flag; the `static.markdown` trace step names the reason
+    (`incomplete render: skeleton/loading shell`).
+
 ## [0.4.0] — 2026-07-06
 
 **Render-then-Markdown escalation** — Draco now scrapes client-rendered SPAs to
