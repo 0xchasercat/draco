@@ -1,23 +1,29 @@
 # Draco
 
-A browserless, tiered data-extraction engine. Draco escalates through the
-**cheapest successful extraction tier** and stops as soon as one yields data:
+A fast, stealth, **native-Rust web scraper** — a lighter alternative to Firecrawl
+/ Browserbase. Point it at a URL and get clean **Markdown + metadata** back, using
+a browser-faithful TLS/JA4 fingerprint to reach pages that block ordinary clients.
+No Node, no headless-Chrome fleet, no per-request browser boot.
 
-1. **Tier 0 — static embedded state.** Parse the raw HTML for `__NEXT_DATA__`,
-   JSON-LD, and object-literal `window.__NUXT__`. No JS executed.
-2. **Tier 1 — heuristic API replay.** Discover a Next.js `buildId` and fetch the
-   `/_next/data/<buildId>/…​.json` endpoint directly. Still no JS.
-3. **Tier 2 — runtime interception.** Boot a jailed, jitless V8 isolate, let the
-   page's own SPA code hydrate, intercept the `fetch`/`XHR` it fires for its
-   data, rank the intercepts, and **replay the winner** with the stealth HTTP
-   client — returning the raw JSON the app itself consumed.
+```sh
+draco extract https://example.com          # → clean Markdown on stdout
+```
 
-The browser engine is a *discovery oracle*, not a renderer: Draco never paints a
-page, it just learns which API the page wanted and calls it directly.
+For a standard HTML page that's a single fingerprinted fetch + parse — typically
+**~300 ms, no browser** — and the Markdown pipeline mirrors Firecrawl's
+(deterministic main-content extraction + a Turndown/GFM-equivalent converter),
+implemented natively in Rust.
 
-> **Design:** the canonical architecture & execution spec remains the reference
-> for the frozen `draco-types` wire contract, the IPC frame format, and the
-> security model. This README reflects what shipped in **v0.1.0**.
+## What you get
+
+- **`markdown`** — the page's main content as clean Markdown: headings, links
+  (absolutized), lists, blockquotes, fenced code blocks (with language), and GFM
+  tables. Boilerplate (nav / header / aside / footer / ads) is stripped, scripts
+  and styles never leak, base64 images are elided.
+- **`metadata`** — `title`, `description`, `language`, `canonical`, `favicon`,
+  every `og:*` / `twitter:*` / `article:*` tag, plus `sourceURL`, `statusCode`,
+  `contentType`.
+- **`trace` + `timing`** — exactly which steps ran and where the milliseconds went.
 
 ## Install / build
 
@@ -26,8 +32,8 @@ git clone https://github.com/0xchasercat/draco && cd draco
 cargo build --release
 ```
 
-Build prerequisites (for wreq's BoringSSL + bindgen, and deno_core's V8):
-`cmake`, a C/C++ compiler, `clang`/`libclang`, `perl`, `pkg-config`.
+Build prerequisites (for wreq's BoringSSL + bindgen; and V8, only for the optional
+`json` mode): `cmake`, a C/C++ compiler, `clang`/`libclang`, `perl`, `pkg-config`.
 - Debian/Ubuntu: `apt install build-essential cmake clang libclang-dev perl pkg-config`
 - Fedora: `dnf install gcc gcc-c++ cmake clang clang-devel llvm-devel perl pkgconf`
 - macOS: Xcode Command Line Tools + `brew install cmake`
@@ -35,96 +41,107 @@ Build prerequisites (for wreq's BoringSSL + bindgen, and deno_core's V8):
 ## Usage
 
 ```sh
-# Full ladder (Tier 0 → 1 → 2):
-draco extract "https://example.com/product/42" --pretty
+# Default: URL → Markdown on stdout (great for piping)
+draco extract https://example.com > page.md
 
-# Cap the ladder (0 = static only, 1 = +build-id, 2 = +runtime):
-draco extract "https://example.com" --tier-max 1
+# Full envelope (markdown + metadata + trace) as JSON
+draco extract https://example.com --json --pretty
 
-# Filter the output with JSONPath:
-draco extract "https://example.com" --extract '$.props.pageProps'
-
-# Politeness + stealth:
-draco extract "https://example.com" --proxy socks5://127.0.0.1:9050 --delay 500
+# Stealth + politeness
+draco extract https://example.com --proxy socks5://127.0.0.1:9050 --delay 500
 ```
 
-Output is always an `ExtractionResult` JSON on stdout: `status`, `source_tier`,
-`data`, a `timing` breakdown, and a full escalation `trace`. Exit codes:
-`0` success · `1` error · `2` unsupported · `3` needs_browser.
+Exit codes: `0` success · `1` error · `2` unsupported · `3` needs_browser.
 
-Selected flags: `--extract <JSONPATH>`, `--tier-max <0|1|2>`, `--proxy`,
-`--delay <ms>`, `--timeout <ms>`, `--capture-window-ms <ms>`, `--ignore-robots`,
-`--no-jail` (dev: run Tier 2 un-jailed), `--allow-unsafe-replay` (permit
-replaying a state-changing request), `--pretty`.
+### Optional: JSON-API extraction (`--format json`)
+
+Beyond Markdown, Draco can extract the **structured data an SPA loads from its own
+API** — a power feature for data-driven sites. It escalates through the cheapest
+tier that yields data:
+
+1. **Static embedded state** — `__NEXT_DATA__`, JSON-LD, `window.__NUXT__`.
+2. **Next.js build-id replay** — fetch `/_next/data/<buildId>/…​.json` directly.
+3. **Runtime interception** — boot a jailed, jitless V8 isolate, let the page's JS
+   hydrate, intercept the `fetch`/`XHR` it fires for its data, rank the intercepts,
+   and replay the winner with the stealth client. The isolate is a *discovery
+   oracle*, not a renderer.
+
+```sh
+draco extract https://app.example.com --format json --pretty       # data[]
+draco extract https://app.example.com --format json --extract '$.props.pageProps'
+draco extract https://app.example.com --format both                # markdown + data
+```
+
+Flags: `--format <markdown|json|both>` (default `markdown`), `--json`, `--extract
+<JSONPATH>`, `--tier-max <0|1|2>`, `--proxy`, `--delay <ms>`, `--timeout <ms>`,
+`--capture-window-ms <ms>`, `--ignore-robots`, `--no-jail`, `--strict-sandbox`,
+`--allow-unsafe-replay`, `--pretty`.
+
+> **Roadmap:** JS-rendered SPAs whose *content* (not just data) requires the DOM
+> — Draco flags a thin shell today and will escalate to render-then-Markdown next,
+> reusing the Tier 2 isolate.
 
 ## Workspace layout
 
 | Crate | Role |
 |-------|------|
-| `draco-types` | Frozen wire + result contract (no I/O) |
+| `draco-types` | Wire + result contract (no I/O) |
 | `draco-net` | Stealth TLS/JA4 HTTP client (wreq/BoringSSL): cookie jar, proxy, robots, backoff |
-| `draco-static` | Tier 0 static extraction + Tier 1 build-id replay |
-| `draco-jail` | Sandbox supervisor + jailed child: userns/netns air-gap, Landlock, two-phase seccomp, IPC codec |
-| `draco-runtime` | Tier 2 V8 isolate (jitless), DOM + scheduler polyfill, `fetch`/`XHR` interception, capture window |
-| `draco-core` | Escalation state machine, challenge short-circuit, ranking policy, replay |
+| `draco-static` | **Markdown + metadata extraction** (Firecrawl-parity) · JSON embedded-state · build-id replay |
+| `draco-jail` | Sandbox supervisor + jailed child: userns/netns air-gap, Landlock, seccomp, IPC codec |
+| `draco-runtime` | Tier 2 V8 isolate (jitless), DOM + scheduler polyfill, `fetch`/`XHR` interception |
+| `draco-core` | Escalation state machine, challenge short-circuit, ranking, replay |
 | `draco-cli` | The `draco` CLI + output contract |
 
 ## Feature flags
 
-- **default (`tier2`)** — the full engine, including the jailed V8 runtime.
-- **`--no-default-features`** — a lean Tier 0/1 build with **no V8 and no jail
-  linked** (smaller, faster to build); Tier 2 reports `unsupported`.
+- **default (`tier2`)** — everything, including the V8 isolate for `--format json`
+  runtime interception.
+- **`--no-default-features`** — a lean build with **no V8/jail linked**. Markdown
+  scraping and static/build-id JSON extraction still work; runtime interception
+  reports `unsupported`. Smaller binary, faster build.
 
 ```sh
 cargo build -p draco-cli --no-default-features   # lean, V8-free
 ```
 
-## Security model (Tier 2)
+## Security model (only relevant to `--format json` Tier 2)
 
-Tier 2 evaluates a page's own untrusted JavaScript, so containment matters.
-Draco's **primary** containment is the isolate itself: the V8 context is created
-with **no host-capability bindings**. The only ops exposed to page JS are
-`op_raze_fetch` (records the intercepted request and returns a stub), `op_sleep`,
-and `op_resolve_url` — there is no `fetch`-to-network, no filesystem, and no
-process API. Page JS therefore cannot perform I/O of any kind. **This is the same
-class of isolation Puppeteer, Playwright, and jsdom rely on**; it works
-identically on macOS and Linux and needs zero configuration. Draco calls this
-**isolate mode**.
+Markdown scraping executes no page JavaScript. The optional Tier 2 does, so
+containment matters. Draco's **primary** containment is the isolate itself: the V8
+context has **no host-capability bindings** — the only ops exposed to page JS
+record the intercepted request, sleep, and resolve URLs. There is no
+network/filesystem/process access, so page JS cannot perform I/O. **This is the
+same class of isolation Puppeteer/Playwright/jsdom rely on**, works identically on
+macOS and Linux, and needs zero configuration (Draco calls it **isolate mode**).
 
-On **Linux**, Draco adds OS-level **defense-in-depth** automatically and
-transparently — a hardening layer against a hypothetical V8-engine exploit:
-- a **seccomp-bpf** filter that kills the dangerous breakout syscalls (`execve`,
-  `socket`/`connect`, `ptrace`, `mount`, `bpf`, executable `mprotect`, …) — a
-  robust *denylist* that needs **no per-host tuning**;
-- a **network-namespace** air-gap and a **Landlock** filesystem lockdown when the
-  kernel supports them (best-effort; silently skipped if not).
-
-V8 runs `--jitless --single-threaded` (no executable memory). The achieved level
-is reported in the result `trace` as a `runtime.sandbox` step — e.g.
-`hardened: seccomp+netns+landlock` or `isolate: v8 no host bindings (macos)`.
-There are no scary warnings and nothing to set up: **isolate mode is a fully
-supported default everywhere; Linux simply gets more.** `--strict-sandbox` opts
-into a maximal default-deny seccomp allowlist; `--no-jail` skips the OS layer.
+On **Linux**, Draco adds OS-level defense-in-depth automatically: a **seccomp-bpf
+denylist** (kills breakout syscalls — `execve`, `socket`/`connect`, `ptrace`,
+`mount`, `bpf`, executable `mprotect`; no per-host tuning), plus a
+**network-namespace** air-gap and **Landlock** FS lockdown when the kernel
+supports them. V8 runs `--jitless`. The achieved level shows in the `trace` as a
+`runtime.sandbox` step (`hardened: …` / `isolate: …`). `--strict-sandbox` opts
+into a maximal allowlist; `--no-jail` skips the OS layer.
 
 Draco does **not** defeat JS challenge walls (Cloudflare/DataDome/…); a genuine
-interstitial (a blocking status with a real challenge page) short-circuits to
+interstitial (blocking status + real challenge page) short-circuits to
 `needs_browser`. A normal `200` behind a CDN is never treated as a challenge.
 
 ## Platforms
 
-| Platform | Tier 0/1 | Tier 2 (isolate: V8, no host bindings) | Tier 2 OS hardening |
-|----------|:--------:|:--------------------------------------:|---------------------|
-| **Linux** `x86_64-gnu` | ✅ | ✅ | ✅ automatic — seccomp always; netns + Landlock when the kernel supports them |
-| **macOS** `aarch64-darwin` | ✅ | ✅ | isolate mode (Seatbelt hardening is on the roadmap) |
+| Platform | Markdown scrape | JSON Tier 0/1 | Tier 2 isolate | Tier 2 OS hardening |
+|----------|:---:|:---:|:---:|---|
+| **Linux** `x86_64-gnu` | ✅ | ✅ | ✅ | ✅ auto (seccomp always; netns + Landlock when supported) |
+| **macOS** `aarch64-darwin` | ✅ | ✅ | ✅ | isolate mode (Seatbelt hardening on the roadmap) |
 
-Both are **first-class**. The optional Linux OS-hardening layer can be verified on
-a real kernel per **[docs/BARE_METAL_VALIDATION.md](docs/BARE_METAL_VALIDATION.md)**
-— that's for confirming the extra hardening, not a requirement to run Draco.
+Both are **first-class**. The optional Linux hardening can be verified on a real
+kernel per **[docs/BARE_METAL_VALIDATION.md](docs/BARE_METAL_VALIDATION.md)** —
+that confirms the extra hardening; it is not required to run Draco.
 
 ## Development
 
 ```sh
-cargo test --workspace                                  # full suite
+cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```

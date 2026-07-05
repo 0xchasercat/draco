@@ -3,6 +3,36 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.3.0] — 2026-07-05
+
+Draco is now a **Markdown-first web scraper** — a lighter Firecrawl/Browserbase
+alternative — with the JSON-API extraction as an opt-in mode.
+
+### Changed
+- **Default output is clean Markdown + metadata.** `draco extract <url>` returns
+  the page's main content as Markdown (printed to stdout; `--json` for the full
+  envelope). For standard HTML that's a single fingerprinted fetch + parse —
+  ~300 ms, no browser. The tiered JSON-API extraction is now `--format json`.
+
+### Added
+- **Firecrawl-parity Tier 0 content extraction, natively in Rust.** Deterministic
+  main-content extraction (42 boilerplate selectors with `:not(:has())`
+  force-include protection — matching Firecrawl's *current* pipeline) with a
+  Mozilla-Readability fallback (`dom_smoothie`); a Turndown/GFM-equivalent
+  converter (`htmd`: ATX headings, fenced code with language, `-` bullets, GFM
+  tables + strikethrough); and Firecrawl's pre/post-processing (unwanted-element
+  stripping, `srcset` collapse, base64-image elision, skip-to-content and
+  multiline-link cleanup, link/image absolutization).
+- `metadata` mirrors Firecrawl's keys (`og:*`, `twitter:*`, `article:*`,
+  `canonical`, `favicon`, `description`, `language`, `sourceURL`, `statusCode`,
+  `contentType`, …).
+- `ExtractionResult` gains `markdown` and `metadata` fields (additive).
+- `--format <markdown|json|both>` and `--json` CLI flags.
+
+### Notes
+- JS-rendered SPAs whose *content* requires the DOM are flagged as a thin shell
+  today; render-then-Markdown escalation via the Tier 2 isolate is the next step.
+
 ## [0.2.1] — 2026-07-05
 
 ### Fixed
@@ -129,6 +159,7 @@ buildable Rust workspace (7 crates) with a `draco` CLI.
   polyfill execution is used instead).
 - **musl fully-static** single-binary build is deferred.
 
+[0.3.0]: https://github.com/0xchasercat/draco/releases/tag/v0.3.0
 [0.2.1]: https://github.com/0xchasercat/draco/releases/tag/v0.2.1
 [0.2.0]: https://github.com/0xchasercat/draco/releases/tag/v0.2.0
 [0.1.1]: https://github.com/0xchasercat/draco/releases/tag/v0.1.1
