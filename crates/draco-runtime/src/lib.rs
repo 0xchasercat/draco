@@ -293,11 +293,17 @@ async fn run_capture_inner(url: &str, html: &str, cfg: &CaptureConfig) -> Captur
         ..Default::default()
     });
 
-    // 1. Inject the page URL for the polyfill's location/history before it runs.
+    // 1. Inject the page URL (for location/history) and the page <body> markup
+    //    (so the polyfill can materialize a real, stable mount-container node
+    //    tree — e.g. `<div id="app">` — that a client framework can find and
+    //    render into) before the polyfill runs.
     let url_lit = json_string_literal(url);
+    let body_lit = json_string_literal(&extract_body_inner(html));
     if let Err(e) = runtime.execute_script(
         "draco:url",
-        format!("globalThis.__DRACO_URL__ = {url_lit};"),
+        format!(
+            "globalThis.__DRACO_URL__ = {url_lit}; globalThis.__DRACO_BODY_HTML__ = {body_lit};"
+        ),
     ) {
         return finish(cap, RuntimeOutcome::Threw, Some(e.to_string()));
     }
@@ -569,6 +575,39 @@ fn extract_inline_scripts(html: &str) -> Vec<String> {
         i = next_i;
     }
     out
+}
+
+/// Extract the inner HTML of the document `<body>` (the static mount scaffold),
+/// so the polyfill can build a real node tree for it.
+///
+/// This is intentionally coarse: a byte scan for the first `<body...>`'s `>` and
+/// the last `</body>`. The polyfill's own parser drops any `<script>` elements
+/// (their code is executed separately), so it is fine to hand it the whole body
+/// including inline scripts. If there is no `<body>` tag we return the region
+/// after `</head>` (or the whole document) — a framework that mounts into
+/// `#app` still finds its container wherever the markup lives.
+fn extract_body_inner(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let lb = lower.as_bytes();
+
+    if let Some(rel) = find_subslice(lb, b"<body") {
+        // Advance to the end of the opening <body ...> tag.
+        if let Some(gt) = find_subslice(&lb[rel..], b">") {
+            let start = rel + gt + 1;
+            let end = match find_subslice(&lb[start..], b"</body") {
+                Some(c) => start + c,
+                None => html.len(),
+            };
+            return html[start..end].to_string();
+        }
+    }
+
+    // No <body>: use everything after </head> if present, else the whole doc.
+    if let Some(rel) = find_subslice(lb, b"</head>") {
+        let start = rel + b"</head>".len();
+        return html[start..].to_string();
+    }
+    html.to_string()
 }
 
 /// Decide whether an opening `<script ...>` tag is executable JS: skip if it has

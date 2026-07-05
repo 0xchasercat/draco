@@ -252,128 +252,647 @@
   }
 
   // ------------------------------------------------------------------
-  // DOM: a deliberately shallow document/element model. querySelector &
-  // friends return a stub element (never null-throws), createElement yields a
-  // detached node, appendChild is a no-op that returns the child. Enough that
-  // hydration glue and "mount into #root" code paths don't explode.
+  // DOM: a real-enough *node tree*.
+  //
+  // Earlier this model was deliberately shallow (querySelector returned a fresh
+  // throwaway stub, insertBefore ignored its anchor, text/comment nodes had no
+  // sibling links). That was enough that hydration glue did not throw, but the
+  // rendered output was not observable and mount containers were not stable
+  // across lookups. Real client frameworks (Vue's runtime-dom `nodeOps`, React
+  // DOM, Svelte) drive a genuine tree during `mount()`: createElement /
+  // createTextNode / createComment, then insertBefore(child, anchor) /
+  // appendChild / removeChild, reading back parentNode / nextSibling /
+  // previousSibling / firstChild / lastChild / childNodes, and setting
+  // textContent. So we now maintain a coherent, mutation-consistent node tree.
+  //
+  // It is still NOT a spec-complete DOM: no layout, no CSS cascade, no live
+  // NodeLists, and querySelector understands only `#id`, `.class`, `tag`, and
+  // `[attr]` / `[attr=val]` selectors (optionally combined) — enough for a
+  // framework to find its mount container and for a test to observe that the
+  // framework actually rendered into the tree. We deliberately do not vendor
+  // linkedom.
   // ------------------------------------------------------------------
   const STYLE = Object.create(null);
-  function makeStubElement(tagName) {
-    const children = [];
+
+  // Element id -> element registry, so getElementById / querySelector('#x')
+  // return the *same* stable node every time (what a real page relies on).
+  const idRegistry = new Map();
+
+  function registerId(el, id) {
+    if (!id) return;
+    // First element with a given id wins (matches getElementById semantics for
+    // the common single-id case) but keep the latest as a fallback.
+    if (!idRegistry.has(id)) idRegistry.set(id, el);
+  }
+
+  // A live-ish `children` view (element nodes only) over a node's childNodes.
+  function elementChildren(node) {
+    const out = [];
+    for (const c of node.childNodes) if (c.nodeType === 1) out.push(c);
+    return out;
+  }
+
+  // Detach `node` from its current parent, fixing up sibling/parent links.
+  function detach(node) {
+    const p = node.parentNode;
+    if (!p) return;
+    const cn = p.childNodes;
+    const i = cn.indexOf(node);
+    if (i >= 0) cn.splice(i, 1);
+    const prev = node.previousSibling;
+    const next = node.nextSibling;
+    if (prev) prev.nextSibling = next;
+    if (next) next.previousSibling = prev;
+    node.parentNode = null;
+    node.previousSibling = null;
+    node.nextSibling = null;
+    refreshEnds(p);
+  }
+
+  function refreshEnds(node) {
+    const cn = node.childNodes;
+    node.firstChild = cn.length ? cn[0] : null;
+    node.lastChild = cn.length ? cn[cn.length - 1] : null;
+  }
+
+  // Core insertion primitive: insert `node` before `ref` in `parent`
+  // (append if `ref` is null/undefined). Maintains every tree link. This is the
+  // one operation Vue's `nodeOps.insert` funnels through:
+  //   insert: (child, parent, anchor) => parent.insertBefore(child, anchor||null)
+  function insertBeforeImpl(parent, node, ref) {
+    if (node == null) return node;
+    // A DocumentFragment inserts its children, then empties.
+    if (node.nodeType === 11) {
+      const kids = node.childNodes.slice();
+      for (const k of kids) insertBeforeImpl(parent, k, ref);
+      return node;
+    }
+    detach(node);
+    const cn = parent.childNodes;
+    let idx = cn.length;
+    if (ref != null) {
+      const at = cn.indexOf(ref);
+      if (at >= 0) idx = at;
+    }
+    const prev = idx > 0 ? cn[idx - 1] : null;
+    const next = idx < cn.length ? cn[idx] : null;
+    cn.splice(idx, 0, node);
+    node.parentNode = parent;
+    node.previousSibling = prev;
+    node.nextSibling = next;
+    if (prev) prev.nextSibling = node;
+    if (next) next.previousSibling = node;
+    refreshEnds(parent);
+    if (node.nodeType === 1 && node.id) registerId(node, node.id);
+    return node;
+  }
+
+  function removeChildImpl(parent, node) {
+    if (node && node.parentNode === parent) detach(node);
+    return node;
+  }
+
+  // Serialize a subtree to HTML-ish text (used by the innerHTML getter and for
+  // test observability). Not spec-perfect, but faithful enough to read back the
+  // text a framework rendered.
+  const VOID_TAGS = new Set([
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr",
+  ]);
+  function serializeChildren(node) {
+    let out = "";
+    for (const c of node.childNodes) out += serializeNode(c);
+    return out;
+  }
+  function serializeNode(node) {
+    if (node.nodeType === 3) return String(node.data == null ? "" : node.data);
+    if (node.nodeType === 8) return "<!--" + String(node.data || "") + "-->";
+    if (node.nodeType === 11) return serializeChildren(node);
+    if (node.nodeType !== 1) return "";
+    const tag = String(node.tagName || "div").toLowerCase();
+    let attrs = "";
+    for (const k of Object.keys(node.attributes)) {
+      attrs += " " + k + '="' + String(node.attributes[k]) + '"';
+    }
+    if (VOID_TAGS.has(tag)) return "<" + tag + attrs + ">";
+    return "<" + tag + attrs + ">" + serializeChildren(node) + "</" + tag + ">";
+  }
+
+  // Concatenate the text content of a subtree (textContent getter).
+  function textOf(node) {
+    if (node.nodeType === 3) return String(node.data == null ? "" : node.data);
+    if (node.nodeType === 8) return "";
+    let out = "";
+    for (const c of node.childNodes) out += textOf(c);
+    return out;
+  }
+
+  // Selector matching against a single element for our supported subset.
+  function elementMatches(el, sel) {
+    if (el.nodeType !== 1) return false;
+    sel = sel.trim();
+    if (sel === "*") return true;
+    // Compound: split into simple tokens (#id, .class, tag, [attr], [attr=v]).
+    const tokens = sel.match(/[#.]?[\w-]+|\[[^\]]+\]/g);
+    if (!tokens) return false;
+    for (const tok of tokens) {
+      if (tok[0] === "#") {
+        if (el.id !== tok.slice(1)) return false;
+      } else if (tok[0] === ".") {
+        const cls = tok.slice(1);
+        const list = String(el.className || "").split(/\s+/);
+        if (!list.includes(cls)) return false;
+      } else if (tok[0] === "[") {
+        const m = tok.slice(1, -1).match(/^([\w-]+)(?:=["']?([^"'\]]*)["']?)?$/);
+        if (!m) return false;
+        const name = m[1];
+        if (!(name in el.attributes)) return false;
+        if (m[2] !== undefined && String(el.attributes[name]) !== m[2]) return false;
+      } else {
+        if (String(el.tagName).toLowerCase() !== tok.toLowerCase()) return false;
+      }
+    }
+    return true;
+  }
+
+  // Depth-first search for the first descendant matching `sel`. Only the last
+  // compound between combinators is honored (descendant combinator collapses to
+  // "match the final compound anywhere under root"), which is all a framework's
+  // mount lookup needs.
+  function queryOne(root, sel) {
+    const parts = String(sel).split(",");
+    for (const part of parts) {
+      const compound = part.trim().split(/\s+/).pop();
+      const hit = findFirst(root, (el) => elementMatches(el, compound));
+      if (hit) return hit;
+    }
+    return null;
+  }
+  function queryAll(root, sel) {
+    const out = [];
+    const parts = String(sel).split(",");
+    for (const part of parts) {
+      const compound = part.trim().split(/\s+/).pop();
+      walk(root, (el) => {
+        if (elementMatches(el, compound) && !out.includes(el)) out.push(el);
+      });
+    }
+    return out;
+  }
+  function findFirst(node, pred) {
+    for (const c of node.childNodes) {
+      if (c.nodeType === 1 && pred(c)) return c;
+      const inner = findFirst(c, pred);
+      if (inner) return inner;
+    }
+    return null;
+  }
+  function walk(node, fn) {
+    for (const c of node.childNodes) {
+      if (c.nodeType === 1) fn(c);
+      walk(c, fn);
+    }
+  }
+
+  // Node factory. `nodeType`: 1 element, 3 text, 8 comment, 11 fragment.
+  function makeNode(nodeType, tagName, text) {
+    const childNodes = [];
     const attrs = Object.create(null);
-    const el = {
-      nodeType: 1,
-      tagName: (tagName || "div").toUpperCase(),
-      nodeName: (tagName || "div").toUpperCase(),
-      id: "",
-      className: "",
-      innerHTML: "",
-      textContent: "",
-      innerText: "",
-      value: "",
-      checked: false,
-      style: Object.create(STYLE),
-      dataset: Object.create(null),
-      children,
-      childNodes: children,
+    const node = {
+      nodeType,
+      tagName: nodeType === 1 ? (tagName || "div").toUpperCase() : undefined,
+      nodeName:
+        nodeType === 3
+          ? "#text"
+          : nodeType === 8
+            ? "#comment"
+            : nodeType === 11
+              ? "#document-fragment"
+              : (tagName || "div").toUpperCase(),
+      childNodes,
       attributes: attrs,
-      classList: {
-        add() {},
-        remove() {},
-        toggle() {},
-        contains() {
-          return false;
-        },
-      },
       ownerDocument: null,
       parentNode: null,
       firstChild: null,
       lastChild: null,
       nextSibling: null,
       previousSibling: null,
-      setAttribute(k, v) {
-        attrs[k] = String(v);
-        if (k === "id") this.id = String(v);
+    };
+
+    if (nodeType === 3 || nodeType === 8) {
+      // Text / comment: carry a mutable `data`, mirrored by nodeValue/textContent.
+      node.data = text == null ? "" : String(text);
+      Object.defineProperty(node, "nodeValue", {
+        get() {
+          return this.data;
+        },
+        set(v) {
+          this.data = v == null ? "" : String(v);
+        },
+      });
+      Object.defineProperty(node, "textContent", {
+        get() {
+          return this.data;
+        },
+        set(v) {
+          this.data = v == null ? "" : String(v);
+        },
+      });
+      return node;
+    }
+
+    // Element / fragment.
+    node.id = "";
+    node.className = "";
+    node.value = "";
+    node.checked = false;
+    node.style = Object.create(STYLE);
+    node.style.setProperty = function (k, v) {
+      this[k] = v;
+    };
+    node.style.removeProperty = function (k) {
+      delete this[k];
+    };
+    node.style.getPropertyValue = function (k) {
+      return this[k] == null ? "" : String(this[k]);
+    };
+    node.dataset = Object.create(null);
+    node.namespaceURI = null;
+
+    node.classList = {
+      _el: node,
+      add(...cs) {
+        const set = new Set(String(this._el.className).split(/\s+/).filter(Boolean));
+        for (const c of cs) set.add(c);
+        this._el.className = Array.from(set).join(" ");
       },
-      getAttribute(k) {
-        return k in attrs ? attrs[k] : null;
+      remove(...cs) {
+        const set = new Set(String(this._el.className).split(/\s+/).filter(Boolean));
+        for (const c of cs) set.delete(c);
+        this._el.className = Array.from(set).join(" ");
       },
-      removeAttribute(k) {
-        delete attrs[k];
+      toggle(c) {
+        if (this.contains(c)) this.remove(c);
+        else this.add(c);
       },
-      hasAttribute(k) {
-        return k in attrs;
-      },
-      appendChild(c) {
-        children.push(c);
-        if (c) c.parentNode = this;
-        this.firstChild = children[0] || null;
-        this.lastChild = children[children.length - 1] || null;
-        return c;
-      },
-      insertBefore(c, _ref) {
-        children.push(c);
-        if (c) c.parentNode = this;
-        return c;
-      },
-      removeChild(c) {
-        const i = children.indexOf(c);
-        if (i >= 0) children.splice(i, 1);
-        return c;
-      },
-      replaceChild(n, _o) {
-        return n;
-      },
-      cloneNode() {
-        return makeStubElement(this.tagName);
-      },
-      contains() {
-        return false;
-      },
-      addEventListener() {},
-      removeEventListener() {},
-      dispatchEvent() {
-        return true;
-      },
-      getBoundingClientRect() {
-        return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0, x: 0, y: 0 };
-      },
-      focus() {},
-      blur() {},
-      click() {},
-      remove() {},
-      querySelector() {
-        return makeStubElement("div");
-      },
-      querySelectorAll() {
-        return [];
-      },
-      getElementsByTagName() {
-        return [];
-      },
-      getElementsByClassName() {
-        return [];
-      },
-      append() {},
-      prepend() {},
-      after() {},
-      before() {},
-      setProperty() {},
-      getContext() {
-        return null;
+      contains(c) {
+        return String(this._el.className).split(/\s+/).includes(c);
       },
     };
-    return el;
+
+    Object.defineProperty(node, "children", {
+      get() {
+        return elementChildren(this);
+      },
+    });
+    Object.defineProperty(node, "childElementCount", {
+      get() {
+        return elementChildren(this).length;
+      },
+    });
+    Object.defineProperty(node, "textContent", {
+      get() {
+        return textOf(this);
+      },
+      set(v) {
+        // Replace all children with a single text node (real setElementText).
+        while (this.childNodes.length) removeChildImpl(this, this.childNodes[0]);
+        const t = makeNode(3, null, v == null ? "" : String(v));
+        insertBeforeImpl(this, t, null);
+      },
+    });
+    Object.defineProperty(node, "innerText", {
+      get() {
+        return textOf(this);
+      },
+      set(v) {
+        this.textContent = v;
+      },
+    });
+    Object.defineProperty(node, "innerHTML", {
+      get() {
+        return serializeChildren(this);
+      },
+      set(v) {
+        while (this.childNodes.length) removeChildImpl(this, this.childNodes[0]);
+        const frag = parseHTML(String(v), doc);
+        insertBeforeImpl(this, frag, null);
+      },
+    });
+    Object.defineProperty(node, "outerHTML", {
+      get() {
+        return serializeNode(this);
+      },
+    });
+
+    node.setAttribute = function (k, v) {
+      attrs[k] = String(v);
+      if (k === "id") {
+        this.id = String(v);
+        registerId(this, this.id);
+      } else if (k === "class") {
+        this.className = String(v);
+      }
+    };
+    node.setAttributeNS = function (_ns, k, v) {
+      this.setAttribute(k, v);
+    };
+    node.getAttribute = function (k) {
+      if (k === "id") return this.id || null;
+      if (k === "class") return this.className || null;
+      return k in attrs ? attrs[k] : null;
+    };
+    node.getAttributeNS = function (_ns, k) {
+      return this.getAttribute(k);
+    };
+    node.removeAttribute = function (k) {
+      delete attrs[k];
+      if (k === "class") this.className = "";
+    };
+    node.removeAttributeNS = function (_ns, k) {
+      this.removeAttribute(k);
+    };
+    node.hasAttribute = function (k) {
+      if (k === "id") return !!this.id;
+      if (k === "class") return !!this.className;
+      return k in attrs;
+    };
+    node.appendChild = function (c) {
+      return insertBeforeImpl(this, c, null);
+    };
+    node.insertBefore = function (c, ref) {
+      return insertBeforeImpl(this, c, ref);
+    };
+    node.removeChild = function (c) {
+      return removeChildImpl(this, c);
+    };
+    node.replaceChild = function (n, o) {
+      if (o && o.parentNode === this) {
+        insertBeforeImpl(this, n, o);
+        removeChildImpl(this, o);
+      }
+      return o;
+    };
+    node.append = function (...cs) {
+      for (const c of cs) {
+        if (typeof c === "string") insertBeforeImpl(this, makeNode(3, null, c), null);
+        else insertBeforeImpl(this, c, null);
+      }
+    };
+    node.prepend = function (...cs) {
+      const first = this.firstChild;
+      for (const c of cs) {
+        const n = typeof c === "string" ? makeNode(3, null, c) : c;
+        insertBeforeImpl(this, n, first);
+      }
+    };
+    node.after = function (...cs) {
+      const p = this.parentNode;
+      if (!p) return;
+      const ref = this.nextSibling;
+      for (const c of cs) {
+        const n = typeof c === "string" ? makeNode(3, null, c) : c;
+        insertBeforeImpl(p, n, ref);
+      }
+    };
+    node.before = function (...cs) {
+      const p = this.parentNode;
+      if (!p) return;
+      for (const c of cs) {
+        const n = typeof c === "string" ? makeNode(3, null, c) : c;
+        insertBeforeImpl(p, n, this);
+      }
+    };
+    node.remove = function () {
+      detach(this);
+    };
+    node.cloneNode = function (deep) {
+      const copy = makeNode(this.nodeType, this.tagName);
+      copy.ownerDocument = this.ownerDocument;
+      copy.className = this.className;
+      for (const k of Object.keys(attrs)) copy.setAttribute(k, attrs[k]);
+      if (this.id) {
+        copy.id = this.id;
+        copy.setAttribute("id", this.id);
+      }
+      if (deep) {
+        for (const c of this.childNodes) copy.appendChild(c.cloneNode(true));
+      }
+      return copy;
+    };
+    node.contains = function (other) {
+      let n = other;
+      while (n) {
+        if (n === this) return true;
+        n = n.parentNode;
+      }
+      return false;
+    };
+    node.hasChildNodes = function () {
+      return this.childNodes.length > 0;
+    };
+    node.getRootNode = function () {
+      let n = this;
+      while (n.parentNode) n = n.parentNode;
+      return n;
+    };
+    node.addEventListener = function () {};
+    node.removeEventListener = function () {};
+    node.dispatchEvent = function () {
+      return true;
+    };
+    node.getBoundingClientRect = function () {
+      return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0, x: 0, y: 0 };
+    };
+    node.getClientRects = function () {
+      return [];
+    };
+    node.focus = function () {};
+    node.blur = function () {};
+    node.click = function () {};
+    node.scrollIntoView = function () {};
+    node.querySelector = function (sel) {
+      return queryOne(this, sel);
+    };
+    node.querySelectorAll = function (sel) {
+      return queryAll(this, sel);
+    };
+    node.getElementsByTagName = function (tag) {
+      const t = String(tag).toLowerCase();
+      return queryAll(this, t === "*" ? "*" : t);
+    };
+    node.getElementsByClassName = function (cls) {
+      return queryAll(this, "." + cls);
+    };
+    node.closest = function (sel) {
+      let n = this;
+      while (n && n.nodeType === 1) {
+        if (elementMatches(n, sel)) return n;
+        n = n.parentNode;
+      }
+      return null;
+    };
+    node.matches = function (sel) {
+      return elementMatches(this, sel);
+    };
+    node.getContext = function () {
+      return null;
+    };
+    node.insertAdjacentElement = function (pos, el) {
+      insertAdjacent(this, pos, el);
+      return el;
+    };
+    node.insertAdjacentHTML = function (pos, html) {
+      const frag = parseHTML(String(html), doc);
+      insertAdjacent(this, pos, frag);
+    };
+    node.insertAdjacentText = function (pos, text) {
+      insertAdjacent(this, pos, makeNode(3, null, text));
+    };
+    return node;
   }
 
-  const documentElement = makeStubElement("html");
-  const headEl = makeStubElement("head");
-  const bodyEl = makeStubElement("body");
+  function insertAdjacent(el, pos, node) {
+    const p = el.parentNode;
+    switch (String(pos).toLowerCase()) {
+      case "beforebegin":
+        if (p) insertBeforeImpl(p, node, el);
+        break;
+      case "afterbegin":
+        insertBeforeImpl(el, node, el.firstChild);
+        break;
+      case "beforeend":
+        insertBeforeImpl(el, node, null);
+        break;
+      case "afterend":
+        if (p) insertBeforeImpl(p, node, el.nextSibling);
+        break;
+    }
+  }
+
+  // --- A tiny, forgiving HTML parser -------------------------------------
+  // Turns a fragment of HTML into a DocumentFragment of real nodes. Used to
+  // materialize the page <body> subtree (so a framework's mount container is a
+  // stable node) and to back the innerHTML setter. It handles tags, attributes
+  // (single/double/unquoted), text, comments, and void elements; it is NOT a
+  // spec parser (no namespaces, no error recovery beyond "close what you can").
+  function parseHTML(html, ownerDoc) {
+    const frag = makeNode(11, null);
+    frag.ownerDocument = ownerDoc;
+    const stack = [frag];
+    let i = 0;
+    const n = html.length;
+    const top = () => stack[stack.length - 1];
+    while (i < n) {
+      const lt = html.indexOf("<", i);
+      if (lt < 0) {
+        appendText(top(), html.slice(i), ownerDoc);
+        break;
+      }
+      if (lt > i) appendText(top(), html.slice(i, lt), ownerDoc);
+
+      if (html.startsWith("<!--", lt)) {
+        const end = html.indexOf("-->", lt + 4);
+        const stop = end < 0 ? n : end;
+        const c = makeNode(8, null, html.slice(lt + 4, stop));
+        c.ownerDocument = ownerDoc;
+        insertBeforeImpl(top(), c, null);
+        i = end < 0 ? n : end + 3;
+        continue;
+      }
+      if (html.startsWith("<!", lt)) {
+        // Doctype / declaration: skip to '>'.
+        const end = html.indexOf(">", lt);
+        i = end < 0 ? n : end + 1;
+        continue;
+      }
+      if (html.startsWith("</", lt)) {
+        const end = html.indexOf(">", lt);
+        const name = html.slice(lt + 2, end < 0 ? n : end).trim().toLowerCase();
+        // Pop until we find a matching open tag (forgiving).
+        for (let s = stack.length - 1; s >= 1; s--) {
+          if (String(stack[s].tagName).toLowerCase() === name) {
+            stack.length = s;
+            break;
+          }
+        }
+        i = end < 0 ? n : end + 1;
+        continue;
+      }
+
+      // Opening tag.
+      const end = html.indexOf(">", lt);
+      if (end < 0) {
+        appendText(top(), html.slice(lt), ownerDoc);
+        break;
+      }
+      let raw = html.slice(lt + 1, end);
+      const selfClose = raw.endsWith("/");
+      if (selfClose) raw = raw.slice(0, -1);
+      const { tag, attrs } = parseOpenTag(raw);
+      if (!tag) {
+        i = end + 1;
+        continue;
+      }
+      const el = makeNode(1, tag);
+      el.ownerDocument = ownerDoc;
+      for (const [k, v] of attrs) el.setAttribute(k, v);
+      insertBeforeImpl(top(), el, null);
+      const lower = tag.toLowerCase();
+      if (lower === "script" || lower === "style" || lower === "textarea" || lower === "title") {
+        // Rawtext element: consume verbatim to its close tag.
+        const close = "</" + lower;
+        const ci = html.toLowerCase().indexOf(close, end + 1);
+        const stop = ci < 0 ? n : ci;
+        if (stop > end + 1) appendText(el, html.slice(end + 1, stop), ownerDoc);
+        const gi = ci < 0 ? n : html.indexOf(">", ci);
+        i = gi < 0 ? n : gi + 1;
+        continue;
+      }
+      if (!selfClose && !VOID_TAGS.has(lower)) stack.push(el);
+      i = end + 1;
+    }
+    return frag;
+  }
+  function appendText(parent, text, ownerDoc) {
+    if (!text) return;
+    const t = makeNode(3, null, text);
+    t.ownerDocument = ownerDoc;
+    insertBeforeImpl(parent, t, null);
+  }
+  function parseOpenTag(raw) {
+    const m = raw.match(/^\s*([\w:-]+)/);
+    if (!m) return { tag: null, attrs: [] };
+    const tag = m[1];
+    const attrs = [];
+    const re = /([\w:-]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'>]+))?/g;
+    let rest = raw.slice(m[0].length);
+    let am;
+    while ((am = re.exec(rest))) {
+      const k = am[1];
+      let v = am[2];
+      if (v == null) v = "";
+      else if (v[0] === '"' || v[0] === "'") v = v.slice(1, -1);
+      attrs.push([k, v]);
+    }
+    return { tag, attrs };
+  }
+
+  function makeStubElement(tag) {
+    const e = makeNode(1, tag);
+    e.ownerDocument = doc;
+    return e;
+  }
+
+  const documentElement = makeNode(1, "html");
+  const headEl = makeNode(1, "head");
+  const bodyEl = makeNode(1, "body");
   documentElement.appendChild(headEl);
   documentElement.appendChild(bodyEl);
 
   const doc = Object.assign(new EventTarget(), {
     nodeType: 9,
+    nodeName: "#document",
     documentElement,
     head: headEl,
     body: bodyEl,
@@ -386,44 +905,82 @@
     hidden: false,
     visibilityState: "visible",
     createElement(tag) {
-      const e = makeStubElement(tag);
+      const e = makeNode(1, tag);
       e.ownerDocument = doc;
       return e;
     },
-    createElementNS(_ns, tag) {
-      return doc.createElement(tag);
+    createElementNS(ns, tag) {
+      const e = doc.createElement(tag);
+      e.namespaceURI = ns;
+      return e;
     },
     createTextNode(text) {
-      return { nodeType: 3, textContent: String(text), data: String(text), parentNode: null };
+      const t = makeNode(3, null, text);
+      t.ownerDocument = doc;
+      return t;
     },
     createDocumentFragment() {
-      return makeStubElement("fragment");
+      const f = makeNode(11, null);
+      f.ownerDocument = doc;
+      return f;
     },
     createComment(text) {
-      return { nodeType: 8, textContent: String(text), data: String(text) };
+      const c = makeNode(8, null, text);
+      c.ownerDocument = doc;
+      return c;
     },
-    getElementById() {
-      return makeStubElement("div");
+    getElementById(id) {
+      const hit = idRegistry.get(String(id));
+      if (hit) return hit;
+      // Fall back to a live tree walk (ids added without setAttribute).
+      return findFirst(documentElement, (el) => el.id === String(id));
     },
-    querySelector() {
-      return makeStubElement("div");
+    querySelector(sel) {
+      return queryOne(documentElement, sel);
     },
-    querySelectorAll() {
-      return [];
+    querySelectorAll(sel) {
+      return queryAll(documentElement, sel);
     },
     getElementsByTagName(tag) {
-      if (tag === "head") return [headEl];
-      if (tag === "body") return [bodyEl];
-      return [];
+      const t = String(tag).toLowerCase();
+      if (t === "head") return [headEl];
+      if (t === "body") return [bodyEl];
+      if (t === "html") return [documentElement];
+      return queryAll(documentElement, t === "*" ? "*" : t);
     },
-    getElementsByClassName() {
-      return [];
+    getElementsByClassName(cls) {
+      return queryAll(documentElement, "." + cls);
     },
-    getElementsByName() {
-      return [];
+    getElementsByName(name) {
+      return queryAll(documentElement, '[name="' + name + '"]');
+    },
+    contains(node) {
+      return documentElement.contains(node);
     },
     createEvent() {
       return new global.Event("event");
+    },
+    createRange() {
+      return {
+        setStart() {},
+        setEnd() {},
+        selectNodeContents() {},
+        collapse() {},
+        cloneContents() {
+          return doc.createDocumentFragment();
+        },
+        deleteContents() {},
+        insertNode() {},
+        getBoundingClientRect() {
+          return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0, x: 0, y: 0 };
+        },
+        getClientRects() {
+          return [];
+        },
+        createContextualFragment(html) {
+          return parseHTML(String(html), doc);
+        },
+      };
     },
     write() {},
     writeln() {},
@@ -435,10 +992,31 @@
     elementFromPoint() {
       return null;
     },
+    addEventListener() {},
+    removeEventListener() {},
   });
   headEl.ownerDocument = doc;
   bodyEl.ownerDocument = doc;
   documentElement.ownerDocument = doc;
+
+  // Materialize the page <body> subtree from the HTML the Rust side injected,
+  // so a framework's mount container (e.g. <div id="app">) is a *real, stable*
+  // node found by getElementById / querySelector. Best-effort: if parsing yields
+  // nothing (or no body markup was injected), we keep the empty <body>.
+  const bodyHtml = global.__DRACO_BODY_HTML__;
+  if (typeof bodyHtml === "string" && bodyHtml.trim()) {
+    try {
+      const frag = parseHTML(bodyHtml, doc);
+      // Drop <script> elements — their code is executed separately by the Rust
+      // driver; we only want the static mount scaffold in the tree.
+      const scripts = queryAll(frag, "script");
+      for (const s of scripts) detach(s);
+      bodyEl.appendChild(frag);
+    } catch (e) {
+      reportError(e);
+    }
+  }
+
   global.document = doc;
 
   // Node type constants some libs read off Node.
