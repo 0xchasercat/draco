@@ -59,10 +59,8 @@ pub use machine::{clamp_tier_max, session_opts, ProdStatic, StaticEngine, TIER_C
 #[cfg(feature = "tier2")]
 pub use draco_jail::{run_jail_child, spawn_jail, JailHandle};
 pub use ranking::{
-    best_candidate, confirm_score, score_request, Candidate, MIN_VIABLE_SCORE, PENALTY_ANALYTICS,
-    PENALTY_HTML, PENALTY_STATIC_ASSET, PENALTY_WRITE_METHOD, SCORE_API_HOST, SCORE_API_PATH,
-    SCORE_HAS_QUERY, SCORE_JSON_ACCEPT, SCORE_JSON_BODY, SCORE_VERSIONED_PATH, SCORE_VIA_FETCH,
-    SCORE_VIA_XHR, SCORE_XHR_HEADERS,
+    best_candidate, score_request, Candidate, MIN_VIABLE_SCORE, PENALTY_ANALYTICS,
+    PENALTY_STATIC_ASSET, SCORE_API_PATH, SCORE_JSON, SCORE_SAME_ORIGIN,
 };
 
 /// Orchestration configuration, assembled by the CLI from flags/env/config file.
