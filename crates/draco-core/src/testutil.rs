@@ -266,6 +266,7 @@ impl MockCapture {
                 bodies,
                 outcome: RuntimeOutcome::Quiesced,
                 sandbox_level: Some(Self::MOCK_LEVEL.to_string()),
+                rendered_html: None,
             }),
             calls: AtomicUsize::new(0),
         }
@@ -279,6 +280,24 @@ impl MockCapture {
                 bodies: Vec::new(),
                 outcome: RuntimeOutcome::NoIntercepts,
                 sandbox_level: Some(Self::MOCK_LEVEL.to_string()),
+                rendered_html: None,
+            }),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    /// Capture yields no interceptable requests but *does* return a serialized
+    /// hydrated DOM — the render-then-Markdown case (a thin shell that hydrates
+    /// its content without any data fetch, or whose fetch was inlined). Drives the
+    /// `runtime.render` escalation in ladder tests without forking a child.
+    pub fn rendered(dom: impl Into<String>) -> Self {
+        Self {
+            result: Ok(CaptureResult {
+                candidates: Vec::new(),
+                bodies: Vec::new(),
+                outcome: RuntimeOutcome::Quiesced,
+                sandbox_level: Some(Self::MOCK_LEVEL.to_string()),
+                rendered_html: Some(dom.into()),
             }),
             calls: AtomicUsize::new(0),
         }

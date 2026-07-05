@@ -445,3 +445,63 @@ fn throwing_third_party_script_does_not_block_later_fetch() {
         report.requests
     );
 }
+
+#[test]
+fn hydrated_dom_is_serialized_for_render_then_markdown() {
+    // A pure client-rendered shell: an empty `<div id="app">` that an inline
+    // script fills after load. The render-then-Markdown escalation depends on the
+    // capture serializing this *hydrated* DOM back to the supervisor.
+    let html = r#"
+        <html><head></head><body>
+          <div id="app"></div>
+          <script>
+            var app = document.getElementById('app');
+            var h = document.createElement('h1');
+            h.textContent = 'Hydrated Title';
+            app.appendChild(h);
+            var p = document.createElement('p');
+            p.textContent = 'Injected by client-side JS after load. 1 < 2 & true';
+            app.appendChild(p);
+          </script>
+        </body></html>
+    "#;
+    let report = run_capture("https://spa.example.com/", html, &cfg());
+
+    let dom = report
+        .rendered_html
+        .expect("hydrated DOM should be serialized");
+    assert!(
+        dom.contains("Hydrated Title"),
+        "serialized DOM missing injected heading: {dom}"
+    );
+    assert!(
+        dom.contains("Injected by client-side JS after load."),
+        "serialized DOM missing injected paragraph: {dom}"
+    );
+    // Text with markup characters must be HTML-escaped so it re-parses cleanly.
+    assert!(
+        dom.contains("1 &lt; 2 &amp; true"),
+        "injected text should be HTML-escaped in the serialized DOM: {dom}"
+    );
+}
+
+#[test]
+fn static_body_content_survives_to_serialized_dom() {
+    // Even with no JS mutation, the serialized DOM reflects the materialized body
+    // (the polyfill builds a real node tree from the injected body markup), so the
+    // render path degrades gracefully to the static body.
+    let html = r#"<html><head></head><body>
+        <article><h1>Static Heading</h1><p>Plain server body text.</p></article>
+      </body></html>"#;
+    let report = run_capture("https://static.example.com/", html, &cfg());
+
+    let dom = report.rendered_html.expect("serialized DOM present");
+    assert!(
+        dom.contains("Static Heading"),
+        "missing static heading: {dom}"
+    );
+    assert!(
+        dom.contains("Plain server body text."),
+        "missing static body: {dom}"
+    );
+}

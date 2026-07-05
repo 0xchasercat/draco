@@ -12,7 +12,10 @@ draco extract https://example.com          # → clean Markdown on stdout
 For a standard HTML page that's a single fingerprinted fetch + parse — typically
 **~300 ms, no browser** — and the Markdown pipeline mirrors Firecrawl's
 (deterministic main-content extraction + a Turndown/GFM-equivalent converter),
-implemented natively in Rust.
+implemented natively in Rust. Client-rendered SPAs (whose content only appears
+after JavaScript runs) are handled too, via
+[render-then-Markdown](#client-rendered-spas--markdown-render-then-markdown) — no
+headless browser fleet.
 
 ## What you get
 
@@ -77,9 +80,24 @@ Flags: `--format <markdown|json|both>` (default `markdown`), `--json`, `--extrac
 `--capture-window-ms <ms>`, `--ignore-robots`, `--no-jail`, `--strict-sandbox`,
 `--allow-unsafe-replay`, `--pretty`.
 
-> **Roadmap:** JS-rendered SPAs whose *content* (not just data) requires the DOM
-> — Draco flags a thin shell today and will escalate to render-then-Markdown next,
-> reusing the Tier 2 isolate.
+### Client-rendered SPAs → Markdown (render-then-Markdown)
+
+Some pages render their *content* only after JavaScript runs — the fetched HTML is
+a thin shell (an empty `<div id="root">`). Draco handles these automatically: when
+the initial parse finds almost no content and Tier 2 is permitted (the default),
+it hydrates the shell in the same jitless V8 isolate, serializes the **live DOM**,
+splices the shell's real `<head>` (title / Open Graph / canonical) onto the
+hydrated `<body>`, and re-runs the exact same content engine over it. You get clean
+Markdown from a client-rendered page with no headless browser — the trace shows a
+`runtime.render` step and `source_tier: runtime_interception`.
+
+```sh
+draco extract https://spa.example.com            # thin shell → hydrated Markdown
+draco extract https://spa.example.com --tier-max 1   # opt out: static shell only
+```
+
+A thin shell that can't be improved (hydration adds nothing, or the isolate is
+unavailable) falls back to the static shell — never a crash, never a regression.
 
 ## Workspace layout
 

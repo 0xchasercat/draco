@@ -142,6 +142,69 @@ pub fn is_thin_content(markdown: &str, min_chars: usize) -> bool {
     markdown.chars().filter(|c| !c.is_whitespace()).count() < min_chars
 }
 
+/// Merge the original shell's `<head>` with a hydrated document's `<body>` into a
+/// single document suitable for [`scrape`].
+///
+/// This is the join point of the render-then-Markdown escalation. The Tier 2
+/// isolate hydrates a client-rendered SPA and serializes the live DOM
+/// (`document.documentElement.outerHTML`) — that markup carries the *content*
+/// the framework mounted, but a near-empty `<head>` (the isolate does not
+/// materialize the shell's metadata). The originally fetched shell is the
+/// reverse: a rich `<head>` (title, Open Graph, canonical, `<base>`) wrapped
+/// around an empty mount point. Splicing the shell head onto the hydrated body
+/// gives [`scrape`] one coherent document that yields both faithful metadata and
+/// the hydrated article — mirroring how a real browser render feeds the same
+/// HTML→Markdown transform.
+///
+/// The shell head is preferred verbatim (so `<base href>` and SEO tags survive);
+/// the hydrated body replaces the shell's empty one. If either part cannot be
+/// located the function degrades gracefully: a missing shell head yields the
+/// hydrated document's own head (or none), and a hydrated document with no
+/// `<body>` is treated as body-only markup.
+pub fn merge_rendered_document(shell_html: &str, rendered_html: &str) -> String {
+    let head = slice_element(shell_html, "head")
+        .or_else(|| slice_element(rendered_html, "head"))
+        .unwrap_or_default();
+
+    // The hydrated content: prefer the rendered `<body>…</body>`; if the isolate
+    // emitted no body wrapper, treat the whole serialized string as body markup.
+    let body = slice_element(rendered_html, "body")
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("<body>{rendered_html}</body>"));
+
+    format!("<!doctype html><html>{head}{body}</html>")
+}
+
+/// Return the full `<tag …>…</tag>` span (opening tag through closing tag) for
+/// the first occurrence of `tag`, case-insensitively. Byte-oriented and
+/// allocation-light: it lowercases only for matching and slices the original.
+/// Returns `None` when the element (or its closing tag) is absent.
+fn slice_element<'a>(html: &'a str, tag: &str) -> Option<&'a str> {
+    let lower = html.to_ascii_lowercase();
+    let open_needle = format!("<{tag}");
+    let close_needle = format!("</{tag}>");
+
+    let open = lower.find(&open_needle)?;
+    // The opening tag must end in `>` (guards against `<bodyfoo`); find it.
+    let after_open = &lower[open + open_needle.len()..];
+    // The next byte after the tag name must be `>`, whitespace, or `/`.
+    let first = after_open.as_bytes().first().copied();
+    if !matches!(
+        first,
+        Some(b'>')
+            | Some(b'/')
+            | Some(b' ')
+            | Some(b'\t')
+            | Some(b'\n')
+            | Some(b'\r')
+            | Some(b'\x0c')
+    ) {
+        return None;
+    }
+    let close = lower[open..].find(&close_needle)? + open + close_needle.len();
+    Some(&html[open..close])
+}
+
 // ===================================================================
 // Pass 1 — DOM pre-processing (Firecrawl `transform_html` parity)
 // ===================================================================
@@ -1474,5 +1537,57 @@ mod tests {
         assert_eq!(a.metadata["url"], "https://x/");
         let b = scrape("not html at all", "https://x/", 404, "text/plain", true);
         assert_eq!(b.metadata["statusCode"], 404);
+    }
+
+    #[test]
+    fn merge_rendered_splices_shell_head_onto_hydrated_body() {
+        // The render-then-Markdown join: a thin shell (rich head, empty mount) +
+        // a hydrated DOM (thin head, real body) → one document that scrapes to
+        // both the shell's metadata and the hydrated article.
+        let shell = r#"<!doctype html><html><head><title>Guide</title>
+            <meta property="og:title" content="The Guide"><base href="https://d.example/">
+            </head><body><div id="app"></div></body></html>"#;
+        let hydrated = "<html><head></head><body><main><article>\
+            <h1>The Guide</h1><p>Rendered body content that only exists after hydration.</p>\
+            </article></main></body></html>";
+
+        let merged = merge_rendered_document(shell, hydrated);
+        // Shell head (title/OG/base) is preserved; hydrated body replaces the shell's.
+        assert!(merged.contains("<title>Guide</title>"));
+        assert!(merged.contains(r#"property="og:title""#));
+        assert!(merged.contains("Rendered body content"));
+        assert!(
+            !merged.contains(r#"id="app""#),
+            "shell's empty mount is replaced"
+        );
+
+        let res = scrape(&merged, "https://d.example/guide", 200, "text/html", true);
+        assert_eq!(res.metadata["title"], "Guide");
+        assert_eq!(res.metadata["og:title"], "The Guide");
+        assert!(res.markdown.contains("Rendered body content"));
+        assert!(res.markdown.contains("# The Guide"));
+    }
+
+    #[test]
+    fn merge_rendered_degrades_without_shell_head_or_rendered_body() {
+        // No shell head → fall back to the rendered document's own head; a
+        // rendered string with no <body> is treated as body-only markup.
+        let merged = merge_rendered_document("<div>shell</div>", "<p>just a fragment</p>");
+        assert!(merged.contains("<p>just a fragment</p>"));
+        // Must remain parseable/usable by the engine.
+        let res = scrape(&merged, "https://x/", 200, "text/html", false);
+        assert!(res.markdown.contains("just a fragment"));
+    }
+
+    #[test]
+    fn slice_element_is_case_insensitive_and_tag_bounded() {
+        // Matches regardless of case, and does not mistake `<bodyguard>` for `<body>`.
+        let html = "<HTML><BODY class=x>hi</BODY></HTML>";
+        assert_eq!(slice_element(html, "body"), Some("<BODY class=x>hi</BODY>"));
+        assert_eq!(slice_element("<bodyguard>no</bodyguard>", "body"), None);
+        assert_eq!(
+            slice_element("<head><title>t</title></head>", "head"),
+            Some("<head><title>t</title></head>")
+        );
     }
 }
