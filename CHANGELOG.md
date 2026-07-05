@@ -3,6 +3,35 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.7.0] — 2026-07-06
+
+### Added
+- **Daemon mode: `draco serve`** — a persistent HTTP daemon exposing a
+  **Firecrawl-compatible REST API** (axum), so the process stays warm (no
+  per-scrape binary spawn) and existing Firecrawl clients can point at Draco
+  unchanged.
+  - `POST /v1/scrape`: Firecrawl request shape (`url`, `formats`, `timeout`;
+    unknown fields like `onlyMainContent` / `waitFor` accepted and ignored) →
+    Firecrawl response shape (`{ success, data: { markdown?, json?, metadata } }`,
+    `{ success: false, error }` on failure). `formats` supports `"markdown"`
+    (default) and `"json"` (Draco's tiered JSON-API extraction under
+    `data.json`); recognized-but-unsupported formats (`html`, `rawHtml`,
+    `links`, `screenshot`, …) are rejected with a clear `400` instead of being
+    silently dropped.
+  - HTTP status mapping: `200` success · `400` bad request · `502`
+    upstream/network failure · `422` unsupported target / needs-browser ·
+    `503` shutting down.
+  - Draco per-request extensions mirroring the CLI flags: `tierMax`,
+    `captureWindowMs`, `noJail`, `allowUnsafeReplay`, `ignoreRobots`, `proxy`.
+    Server-wide defaults from `draco serve` flags (`--timeout`, `--tier-max`,
+    `--no-jail`, …). Every response carries a `draco` extension object
+    (`sourceTier`, `timing`, `trace`).
+  - `GET /health`; graceful shutdown on ctrl-c/SIGTERM; concurrency bounded by
+    `--max-concurrency` (default 8, excess requests queue).
+  - New `serve` cargo feature (default on), independent of `tier2`: the lean
+    `--no-default-features` build stays axum-free, and
+    `--features serve` without `tier2` serves the static tiers only.
+
 ## [0.6.1] — 2026-07-06
 
 ### Changed

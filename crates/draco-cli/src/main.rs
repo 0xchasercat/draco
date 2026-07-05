@@ -15,6 +15,10 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use draco_core::{extract, Config, OutputFormat};
+
+/// `draco serve` — persistent daemon with a Firecrawl-compatible REST API.
+#[cfg(feature = "serve")]
+mod serve;
 use draco_types::{DracoError, ExtractionResult, SourceTier, Status, StepOutcome, TraceStep};
 use serde_json::Value;
 use serde_json_path::JsonPath;
@@ -109,6 +113,45 @@ enum Command {
         /// Pretty-print the JSON envelope (no effect on raw Markdown output).
         #[arg(long)]
         pretty: bool,
+    },
+    /// Run a persistent HTTP daemon exposing a Firecrawl-compatible REST API
+    /// (`POST /v1/scrape`, `GET /health`). The process stays warm, so clients
+    /// skip the per-scrape binary spawn.
+    #[cfg(feature = "serve")]
+    Serve {
+        /// Bind address.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Bind port (Firecrawl's self-hosted API default is 3002).
+        #[arg(long, default_value_t = 3002)]
+        port: u16,
+        /// Maximum concurrent extractions; excess requests queue.
+        #[arg(long, default_value_t = 8)]
+        max_concurrency: usize,
+        /// Default total request timeout (ms); per-request `timeout` overrides.
+        #[arg(long, default_value_t = 30_000)]
+        timeout: u64,
+        /// Default escalation-ladder cap (0, 1, or 2); per-request `tierMax`
+        /// overrides.
+        #[arg(long, default_value_t = 2)]
+        tier_max: u8,
+        /// Default Tier 2 capture-window duration (ms); per-request
+        /// `captureWindowMs` overrides.
+        #[arg(long, default_value_t = 2_000)]
+        capture_window_ms: u64,
+        /// Default: skip OS-level sandbox hardening (Tier 2 still runs V8 with
+        /// no host bindings); per-request `noJail` overrides.
+        #[arg(long)]
+        no_jail: bool,
+        /// Use the strict default-deny seccomp allowlist for jailed children.
+        #[arg(long)]
+        strict_sandbox: bool,
+        /// Default: bypass robots.txt; per-request `ignoreRobots` overrides.
+        #[arg(long)]
+        ignore_robots: bool,
+        /// Default http/https/socks5 proxy URL; per-request `proxy` overrides.
+        #[arg(long)]
+        proxy: Option<String>,
     },
     /// Internal: jailed child entry (self-re-exec target). Hidden.
     #[command(name = "__jail", hide = true)]
@@ -299,6 +342,44 @@ async fn async_main() {
             }
             print!("{}", render_output(&result, format, json, pretty));
             std::process::exit(status_to_exit_code(result.status));
+        }
+        #[cfg(feature = "serve")]
+        Command::Serve {
+            host,
+            port,
+            max_concurrency,
+            timeout,
+            tier_max,
+            capture_window_ms,
+            no_jail,
+            strict_sandbox,
+            ignore_robots,
+            proxy,
+        } => {
+            let defaults = Config {
+                // Per-request `formats` decides markdown/json; this default is
+                // overwritten on every request but keeps the struct total.
+                format: OutputFormat::Markdown,
+                proxy,
+                delay_ms: 0,
+                timeout_ms: timeout,
+                respect_robots: !ignore_robots,
+                tier_max,
+                capture_window_ms,
+                no_jail,
+                strict_sandbox,
+                allow_unsafe_replay: false,
+            };
+            let opts = serve::ServeOptions {
+                host,
+                port,
+                max_concurrency,
+                defaults,
+            };
+            if let Err(e) = serve::serve(opts).await {
+                eprintln!("draco serve: {e}");
+                std::process::exit(1);
+            }
         }
         Command::Jail => {
             // Reached only when `tier2` is OFF (the tier2 build handles `__jail`

@@ -1,0 +1,594 @@
+//! `draco serve` — a persistent HTTP daemon exposing a Firecrawl-compatible
+//! REST API over the extraction ladder.
+//!
+//! The process stays resident, so clients skip the per-scrape binary spawn and
+//! the request path is exactly [`draco_core::extract`] — the same tiered ladder
+//! the CLI runs, warm. The surface mirrors Firecrawl's self-hosted API so
+//! existing Firecrawl clients can point at Draco unchanged:
+//!
+//! - `GET /health` → `{ "status": "ok", "version": … }`
+//! - `POST /v1/scrape` with `{ "url": …, "formats": ["markdown" | "json"], … }`
+//!   → `{ "success": true, "data": { "markdown"?, "json"?, "metadata" } }`
+//!
+//! Firecrawl-compatible notes:
+//! - `formats` defaults to `["markdown"]`. Draco's `"json"` is the tiered
+//!   JSON-API extraction (embedded state → build-id replay → runtime
+//!   interception) — a superset of "structured data from the page", surfaced
+//!   under `data.json` like Firecrawl's json format. Formats Draco does not
+//!   produce yet (`html`, `rawHtml`, `links`, `screenshot`, …) are rejected
+//!   with a clear `400` rather than silently dropped.
+//! - Unknown request fields (`onlyMainContent`, `waitFor`, `mobile`, …) are
+//!   accepted and ignored, so real-world Firecrawl client payloads work.
+//! - Failures use Firecrawl's `{ "success": false, "error": … }` envelope.
+//! - Every response also carries a `draco` extension object (`sourceTier`,
+//!   `timing`, `trace`) — Draco's honest execution report. Extra keys are
+//!   invisible to clients that only read the Firecrawl fields.
+//!
+//! Concurrency is bounded by a semaphore (`--max-concurrency`): each in-flight
+//! scrape may spawn a jailed V8 child, so an unbounded intake could exhaust the
+//! host. Excess requests queue rather than fail.
+
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use draco_core::{extract, Config, OutputFormat};
+use draco_types::{DracoError, ExtractionResult, Status};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tokio::sync::Semaphore;
+
+// ===================================================================
+// Options & state
+// ===================================================================
+
+/// Server options assembled from `draco serve` flags. `defaults` seeds every
+/// request's [`Config`]; per-request fields override it.
+pub struct ServeOptions {
+    pub host: String,
+    pub port: u16,
+    pub max_concurrency: usize,
+    pub defaults: Config,
+}
+
+struct AppState {
+    defaults: Config,
+    gate: Semaphore,
+}
+
+// ===================================================================
+// Entry
+// ===================================================================
+
+/// Bind and run the daemon until ctrl-c / SIGTERM. Returns an error string only
+/// for startup/bind failures (the caller maps it to a nonzero exit).
+pub async fn serve(opts: ServeOptions) -> Result<(), String> {
+    let state = Arc::new(AppState {
+        defaults: opts.defaults,
+        gate: Semaphore::new(opts.max_concurrency.max(1)),
+    });
+    let addr = format!("{}:{}", opts.host, opts.port);
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(|e| format!("bind {addr}: {e}"))?;
+    let local = listener.local_addr().map(|a| a.to_string()).unwrap_or(addr);
+    eprintln!("draco serve: listening on http://{local} (Firecrawl-compatible API at /v1/scrape)");
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .map_err(|e| format!("server error: {e}"))
+}
+
+fn router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/v1/scrape", post(scrape))
+        .with_state(state)
+}
+
+async fn shutdown_signal() {
+    // Ctrl-C always; SIGTERM too on unix (containers / service managers).
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    ctrl_c.await;
+    eprintln!("draco serve: shutting down");
+}
+
+// ===================================================================
+// Handlers
+// ===================================================================
+
+async fn health() -> Json<Value> {
+    Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
+}
+
+/// Firecrawl-shaped scrape request. Unknown fields are deliberately ignored so
+/// stock Firecrawl client payloads (`onlyMainContent`, `waitFor`, `mobile`, …)
+/// deserialize cleanly; camelCase to match their wire format. The `tierMax` /
+/// `captureWindowMs` / `noJail` / `allowUnsafeReplay` / `ignoreRobots` / `proxy`
+/// fields are Draco extensions mirroring the CLI flags.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScrapeRequest {
+    url: String,
+    #[serde(default)]
+    formats: Vec<String>,
+    /// Total request timeout in ms (Firecrawl field).
+    #[serde(default)]
+    timeout: Option<u64>,
+    // ---- Draco extensions ------------------------------------------------
+    #[serde(default)]
+    tier_max: Option<u8>,
+    #[serde(default)]
+    capture_window_ms: Option<u64>,
+    #[serde(default)]
+    no_jail: Option<bool>,
+    #[serde(default)]
+    allow_unsafe_replay: Option<bool>,
+    #[serde(default)]
+    ignore_robots: Option<bool>,
+    #[serde(default)]
+    proxy: Option<String>,
+}
+
+async fn scrape(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ScrapeRequest>,
+) -> (StatusCode, Json<Value>) {
+    let format = match parse_formats(&req.formats) {
+        Ok(f) => f,
+        Err(msg) => return (StatusCode::BAD_REQUEST, Json(error_body(&msg))),
+    };
+    if req.url.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(error_body("\"url\" must be a non-empty string")),
+        );
+    }
+
+    let config = Config {
+        format,
+        proxy: req.proxy.clone().or_else(|| state.defaults.proxy.clone()),
+        timeout_ms: req.timeout.unwrap_or(state.defaults.timeout_ms),
+        tier_max: req.tier_max.unwrap_or(state.defaults.tier_max),
+        capture_window_ms: req
+            .capture_window_ms
+            .unwrap_or(state.defaults.capture_window_ms),
+        no_jail: req.no_jail.unwrap_or(state.defaults.no_jail),
+        allow_unsafe_replay: req
+            .allow_unsafe_replay
+            .unwrap_or(state.defaults.allow_unsafe_replay),
+        respect_robots: match req.ignore_robots {
+            Some(ignore) => !ignore,
+            None => state.defaults.respect_robots,
+        },
+        ..state.defaults.clone()
+    };
+
+    // Bound concurrent extractions; queue (don't fail) when saturated. The
+    // semaphore is never closed, so acquire can only fail on close — treat that
+    // as a 503 just in case.
+    let Ok(_permit) = state.gate.acquire().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(error_body("server is shutting down")),
+        );
+    };
+    let result = extract(&req.url, &config).await;
+    let (code, body) = to_firecrawl(&result, format);
+    (code, Json(body))
+}
+
+// ===================================================================
+// Mapping
+// ===================================================================
+
+/// Parse Firecrawl `formats` into Draco's [`OutputFormat`]. Empty defaults to
+/// Markdown (Firecrawl's default). Recognized-but-unsupported formats fail
+/// loudly — a client asking for `rawHtml` should not get a silently different
+/// payload.
+fn parse_formats(formats: &[String]) -> Result<OutputFormat, String> {
+    let (mut markdown, mut json) = (false, false);
+    for f in formats {
+        match f.as_str() {
+            "markdown" => markdown = true,
+            "json" => json = true,
+            "html"
+            | "rawHtml"
+            | "links"
+            | "screenshot"
+            | "screenshot@fullPage"
+            | "extract"
+            | "changeTracking"
+            | "summary" => {
+                return Err(format!(
+                    "format {f:?} is not supported yet — supported formats: \"markdown\", \"json\""
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "unknown format {other:?} — supported formats: \"markdown\", \"json\""
+                ));
+            }
+        }
+    }
+    Ok(match (markdown, json) {
+        (true, true) => OutputFormat::Both,
+        (false, true) => OutputFormat::Json,
+        // No formats given, or just "markdown".
+        _ => OutputFormat::Markdown,
+    })
+}
+
+/// Firecrawl error envelope.
+fn error_body(message: &str) -> Value {
+    json!({ "success": false, "error": message })
+}
+
+/// Map a terminal [`ExtractionResult`] to (HTTP status, Firecrawl body).
+fn to_firecrawl(result: &ExtractionResult, format: OutputFormat) -> (StatusCode, Value) {
+    let draco_ext = json!({
+        "sourceTier": result.source_tier,
+        "timing": result.timing,
+        "trace": result.trace,
+    });
+
+    if result.status == Status::Success {
+        let mut data = serde_json::Map::new();
+        if let Some(md) = &result.markdown {
+            data.insert("markdown".into(), Value::String(md.clone()));
+        }
+        if matches!(format, OutputFormat::Json | OutputFormat::Both) {
+            if let Some(d) = &result.data {
+                data.insert("json".into(), d.clone());
+            }
+        }
+        // Draco's metadata is already Firecrawl-keyed (title, description,
+        // og:*, sourceURL, statusCode, contentType). Synthesize the minimum
+        // when the Markdown path didn't run (json-only requests).
+        let metadata = result
+            .metadata
+            .clone()
+            .unwrap_or_else(|| json!({ "sourceURL": result.url, "url": result.url }));
+        data.insert("metadata".into(), metadata);
+        let body = json!({ "success": true, "data": Value::Object(data), "draco": draco_ext });
+        return (StatusCode::OK, body);
+    }
+
+    let code = match (result.status, &result.error) {
+        // Upstream/network failure — Draco is the gateway to the target site.
+        (Status::Error, Some(DracoError::Network { .. })) => StatusCode::BAD_GATEWAY,
+        (Status::Error, _) => StatusCode::INTERNAL_SERVER_ERROR,
+        // The ladder ran out of tiers / needs a real browser: the request was
+        // well-formed but this target is beyond what the server can do.
+        (Status::Unsupported | Status::NeedsBrowser, _) => StatusCode::UNPROCESSABLE_ENTITY,
+        (Status::Success, _) => unreachable!("handled above"),
+    };
+    let mut body = error_body(&error_summary(result));
+    body["draco"] = draco_ext;
+    (code, body)
+}
+
+/// One-line human summary of a failed result for the `error` field.
+fn error_summary(result: &ExtractionResult) -> String {
+    match (&result.error, result.status) {
+        (Some(DracoError::Network { reason, detail }), _) => {
+            let reason = format!("{reason:?}").to_lowercase();
+            format!("network error ({reason}): {detail}")
+        }
+        (Some(DracoError::Parse { detail }), _) => format!("parse error: {detail}"),
+        (Some(DracoError::Jail { reason, detail }), _) => {
+            let reason = format!("{reason:?}").to_lowercase();
+            format!("sandbox error ({reason}): {detail}")
+        }
+        (Some(DracoError::Runtime { detail }), _) => format!("runtime error: {detail}"),
+        (Some(DracoError::Ipc { detail }), _) => format!("ipc error: {detail}"),
+        (Some(DracoError::Config { detail }), _) => format!("config error: {detail}"),
+        (None, Status::Unsupported) => {
+            "extraction unsupported for this target (exhausted the tier ladder)".into()
+        }
+        (None, Status::NeedsBrowser) => {
+            "target needs a full browser (beyond the isolate's ceiling)".into()
+        }
+        (None, _) => "extraction failed".into(),
+    }
+}
+
+// ===================================================================
+// Tests
+// ===================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use draco_types::Timing;
+    use tower::ServiceExt;
+
+    fn test_state(defaults: Config) -> Arc<AppState> {
+        Arc::new(AppState {
+            defaults,
+            gate: Semaphore::new(2),
+        })
+    }
+
+    async fn body_json(resp: axum::response::Response) -> Value {
+        let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // ---- formats ----------------------------------------------------------
+
+    #[test]
+    fn formats_default_to_markdown() {
+        assert_eq!(parse_formats(&[]).unwrap(), OutputFormat::Markdown);
+        assert_eq!(
+            parse_formats(&["markdown".into()]).unwrap(),
+            OutputFormat::Markdown
+        );
+    }
+
+    #[test]
+    fn formats_map_json_and_both() {
+        assert_eq!(parse_formats(&["json".into()]).unwrap(), OutputFormat::Json);
+        assert_eq!(
+            parse_formats(&["markdown".into(), "json".into()]).unwrap(),
+            OutputFormat::Both
+        );
+    }
+
+    #[test]
+    fn known_but_unsupported_formats_fail_loudly() {
+        let err = parse_formats(&["rawHtml".into()]).unwrap_err();
+        assert!(err.contains("not supported yet"), "{err}");
+        let err = parse_formats(&["bogus".into()]).unwrap_err();
+        assert!(err.contains("unknown format"), "{err}");
+    }
+
+    // ---- request deserialization -------------------------------------------
+
+    #[test]
+    fn firecrawl_client_payload_deserializes_with_unknown_fields() {
+        // A realistic Firecrawl SDK payload: unknown fields must be ignored.
+        let req: ScrapeRequest = serde_json::from_value(json!({
+            "url": "https://example.com",
+            "formats": ["markdown"],
+            "onlyMainContent": true,
+            "waitFor": 123,
+            "mobile": false,
+            "timeout": 15000,
+            "headers": { "User-Agent": "x" }
+        }))
+        .unwrap();
+        assert_eq!(req.url, "https://example.com");
+        assert_eq!(req.timeout, Some(15_000));
+        assert!(req.tier_max.is_none());
+    }
+
+    #[test]
+    fn draco_extension_fields_deserialize() {
+        let req: ScrapeRequest = serde_json::from_value(json!({
+            "url": "https://example.com",
+            "formats": ["json"],
+            "tierMax": 1,
+            "captureWindowMs": 500,
+            "noJail": true,
+            "allowUnsafeReplay": false,
+            "ignoreRobots": true,
+            "proxy": "http://127.0.0.1:8080"
+        }))
+        .unwrap();
+        assert_eq!(req.tier_max, Some(1));
+        assert_eq!(req.capture_window_ms, Some(500));
+        assert_eq!(req.no_jail, Some(true));
+        assert_eq!(req.ignore_robots, Some(true));
+        assert_eq!(req.proxy.as_deref(), Some("http://127.0.0.1:8080"));
+    }
+
+    // ---- response mapping ---------------------------------------------------
+
+    fn success_result() -> ExtractionResult {
+        ExtractionResult {
+            url: "https://site.example/a".into(),
+            status: Status::Success,
+            source_tier: None,
+            data: Some(json!({ "items": [1, 2] })),
+            markdown: Some("# Title\n\nBody.".into()),
+            metadata: Some(json!({
+                "title": "Title",
+                "sourceURL": "https://site.example/a",
+                "statusCode": 200
+            })),
+            timing: Timing::default(),
+            trace: vec![],
+            error: None,
+        }
+    }
+
+    #[test]
+    fn success_maps_to_firecrawl_data_envelope() {
+        let (code, body) = to_firecrawl(&success_result(), OutputFormat::Markdown);
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["success"], true);
+        assert_eq!(body["data"]["markdown"], "# Title\n\nBody.");
+        assert_eq!(
+            body["data"]["metadata"]["sourceURL"],
+            "https://site.example/a"
+        );
+        // markdown-only request: the JSON-API payload is not attached.
+        assert!(body["data"].get("json").is_none());
+        // The draco extension is always present.
+        assert!(body["draco"].get("timing").is_some());
+    }
+
+    #[test]
+    fn json_format_attaches_data_json() {
+        let (_, body) = to_firecrawl(&success_result(), OutputFormat::Both);
+        assert_eq!(body["data"]["json"]["items"][0], 1);
+    }
+
+    #[test]
+    fn json_only_synthesizes_minimal_metadata() {
+        let mut r = success_result();
+        r.markdown = None;
+        r.metadata = None;
+        let (_, body) = to_firecrawl(&r, OutputFormat::Json);
+        assert_eq!(
+            body["data"]["metadata"]["sourceURL"],
+            "https://site.example/a"
+        );
+    }
+
+    #[test]
+    fn network_error_maps_to_bad_gateway() {
+        let mut r = success_result();
+        r.status = Status::Error;
+        r.markdown = None;
+        r.data = None;
+        r.error = Some(DracoError::Network {
+            reason: draco_types::NetKind::Timeout,
+            detail: "connect timed out".into(),
+        });
+        let (code, body) = to_firecrawl(&r, OutputFormat::Markdown);
+        assert_eq!(code, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["success"], false);
+        let msg = body["error"].as_str().unwrap();
+        assert!(msg.contains("connect timed out"), "{msg}");
+    }
+
+    #[test]
+    fn unsupported_maps_to_unprocessable() {
+        let mut r = success_result();
+        r.status = Status::Unsupported;
+        r.markdown = None;
+        r.data = None;
+        let (code, body) = to_firecrawl(&r, OutputFormat::Json);
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["success"], false);
+    }
+
+    // ---- router-level (oneshot, no sockets) ---------------------------------
+
+    #[tokio::test]
+    async fn health_endpoint_reports_ok() {
+        let app = router(test_state(Config::default()));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn scrape_rejects_bad_format_before_extracting() {
+        let app = router(test_state(Config::default()));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/scrape")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "url": "https://example.com", "formats": ["rawHtml"] }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["success"], false);
+    }
+
+    #[tokio::test]
+    async fn scrape_rejects_empty_url() {
+        let app = router(test_state(Config::default()));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/scrape")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "url": "  " }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Full end-to-end through the router: a fixture HTTP server serves a real
+    /// static article; POST /v1/scrape extracts it to Markdown via the actual
+    /// ladder (tier 0 static path — no isolate needed).
+    #[tokio::test]
+    async fn scrape_end_to_end_static_page() {
+        // Fixture site on an ephemeral port.
+        let fixture = Router::new().route(
+            "/article",
+            get(|| async {
+                axum::response::Html(
+                    "<!doctype html><html><head><title>Fixture</title></head><body>\
+                     <article><h1>Daemon Smoke</h1>\
+                     <p>Served by the in-test fixture and scraped through the daemon's \
+                     REST surface via the real extraction ladder.</p></article>\
+                     </body></html>",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, fixture).await.unwrap();
+        });
+
+        // Static-only config: the fixture page needs no isolate/jail.
+        let defaults = Config {
+            tier_max: 0,
+            respect_robots: false,
+            ..Config::default()
+        };
+        let app = router(test_state(defaults));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/scrape")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "url": format!("http://127.0.0.1:{port}/article") }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["success"], true);
+        let md = body["data"]["markdown"].as_str().unwrap();
+        assert!(md.contains("Daemon Smoke"), "markdown: {md}");
+        assert_eq!(body["data"]["metadata"]["title"], "Fixture");
+        assert_eq!(body["data"]["metadata"]["statusCode"], 200);
+    }
+}
