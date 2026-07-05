@@ -81,30 +81,45 @@ cargo build -p draco-cli --no-default-features   # lean, V8-free
 
 ## Security model (Tier 2)
 
-Untrusted page JS is only ever evaluated inside a child process that is
-network-air-gapped (user + network namespace, no interfaces), filesystem-locked
-(Landlock), and syscall-filtered (two-phase seccomp-bpf, default `KILL`). V8 runs
-`--jitless --single-threaded` so no executable memory is needed and `mprotect`
-with `PROT_EXEC` is denied. The child only ever *reports* the API request it
-intercepted; the air-gapped supervisor replays it. On non-Linux (or with
-`--no-jail`) Tier 2 runs **un-jailed with a loud warning** — dev use only.
+Tier 2 evaluates a page's own untrusted JavaScript, so containment matters.
+Draco's **primary** containment is the isolate itself: the V8 context is created
+with **no host-capability bindings**. The only ops exposed to page JS are
+`op_raze_fetch` (records the intercepted request and returns a stub), `op_sleep`,
+and `op_resolve_url` — there is no `fetch`-to-network, no filesystem, and no
+process API. Page JS therefore cannot perform I/O of any kind. **This is the same
+class of isolation Puppeteer, Playwright, and jsdom rely on**; it works
+identically on macOS and Linux and needs zero configuration. Draco calls this
+**isolate mode**.
 
-Draco v0.1 deliberately does **not** defeat JS challenge walls
-(Cloudflare/DataDome/…); those short-circuit to `needs_browser`.
+On **Linux**, Draco adds OS-level **defense-in-depth** automatically and
+transparently — a hardening layer against a hypothetical V8-engine exploit:
+- a **seccomp-bpf** filter that kills the dangerous breakout syscalls (`execve`,
+  `socket`/`connect`, `ptrace`, `mount`, `bpf`, executable `mprotect`, …) — a
+  robust *denylist* that needs **no per-host tuning**;
+- a **network-namespace** air-gap and a **Landlock** filesystem lockdown when the
+  kernel supports them (best-effort; silently skipped if not).
 
-### Validation status
+V8 runs `--jitless --single-threaded` (no executable memory). The achieved level
+is reported in the result `trace` as a `runtime.sandbox` step — e.g.
+`hardened: seccomp+netns+landlock` or `isolate: v8 no host bindings (macos)`.
+There are no scary warnings and nothing to set up: **isolate mode is a fully
+supported default everywhere; Linux simply gets more.** `--strict-sandbox` opts
+into a maximal default-deny seccomp allowlist; `--no-jail` skips the OS layer.
 
-The full un-jailed Tier 2 pipeline (fetch → V8 capture → rank → replay) is
-covered by the test suite, including a **real Vue 3 bundle** that hydrates in the
-isolate and leaks its data fetch. The jail's *runtime enforcement* (seccomp
-kills, netns, Landlock) requires a real kernel (≥ 5.13 + unprivileged userns) and
-is validated per **[docs/BARE_METAL_VALIDATION.md](docs/BARE_METAL_VALIDATION.md)**.
+Draco does **not** defeat JS challenge walls (Cloudflare/DataDome/…); a genuine
+interstitial (a blocking status with a real challenge page) short-circuits to
+`needs_browser`. A normal `200` behind a CDN is never treated as a challenge.
 
-## Platforms (v0.1)
+## Platforms
 
-`x86_64-unknown-linux-gnu` (primary, full jail) and `aarch64-apple-darwin`
-(dev; Tier 2 runs un-jailed). The jail's seccomp/Landlock/netns layers are
-Linux-only.
+| Platform | Tier 0/1 | Tier 2 (isolate: V8, no host bindings) | Tier 2 OS hardening |
+|----------|:--------:|:--------------------------------------:|---------------------|
+| **Linux** `x86_64-gnu` | ✅ | ✅ | ✅ automatic — seccomp always; netns + Landlock when the kernel supports them |
+| **macOS** `aarch64-darwin` | ✅ | ✅ | isolate mode (Seatbelt hardening is on the roadmap) |
+
+Both are **first-class**. The optional Linux OS-hardening layer can be verified on
+a real kernel per **[docs/BARE_METAL_VALIDATION.md](docs/BARE_METAL_VALIDATION.md)**
+— that's for confirming the extra hardening, not a requirement to run Draco.
 
 ## Development
 

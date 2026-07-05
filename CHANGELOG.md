@@ -3,6 +3,38 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.2.0] — 2026-07-05
+
+Tier 2 sandbox reframed for real-world use — **macOS is now first-class** and
+there are no manual setup steps.
+
+### Changed
+- **Isolate mode is the supported cross-platform default.** Tier 2's real
+  containment is the V8 context itself: page JS gets no host-capability bindings
+  (no network/filesystem/process ops), the same isolation class as
+  Puppeteer/Playwright/jsdom. It runs identically on macOS and Linux with zero
+  configuration — the "dev only / running un-jailed" warnings are gone. macOS is
+  a fully supported target, not a second-class one.
+- **seccomp is now a robust *denylist*** instead of a default-deny allowlist. It
+  kills only the unambiguous breakout syscalls (`execve`, `socket`/`connect`,
+  `ptrace`, `mount`, `bpf`, executable `mprotect`, …) and allows the rest, so it
+  **never needs per-host tuning** — the manual "SIGSYS iterate loop" is gone.
+  Network is now blocked by the denylist itself (no longer dependent on user
+  namespaces); netns + Landlock remain best-effort extra layers applied
+  automatically when the kernel supports them.
+- **The achieved sandbox level is reported in the result `trace`** as a
+  `runtime.sandbox` step (e.g. `hardened: seccomp+netns+landlock` or `isolate: v8
+  no host bindings (macos)`) instead of being shouted to stderr.
+
+### Added
+- `--strict-sandbox` flag / `Config::strict_sandbox` — opt into the maximal
+  default-deny seccomp allowlist (may need per-host tuning; see
+  `docs/BARE_METAL_VALIDATION.md`).
+
+### Docs
+- README security/platform sections rewritten around the two-level model;
+  `docs/BARE_METAL_VALIDATION.md` reframed as *optional* hardening verification.
+
 ## [0.1.1] — 2026-07-05
 
 ### Fixed
@@ -80,5 +112,6 @@ buildable Rust workspace (7 crates) with a `draco` CLI.
   polyfill execution is used instead).
 - **musl fully-static** single-binary build is deferred.
 
+[0.2.0]: https://github.com/0xchasercat/draco/releases/tag/v0.2.0
 [0.1.1]: https://github.com/0xchasercat/draco/releases/tag/v0.1.1
 [0.1.0]: https://github.com/0xchasercat/draco/releases/tag/v0.1.0
