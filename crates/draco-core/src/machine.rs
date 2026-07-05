@@ -363,10 +363,11 @@ where
 /// `Some(result)` if the ladder should terminate here (a successful replay, or a
 /// hard jail failure), or `None` to fall through to `Unsupported`.
 ///
-/// Trace steps: `runtime.spawn` (spawn+capture the child), `runtime.capture`
-/// (intercept count + outcome), `runtime.rank` (winning score / no viable
-/// candidate), `runtime.replay` (replaying the winner). Isolate wall time is
-/// charged to the [`Bucket::Runtime`] timing bucket.
+/// Trace steps: `runtime.spawn` (spawn+capture the child), `runtime.sandbox`
+/// (achieved sandbox level the child reported), `runtime.capture` (intercept
+/// count + outcome), `runtime.rank` (winning score / no viable candidate),
+/// `runtime.replay` (replaying the winner). Isolate wall time is charged to the
+/// [`Bucket::Runtime`] timing bucket.
 #[cfg(feature = "tier2")]
 async fn try_tier2<F, T>(
     run: &mut Run,
@@ -411,6 +412,19 @@ where
         Bucket::None,
         None,
     );
+    // Surface the achieved sandbox posture the child reported (e.g.
+    // "hardened: seccomp+netns+landlock" or "isolate: v8 no host bindings
+    // (macos)"). Informational — no timing bucket.
+    if let Some(level) = capture_result.sandbox_level.as_deref() {
+        run.record(
+            SourceTier::RuntimeInterception,
+            "runtime.sandbox",
+            StepOutcome::Matched,
+            0,
+            Bucket::None,
+            Some(level.to_string()),
+        );
+    }
     run.record(
         SourceTier::RuntimeInterception,
         "runtime.capture",

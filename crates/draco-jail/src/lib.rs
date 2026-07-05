@@ -12,9 +12,11 @@
 //!   the jailed child, inheriting the IPC socket as **fd 3**.
 //!
 //! The IPC frame codec (spec §6) lives in [`frame`] and is fully portable and
-//! unit-tested. The jail *mechanics* are Linux-only; on other platforms the crate
-//! degrades to running the payload **un-jailed** with a loud warning (see
-//! [`spawn_jail`] / [`run_jail_child`]).
+//! unit-tested. The OS-sandbox *mechanics* are Linux-only; on macOS and other
+//! platforms the crate runs the payload in **isolate** mode — V8 with no
+//! host-capability bindings, no OS sandbox — which is a normal, supported posture,
+//! not a degraded one (see [`spawn_jail`] / [`run_jail_child`]). The achieved
+//! posture is reported to the supervisor via [`level`].
 //!
 //! ## Scope (Slice 4)
 //!
@@ -35,9 +37,17 @@
 //!
 //! **Frozen public API** — the signatures of [`JailHandle`], [`JailError`],
 //! [`spawn_jail`], and [`run_jail_child`] are fixed by the workspace contract.
+//! [`spawn_jail_with`] is an additive superset entry (selects the seccomp model);
+//! it does not change any frozen signature — [`spawn_jail`] delegates to it with
+//! the default (denylist) posture.
 #![allow(dead_code)]
 
 pub mod frame;
+
+/// Achieved sandbox level (`hardened` / `isolate`) reported by the child to the
+/// supervisor. Portable (no OS sandbox mechanics), so both the Linux and degraded
+/// child paths compute it the same way.
+pub mod level;
 
 pub(crate) mod payload;
 
@@ -109,30 +119,44 @@ impl std::fmt::Display for JailError {
 
 impl std::error::Error for JailError {}
 
-/// Supervisor-side: create the socketpair, set up namespaces, and spawn the
-/// jailed child by re-exec'ing this binary as `draco __jail`.
+/// Supervisor-side: spawn the Tier 2 child by re-exec'ing this binary as
+/// `draco __jail`, inheriting the IPC socket as fd 3.
 ///
-/// On Linux the child is placed in a fresh user + network namespace with tight
-/// rlimits and its IPC socket dup'd to fd 3. On non-Linux hosts this returns a
-/// handle to an un-jailed child after logging a warning (dev-only path).
+/// On Linux the child arms the OS sandbox (seccomp denylist by default, netns +
+/// Landlock best-effort) — the `hardened` posture. On macOS (and other
+/// non-Linux hosts) the child runs V8 with no host-capability bindings and no OS
+/// sandbox — the `isolate` posture — which is a normal, supported outcome.
+///
+/// Signature frozen by the workspace contract. Use [`spawn_jail_with`] to select
+/// the strict seccomp model.
 pub fn spawn_jail() -> Result<JailHandle, JailError> {
+    spawn_jail_with(false)
+}
+
+/// Supervisor-side spawn, selecting the seccomp model on Linux. `strict = false`
+/// (the [`spawn_jail`] default) arms the robust denylist; `strict = true` arms the
+/// strict default-deny allowlist (`--strict-sandbox`). On non-Linux the `strict`
+/// flag is inert (there is no seccomp layer in `isolate` mode).
+pub fn spawn_jail_with(strict: bool) -> Result<JailHandle, JailError> {
     #[cfg(target_os = "linux")]
     {
-        linux::spawn_jail()
+        linux::spawn_jail_with(strict)
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = strict;
         degraded::spawn_jail()
     }
 }
 
 /// Child-side entry, invoked when the binary re-execs itself as `draco __jail`.
 ///
-/// Opens the inherited fd-3 socket, applies the namespace/Landlock/seccomp
-/// lockdown, then runs the Tier 2 capture payload: read a `Hydrate`, drive the V8
-/// isolate via `draco-runtime`, stream `Intercept` frames + a terminal `Result`
-/// ([`runtime_payload`]). Never returns: it exits the process on a clean
-/// shutdown / completed capture or on any fatal setup error.
+/// Opens the inherited fd-3 socket, arms the achievable sandbox (on Linux, seccomp
+/// with best-effort netns/Landlock — the `hardened` posture; on macOS, the
+/// V8-only `isolate` posture), then runs the Tier 2 capture payload: read a
+/// `Hydrate`, drive the V8 isolate via `draco-runtime`, stream `Intercept` frames
+/// and a terminal `Result` ([`runtime_payload`]). Never returns: it exits on a
+/// clean shutdown / completed capture or on any fatal setup error.
 pub fn run_jail_child() -> ! {
     #[cfg(target_os = "linux")]
     {
@@ -148,12 +172,18 @@ pub fn run_jail_child() -> ! {
 pub const JAIL_IPC_FD: i32 = 3;
 
 /// Environment variable the supervisor sets on the re-exec'd child to request the
-/// **un-jailed** dev path (`--no-jail`): when present (any value), the Linux child
-/// entry SKIPS the namespace/rlimit/Landlock/seccomp lockdown and runs the capture
-/// payload directly. This exists so the `draco __jail` hook stays a single call
-/// (`run_jail_child`) — the child decides whether to arm based on this marker,
-/// which only the dev `no_jail` spawn ever sets.
-///
-/// SECURITY: production never sets this. It weakens the sandbox to nothing, so it
-/// is strictly a local-debugging affordance (the spawn logs a loud warning).
+/// **isolate-only** path (`--no-jail`): when present (any value), the Linux child
+/// entry SKIPS the OS sandbox (netns/rlimit/Landlock/seccomp) and runs the capture
+/// payload directly. Tier 2 still hosts V8 with no host-capability bindings, so
+/// page JS remains contained; only the defense-in-depth OS sandbox is skipped.
+/// This exists so the `draco __jail` hook stays a single call (`run_jail_child`) —
+/// the child decides whether to arm based on this marker, which only the
+/// `no_jail` spawn ever sets. The supervisor prints one informational line noting
+/// the skipped hardening.
 pub const JAIL_NO_SANDBOX_ENV: &str = "DRACO_JAIL_NO_SANDBOX";
+
+/// Environment variable the supervisor sets on the re-exec'd child to request the
+/// **strict** seccomp model (`--strict-sandbox`): when present, the Linux child
+/// arms the default-deny allowlist filter instead of the default robust denylist.
+/// Set only by [`spawn_jail_with(true)`](spawn_jail_with); inert on non-Linux.
+pub const JAIL_STRICT_ENV: &str = "DRACO_JAIL_STRICT";

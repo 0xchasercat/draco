@@ -220,6 +220,10 @@ pub struct MockCapture {
 }
 
 impl MockCapture {
+    /// A representative sandbox level the mock child "reports", so ladder tests
+    /// can assert the `runtime.sandbox` trace step is recorded.
+    pub const MOCK_LEVEL: &'static str = "hardened: seccomp+netns+landlock";
+
     /// Capture yields the given candidates (no request bodies) with a
     /// `Quiesced` outcome.
     pub fn with_candidates(candidates: Vec<Candidate>) -> Self {
@@ -229,6 +233,7 @@ impl MockCapture {
                 candidates,
                 bodies,
                 outcome: RuntimeOutcome::Quiesced,
+                sandbox_level: Some(Self::MOCK_LEVEL.to_string()),
             }),
             calls: AtomicUsize::new(0),
         }
@@ -241,6 +246,7 @@ impl MockCapture {
                 candidates: Vec::new(),
                 bodies: Vec::new(),
                 outcome: RuntimeOutcome::NoIntercepts,
+                sandbox_level: Some(Self::MOCK_LEVEL.to_string()),
             }),
             calls: AtomicUsize::new(0),
         }

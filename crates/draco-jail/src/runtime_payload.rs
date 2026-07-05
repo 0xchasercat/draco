@@ -34,9 +34,10 @@ use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 
 use draco_runtime::{CaptureConfig, CaptureReport, CapturedRequest};
-use draco_types::{JailToSupervisor, SupervisorToJail};
+use draco_types::{JailToSupervisor, LogLevel, SupervisorToJail};
 
 use crate::frame::{self, FrameError};
+use crate::level::LEVEL_LOG_PREFIX;
 use crate::JAIL_IPC_FD;
 
 /// Errors from running the runtime payload loop.
@@ -77,23 +78,32 @@ unsafe fn stream_from_fd(fd: RawFd) -> UnixStream {
 
 /// Run the runtime child payload over the inherited fd-3 IPC socket.
 ///
+/// `sandbox_level` is the achieved posture (e.g. `"hardened: seccomp+netns+
+/// landlock"` or `"isolate: v8 no host bindings (macos)"`); when `Some`, it is
+/// reported to the supervisor as a `Log` frame right after `Ready` so the ladder
+/// can record a `runtime.sandbox` trace step. `None` (used by tests) skips it.
+///
 /// Returns `Ok(())` on an orderly completion (a serviced `Hydrate`, a `Shutdown`,
 /// or a clean channel EOF) and an error on any framing/protocol failure.
-pub fn run_child_over_fd3() -> Result<(), PayloadError> {
+pub fn run_child_over_fd3(sandbox_level: Option<&str>) -> Result<(), PayloadError> {
     // SAFETY: `draco __jail` is only ever reached via the supervisor's re-exec,
     // which dup2()'s the child socketpair end onto fd 3 (JAIL_IPC_FD) and sets
     // CLOEXEC on every other inherited fd. Nothing else in this process owns
     // fd 3, so adopting it here is sound.
     let stream = unsafe { stream_from_fd(JAIL_IPC_FD) };
-    run_capture_loop(stream)
+    run_capture_loop(stream, sandbox_level)
 }
 
 /// The transport-agnostic payload, split out so tests can drive it over an
-/// in-process socketpair (un-jailed) without the fd-3 / re-exec machinery.
+/// in-process socketpair without the fd-3 / re-exec machinery.
 ///
 /// Handles exactly one `Hydrate` (see the module docs on why capture is
 /// once-per-process), emitting `Intercept` frames + a terminal `Result`.
-pub fn run_capture_loop(mut stream: UnixStream) -> Result<(), PayloadError> {
+/// `sandbox_level`, when `Some`, is reported as a `Log` frame after `Ready`.
+pub fn run_capture_loop(
+    mut stream: UnixStream,
+    sandbox_level: Option<&str>,
+) -> Result<(), PayloadError> {
     // Announce readiness. deno_core executes the polyfill at isolate boot rather
     // than restoring a heap snapshot, so there is no snapshot-restore cost to
     // report here; 0 ms is honest.
@@ -104,6 +114,20 @@ pub fn run_capture_loop(mut stream: UnixStream) -> Result<(), PayloadError> {
         },
         &[],
     )?;
+
+    // Report the achieved sandbox level as an informational Log frame (a frozen
+    // frame type), prefixed so the supervisor can pick it out and surface it in
+    // the `runtime.sandbox` trace step.
+    if let Some(level) = sandbox_level {
+        frame::write_jail_frame(
+            &mut stream,
+            &JailToSupervisor::Log {
+                level: LogLevel::Info,
+                msg: format!("{LEVEL_LOG_PREFIX}{level}"),
+            },
+            &[],
+        )?;
+    }
 
     // Read a single control frame. A capture is once-per-process, so we do not
     // loop over multiple Hydrates.
@@ -245,7 +269,7 @@ mod tests {
         });
 
         let (sup, child) = UnixStream::pair().unwrap();
-        let child_handle = thread::spawn(move || run_capture_loop(child));
+        let child_handle = thread::spawn(move || run_capture_loop(child, None));
         let mut sup = sup;
 
         // 1. Ready.
@@ -322,6 +346,61 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_level_is_reported_as_a_log_after_ready() {
+        let _guard = CAPTURE_TEST_LOCK.lock().unwrap();
+        set_canned(CaptureReport {
+            outcome: RuntimeOutcome::NoIntercepts,
+            requests: vec![],
+        });
+
+        let (sup, child) = UnixStream::pair().unwrap();
+        // Pass a level so the payload emits the prefixed Log frame after Ready.
+        let child_handle = thread::spawn(move || {
+            run_capture_loop(child, Some("hardened: seccomp+netns+landlock"))
+        });
+        let mut sup = sup;
+
+        // 1. Ready first.
+        let ready = read_jail_frame(&mut sup).unwrap();
+        assert!(matches!(ready.header, JailToSupervisor::Ready { .. }));
+
+        // 2. Then the sandbox-level Log, prefixed for supervisor recognition.
+        let log = read_jail_frame(&mut sup).unwrap();
+        match log.header {
+            JailToSupervisor::Log { level, msg } => {
+                assert_eq!(level, LogLevel::Info);
+                assert_eq!(msg, "sandbox:hardened: seccomp+netns+landlock");
+                assert!(msg.starts_with(crate::level::LEVEL_LOG_PREFIX));
+            }
+            other => panic!("expected a sandbox-level Log, got {other:?}"),
+        }
+
+        // 3. Drive a Hydrate; the terminal Result still follows.
+        write_supervisor_frame(
+            &mut sup,
+            &SupervisorToJail::Hydrate {
+                url: "https://x.com".into(),
+                capture_window_ms: 500,
+                quiesce_ms: 50,
+                max_intercepts: 8,
+                stub_response_json: "{}".into(),
+            },
+            b"<html></html>",
+        )
+        .unwrap();
+        let result = read_jail_frame(&mut sup).unwrap();
+        assert!(matches!(
+            result.header,
+            JailToSupervisor::Result {
+                outcome: RuntimeOutcome::NoIntercepts,
+                ..
+            }
+        ));
+        drop(sup);
+        child_handle.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn no_intercepts_still_emits_a_result() {
         let _guard = CAPTURE_TEST_LOCK.lock().unwrap();
         set_canned(CaptureReport {
@@ -330,7 +409,7 @@ mod tests {
         });
 
         let (sup, child) = UnixStream::pair().unwrap();
-        let child_handle = thread::spawn(move || run_capture_loop(child));
+        let child_handle = thread::spawn(move || run_capture_loop(child, None));
         let mut sup = sup;
 
         let _ready = read_jail_frame(&mut sup).unwrap();
@@ -362,7 +441,7 @@ mod tests {
     #[test]
     fn shutdown_before_hydrate_is_orderly() {
         let (sup, child) = UnixStream::pair().unwrap();
-        let child_handle = thread::spawn(move || run_capture_loop(child));
+        let child_handle = thread::spawn(move || run_capture_loop(child, None));
         let mut sup = sup;
 
         let _ready = read_jail_frame(&mut sup).unwrap();
@@ -375,7 +454,7 @@ mod tests {
     #[test]
     fn channel_close_before_hydrate_is_orderly() {
         let (sup, child) = UnixStream::pair().unwrap();
-        let child_handle = thread::spawn(move || run_capture_loop(child));
+        let child_handle = thread::spawn(move || run_capture_loop(child, None));
         let mut sup = sup;
         let _ready = read_jail_frame(&mut sup).unwrap();
         drop(sup); // hang up without Shutdown

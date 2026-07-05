@@ -74,8 +74,16 @@ pub struct Config {
     /// Cap the escalation ladder: 0 = static only, 1 = +build-id, 2 = +runtime.
     pub tier_max: u8,
     pub capture_window_ms: u64,
-    /// Dev-only: run Tier 2 un-jailed.
+    /// Skip OS-level sandbox hardening for Tier 2. The V8 isolate still runs with
+    /// no host-capability bindings (page JS cannot reach the network, filesystem,
+    /// or processes); only the defense-in-depth OS sandbox (seccomp/netns/
+    /// Landlock) is skipped. On non-Linux this is a no-op (there is no OS sandbox
+    /// to skip). Set via the CLI `--no-jail` flag.
     pub no_jail: bool,
+    /// Use the strict default-deny seccomp allowlist instead of the default robust
+    /// denylist (Linux, jailed path only). Maximum hardening but may need per-host
+    /// tuning. Set via the CLI `--strict-sandbox` flag. Off by default.
+    pub strict_sandbox: bool,
     /// Allow Tier 2 to replay a state-changing request (an unsafe HTTP method
     /// that is not a GraphQL/JSON-RPC read) that the ranking picked. Off by
     /// default: mutation-safety withholds such a request from replay and the run
@@ -94,6 +102,7 @@ impl Default for Config {
             tier_max: 2,
             capture_window_ms: 2_000,
             no_jail: false,
+            strict_sandbox: false,
             allow_unsafe_replay: false,
         }
     }

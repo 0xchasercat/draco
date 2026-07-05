@@ -18,9 +18,15 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
 # Linux-only jail mechanics (spec §7 & §14). cfg-gated so non-Linux hosts build
-# the degraded, un-jailed path without pulling these in.
+# the isolate-mode path without pulling these in.
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = "0.5.0"
 landlock = "0.4.5"
 nix = { version = "0.31.3", features = ["socket", "process", "sched", "resource", "fs", "user"] }
+libc = "0.2.186"
+
+# Non-Linux unix (macOS, …): the isolate-mode supervisor spawn forks + re-execs
+# `draco __jail` and dup2()s the IPC socket onto fd 3 with raw libc calls. Only
+# `libc` is needed here — there is no OS sandbox to arm.
+[target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
 libc = "0.2.186"
