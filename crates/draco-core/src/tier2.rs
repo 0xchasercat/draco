@@ -87,8 +87,19 @@ pub(crate) trait Tier2Capture: Send + Sync {
         &self,
         url: &str,
         html: &[u8],
+        resources: &[ScriptResource],
         config: &Config,
     ) -> Result<CaptureResult, DracoError>;
+}
+
+/// A supervisor-prefetched script subresource handed to the jailed child so the
+/// (air-gapped) isolate can run external `<script src>` and resolve
+/// `import`/`import()` for `type="module"` apps. `url` is the absolute resource
+/// URL (the module-loader key); `source` is its raw bytes.
+#[derive(Debug, Clone)]
+pub(crate) struct ScriptResource {
+    pub url: String,
+    pub source: Vec<u8>,
 }
 
 /// A structured Tier 2 error, mapped to [`DracoError::Jail`] for the trace/result.
@@ -221,6 +232,7 @@ impl Tier2Capture for DisabledCapture {
         &self,
         _url: &str,
         _html: &[u8],
+        _resources: &[ScriptResource],
         _config: &Config,
     ) -> Result<CaptureResult, DracoError> {
         Err(jail_error(
@@ -291,7 +303,8 @@ mod prod {
     use draco_types::{DracoError, JailKind, JailToSupervisor, RuntimeOutcome, SupervisorToJail};
 
     use super::{
-        default_quiesce_ms, jail_error, CaptureResult, Config, Tier2Capture, MAX_INTERCEPTS,
+        default_quiesce_ms, jail_error, CaptureResult, Config, ScriptResource, Tier2Capture,
+        MAX_INTERCEPTS,
     };
     use crate::ranking::Candidate;
 
@@ -304,13 +317,15 @@ mod prod {
             &self,
             url: &str,
             html: &[u8],
+            resources: &[ScriptResource],
             config: &Config,
         ) -> Result<CaptureResult, DracoError> {
             // The spawn + blocking IPC exchange runs off the async worker pool.
             let url = url.to_string();
             let html = html.to_vec();
+            let resources = resources.to_vec();
             let config = config.clone();
-            tokio::task::spawn_blocking(move || capture_blocking(&url, &html, &config))
+            tokio::task::spawn_blocking(move || capture_blocking(&url, &html, &resources, &config))
                 .await
                 .map_err(|e| {
                     jail_error(
@@ -326,6 +341,7 @@ mod prod {
     fn capture_blocking(
         url: &str,
         html: &[u8],
+        resources: &[ScriptResource],
         config: &Config,
     ) -> Result<CaptureResult, DracoError> {
         let mut handle = spawn(config)?;
@@ -353,7 +369,18 @@ mod prod {
             Err(e) => return Err(map_frame_err(e, "reading Ready")),
         }
 
-        // 2. Send Hydrate with the page HTML as the frame body.
+        // 2a. Stream the pre-fetched script subresources (each source rides its
+        //     frame body) so the isolate's module loader can serve `<script src>`
+        //     and `import`/`import()` without the air-gapped child fetching.
+        for res in resources {
+            let frame = SupervisorToJail::Resource {
+                url: res.url.clone(),
+            };
+            frame::write_supervisor_frame(ipc, &frame, &res.source)
+                .map_err(|e| map_frame_err(e, "sending Resource"))?;
+        }
+
+        // 2b. Send Hydrate with the page HTML as the frame body.
         let hydrate = SupervisorToJail::Hydrate {
             url: url.to_string(),
             capture_window_ms: config.capture_window_ms,

@@ -51,12 +51,18 @@
 #![allow(clippy::type_complexity)]
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Once;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use deno_core::{JsRuntime, OpState, PollEventLoopOptions, RuntimeOptions};
+use deno_core::{
+    resolve_import, JsRuntime, ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse,
+    ModuleLoader, ModuleResolveResponse, ModuleSource, ModuleSourceCode, ModuleSpecifier,
+    ModuleType, OpState, PollEventLoopOptions, ResolutionKind, RuntimeOptions,
+};
+use deno_error::JsErrorBox;
 use serde::Deserialize;
 
 use draco_types::{InterceptVia, RuntimeOutcome};
@@ -126,6 +132,20 @@ pub struct CaptureReport {
 /// [`RuntimeOutcome::Threw`] (with whatever was captured before the throw), and
 /// the isolate is always torn down cleanly.
 pub fn run_capture(url: &str, html: &str, cfg: &CaptureConfig) -> CaptureReport {
+    run_capture_with_resources(url, html, cfg, HashMap::new())
+}
+
+/// As [`run_capture`], but with the page's script subresources pre-fetched by the
+/// (air-gapped) supervisor: a `{ url -> source }` map used to run external
+/// `<script src>` and to resolve `import` / `import()` for `type="module"` apps.
+/// The isolate itself never fetches — this is how ES-module SPAs hydrate while
+/// the child stays network-isolated.
+pub fn run_capture_with_resources(
+    url: &str,
+    html: &str,
+    cfg: &CaptureConfig,
+    resources: HashMap<String, Vec<u8>>,
+) -> CaptureReport {
     ensure_v8_flags();
 
     // Current-thread tokio runtime, time driver only (see module docs).
@@ -145,7 +165,7 @@ pub fn run_capture(url: &str, html: &str, cfg: &CaptureConfig) -> CaptureReport 
         }
     };
 
-    rt.block_on(async move { run_capture_inner(url, html, cfg).await })
+    rt.block_on(async move { run_capture_inner_with_resources(url, html, cfg, resources).await })
 }
 
 /// Thin legacy entry retained from the stub. Not used by the jail directly (Slice
@@ -313,7 +333,70 @@ static SNAPSHOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/DRACO_SNAPSHO
 /// fetched HTML so the framework's mount container exists.
 const GLUE_JS: &str = include_str!("../js/glue.js");
 
-async fn run_capture_inner(url: &str, html: &str, cfg: &CaptureConfig) -> CaptureReport {
+// ===================================================================
+// ES-module support: in-isolate module loader + script model
+// ===================================================================
+
+/// Module loader backed by a pre-fetched `{url -> source}` map (the page's script
+/// subresources, fetched by the air-gapped supervisor and handed in). Serves
+/// static + dynamic `import`s from the map; a module that isn't present (e.g. a
+/// runtime-only lazy chunk the supervisor didn't prefetch) resolves to an **empty
+/// module** rather than throwing, so a missing dynamic import can't crash the
+/// hydration we're trying to observe.
+struct MapModuleLoader {
+    modules: Rc<RefCell<HashMap<String, Vec<u8>>>>,
+}
+
+impl ModuleLoader for MapModuleLoader {
+    fn resolve(
+        &self,
+        specifier: &str,
+        referrer: &str,
+        _kind: ResolutionKind,
+    ) -> ModuleResolveResponse {
+        resolve_import(specifier, referrer).map_err(JsErrorBox::from_err)
+    }
+
+    fn load(
+        &self,
+        module_specifier: &ModuleSpecifier,
+        _maybe_referrer: Option<&ModuleLoadReferrer>,
+        _options: ModuleLoadOptions,
+    ) -> ModuleLoadResponse {
+        let code = self
+            .modules
+            .borrow()
+            .get(module_specifier.as_str())
+            .cloned()
+            .unwrap_or_default();
+        let source = String::from_utf8_lossy(&code).into_owned();
+        let module = ModuleSource::new(
+            ModuleType::JavaScript,
+            ModuleSourceCode::String(source.into()),
+            module_specifier,
+            None,
+        );
+        ModuleLoadResponse::Sync(Ok(module))
+    }
+}
+
+/// One `<script>` from the page, in document order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PageScript {
+    /// `true` for an inline `<script>…</script>`; `false` for `<script src=…>`.
+    inline: bool,
+    /// `true` for `type="module"` (evaluated as an ES module).
+    module: bool,
+    /// Inline script body, or the raw `src` attribute for an external script.
+    payload: String,
+}
+
+async fn run_capture_inner_with_resources(
+    url: &str,
+    html: &str,
+    cfg: &CaptureConfig,
+    resources: HashMap<String, Vec<u8>>,
+) -> CaptureReport {
     let stub_body = normalize_stub_body(&cfg.stub_response_json);
 
     let cap = Rc::new(RefCell::new(CaptureState {
@@ -323,10 +406,18 @@ async fn run_capture_inner(url: &str, html: &str, cfg: &CaptureConfig) -> Captur
         rendered_html: None,
     }));
 
+    // Module loader backed by the supervisor-prefetched script sources, so
+    // `<script type="module">` and `import()` resolve without the (air-gapped)
+    // isolate ever touching the network.
+    let modules = Rc::new(RefCell::new(resources));
+
     // Restore the DOM-engine snapshot and register the ops for this isolate.
     let mut runtime = JsRuntime::new(RuntimeOptions {
         startup_snapshot: Some(SNAPSHOT),
         extensions: vec![draco_runtime_ext::init(cap.clone())],
+        module_loader: Some(Rc::new(MapModuleLoader {
+            modules: modules.clone(),
+        })),
         ..Default::default()
     });
 
@@ -349,24 +440,62 @@ async fn run_capture_inner(url: &str, html: &str, cfg: &CaptureConfig) -> Captur
         return finish(cap, RuntimeOutcome::Threw, Some(e.to_string()));
     }
 
-    // 2. Evaluate the page's inline <script> contents in order against the
-    //    happy-dom document. A throw in page script is *not* fatal — later scripts
-    //    and already-scheduled async work may still surface intercepts — but if it
-    //    happens before anything is captured we remember it so the outcome is
-    //    `Threw`.
-    let scripts = extract_inline_scripts(html);
+    // 2. Evaluate the page's scripts in document order against the happy-dom
+    //    document. Classic scripts (inline or fetched external) run via
+    //    `execute_script`; ES modules (`type="module"`, inline or external) are
+    //    loaded through the [`MapModuleLoader`] and evaluated, so `import` /
+    //    `import()` resolve from the prefetched module map. A throw in page script
+    //    is *not* fatal — later scripts and already-scheduled async work may still
+    //    surface intercepts — but if it happens before anything is captured we
+    //    remember it so the outcome is `Threw`.
+    let scripts = extract_scripts(html);
     let mut threw_in_page = false;
-    for (i, code) in scripts.into_iter().enumerate() {
-        // Point document.currentScript at a fresh <script> for this inline block
+    for (i, script) in scripts.into_iter().enumerate() {
+        // Point document.currentScript at a fresh <script> for this block
         // (analytics/tag scripts read currentScript.parentElement); best-effort.
         let _ = runtime.execute_script(
             "draco:currentScript",
             "try { globalThis.__dracoSetCurrentScript(); } catch (_) {}",
         );
-        let name = format!("draco:page[{i}]");
-        if let Err(e) = runtime.execute_script(name, code) {
-            threw_in_page = true;
-            eprintln!("draco-runtime: page script {i} threw: {e}");
+
+        // Resolve the source + its module specifier. Inline scripts use their
+        // body verbatim and a synthetic per-index URL (based on the page URL, so
+        // relative imports resolve against the page). External scripts use their
+        // prefetched source, looked up by resolved URL; one we couldn't prefetch
+        // is simply skipped (nothing to run).
+        let (source, spec_str) = if script.inline {
+            let base = url.split('#').next().unwrap_or(url);
+            (script.payload.clone(), format!("{base}#draco-inline-{i}"))
+        } else {
+            let resolved = resolve_script_url(url, &script.payload);
+            match modules.borrow().get(&resolved) {
+                Some(bytes) => (String::from_utf8_lossy(bytes).into_owned(), resolved),
+                None => continue,
+            }
+        };
+
+        if script.module {
+            // ES module: register the entry source under its specifier (so its own
+            // relative imports resolve) and evaluate it, driving the event loop to
+            // completion.
+            match deno_core::url::Url::parse(&spec_str) {
+                Ok(spec_url) => {
+                    modules
+                        .borrow_mut()
+                        .insert(spec_url.as_str().to_string(), source.into_bytes());
+                    if let Err(e) = eval_module(&mut runtime, &spec_url).await {
+                        threw_in_page = true;
+                        eprintln!("draco-runtime: module script {i} threw: {e}");
+                    }
+                }
+                Err(e) => eprintln!("draco-runtime: bad module specifier for script {i}: {e}"),
+            }
+        } else {
+            let name = format!("draco:page[{i}]");
+            if let Err(e) = runtime.execute_script(name, source) {
+                threw_in_page = true;
+                eprintln!("draco-runtime: page script {i} threw: {e}");
+            }
         }
     }
     let _ = runtime.execute_script(
@@ -408,6 +537,30 @@ fn serialize_dom(runtime: &mut JsRuntime) {
 
     if let Err(e) = runtime.execute_script("draco:serialize-dom", SERIALIZE_JS) {
         eprintln!("draco-runtime: DOM serialization script failed: {e}");
+    }
+}
+
+/// Load and evaluate one ES module to completion, driving the event loop so its
+/// (and its imports') top-level bodies run before we return. The module source is
+/// served by the [`MapModuleLoader`].
+async fn eval_module(
+    runtime: &mut JsRuntime,
+    spec: &ModuleSpecifier,
+) -> Result<(), deno_core::error::CoreError> {
+    let id = runtime.load_side_es_module(spec).await?;
+    let eval = runtime.mod_evaluate(id);
+    runtime
+        .run_event_loop(PollEventLoopOptions::default())
+        .await?;
+    eval.await
+}
+
+/// Resolve a script `src` against the page URL (WHATWG join); passes `src`
+/// through unchanged if either cannot be parsed.
+fn resolve_script_url(base: &str, src: &str) -> String {
+    match deno_core::url::Url::parse(base).and_then(|b| b.join(src)) {
+        Ok(u) => u.to_string(),
+        Err(_) => src.to_string(),
     }
 }
 
@@ -610,7 +763,7 @@ fn normalize_stub_body(raw: &str) -> String {
 /// External scripts (`src=...`) and non-executable `type`s (JSON-LD, importmap,
 /// `application/json`, `__NEXT_DATA__`, `speculationrules`, templates, …) are
 /// skipped — we only run real JS.
-fn extract_inline_scripts(html: &str) -> Vec<String> {
+fn extract_scripts(html: &str) -> Vec<PageScript> {
     let mut out = Vec::new();
     let bytes = html.as_bytes();
     let lower = html.to_ascii_lowercase();
@@ -679,39 +832,70 @@ fn extract_inline_scripts(html: &str) -> Vec<String> {
             }
         };
 
-        if is_runnable_script_tag(open_tag) && !body.trim().is_empty() {
-            out.push(body.to_string());
+        if let Some(is_module) = classify_script(open_tag) {
+            if let Some(src) = attr_value(open_tag, "src") {
+                let src = src.trim().to_string();
+                if !src.is_empty() {
+                    out.push(PageScript {
+                        inline: false,
+                        module: is_module,
+                        payload: src,
+                    });
+                }
+            } else if !body.trim().is_empty() {
+                out.push(PageScript {
+                    inline: true,
+                    module: is_module,
+                    payload: body.to_string(),
+                });
+            }
         }
         i = next_i;
     }
     out
 }
 
-/// Decide whether an opening `<script ...>` tag is executable JS: skip if it has
-/// a `src` attribute or a non-JS `type`.
-fn is_runnable_script_tag(open_tag: &str) -> bool {
-    let lower = open_tag.to_ascii_lowercase();
-    if attr_present(&lower, "src") {
-        return false;
-    }
+/// Inline-only JS bodies, in document order — a thin filter over
+/// [`extract_scripts`] retained for the scanner's focused unit tests.
+#[cfg(test)]
+fn extract_inline_scripts(html: &str) -> Vec<String> {
+    extract_scripts(html)
+        .into_iter()
+        .filter(|s| s.inline)
+        .map(|s| s.payload)
+        .collect()
+}
+
+/// Classify an opening `<script ...>` tag: `Some(is_module)` if it is executable
+/// JavaScript (any inline/external JS `type`, with `is_module` set for
+/// `type="module"`); `None` for a non-JS type (`application/json`, `importmap`,
+/// `speculationrules`, …) that must not be executed.
+fn classify_script(open_tag: &str) -> Option<bool> {
     match attr_value(open_tag, "type") {
-        None => true,
+        None => Some(false),
         Some(ty) => {
             let ty = ty.trim().to_ascii_lowercase();
-            ty.is_empty()
+            if ty.is_empty()
                 || ty == "text/javascript"
                 || ty == "application/javascript"
-                || ty == "module"
                 || ty == "text/ecmascript"
                 || ty == "application/ecmascript"
                 || ty == "text/babel"
                 || ty == "text/jsx"
+            {
+                Some(false)
+            } else if ty == "module" {
+                Some(true)
+            } else {
+                None
+            }
         }
     }
 }
 
 /// True if attribute `name` appears in the (already-lowercased) opening tag.
 /// Matches `name=`, `name ` or `name>` / `name/` (bare boolean attribute).
+#[cfg(test)]
 fn attr_present(lower_tag: &str, name: &str) -> bool {
     let mut search_from = 0;
     while let Some(rel) = lower_tag[search_from..].find(name) {
