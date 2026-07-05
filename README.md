@@ -96,6 +96,12 @@ draco extract https://spa.example.com            # thin shell → hydrated Markd
 draco extract https://spa.example.com --tier-max 1   # opt out: static shell only
 ```
 
+This also covers **skeleton screens**: a page that ships lots of chrome but whose
+content rails are still `Loading…` is detected as an incomplete render (regardless
+of length) and escalated the same way. `Loading…` placeholder lines are always
+stripped from the output, so that noise never reaches you even if the render pass
+is capped (`--tier-max 1`) or can't improve the page.
+
 A thin shell that can't be improved (hydration adds nothing, or the isolate is
 unavailable) falls back to the static shell — never a crash, never a regression.
 

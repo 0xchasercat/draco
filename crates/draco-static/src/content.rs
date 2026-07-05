@@ -64,10 +64,19 @@ use serde_json::{Map, Value};
 /// to match Firecrawl's `scrape` response.
 #[derive(Debug, Clone)]
 pub struct ScrapeResult {
-    /// The main content (or whole body) rendered as GFM Markdown.
+    /// The main content (or whole body) rendered as GFM Markdown. Skeleton/
+    /// placeholder lines (e.g. `Loading…`) are stripped from this output.
     pub markdown: String,
     /// A flat JSON object of page metadata (see the module docs for the keys).
     pub metadata: Value,
+    /// `true` when the source looked like an **incomplete client-side render** —
+    /// a skeleton screen whose real content had not yet loaded (many repeated
+    /// `Loading…` placeholders). Length-independent: a chrome-heavy shell can be
+    /// well over the thin-content threshold yet still be a skeleton. The caller
+    /// uses this (alongside [`is_thin_content`]) to decide whether to escalate to
+    /// the render-then-Markdown pass. Computed *before* the placeholders are
+    /// stripped from [`ScrapeResult::markdown`].
+    pub incomplete: bool,
 }
 
 /// Scrape `html` into Markdown + metadata.
@@ -122,7 +131,78 @@ pub fn scrape(
         }
     }
 
-    ScrapeResult { markdown, metadata }
+    // Skeleton detection + cleanup. A client-rendered page often serializes as a
+    // skeleton screen — repeated `Loading…` placeholders where content will
+    // mount. We (a) flag it as an incomplete render so the caller can escalate to
+    // the render-then-Markdown pass even though the chrome makes it non-thin, and
+    // (b) strip the placeholder lines so `Loading…` noise never reaches the user
+    // regardless of whether the render pass runs or succeeds. Detection runs on
+    // the pre-strip Markdown.
+    let incomplete = is_incomplete_render(&markdown);
+    let markdown = strip_incomplete_markers(&markdown);
+
+    ScrapeResult {
+        markdown,
+        metadata,
+        incomplete,
+    }
+}
+
+/// Minimum number of skeleton placeholder lines before a page is judged an
+/// incomplete client-side render. One or two `Loading…` labels are normal (a lazy
+/// widget on an otherwise-rendered page); a wall of them is a skeleton screen.
+const SKELETON_MIN_MARKERS: usize = 3;
+
+/// Does this Markdown look like an **incomplete client-side render** — a skeleton
+/// screen whose real content has not loaded yet?
+///
+/// Detects repeated placeholder lines (`Loading…`, `Loading...`, `Please wait`)
+/// that frameworks emit while data is in flight. Length-independent by design: a
+/// page like a large retail homepage carries enough nav/promo chrome to clear the
+/// thin-content bar while its actual product rails are still `Loading…`. Returns
+/// `true` once at least [`SKELETON_MIN_MARKERS`] such lines are present.
+pub fn is_incomplete_render(markdown: &str) -> bool {
+    markdown.lines().filter(|l| is_skeleton_line(l)).count() >= SKELETON_MIN_MARKERS
+}
+
+/// Remove skeleton placeholder lines (`Loading…` etc.) from `markdown`, then
+/// collapse the blank runs their removal leaves behind. Always safe to run: a
+/// line is only removed when, stripped of Markdown structure and emphasis, it is
+/// *exactly* a known placeholder token — never when the word merely appears
+/// inside real text (`Loading dock tours`) or an image (`![loading](spinner.gif)`).
+pub fn strip_incomplete_markers(markdown: &str) -> String {
+    let kept: Vec<&str> = markdown.lines().filter(|l| !is_skeleton_line(l)).collect();
+    collapse_blank_lines(&kept.join("\n"))
+}
+
+/// Is `line`, once stripped of leading Markdown structure (heading `#`, list
+/// markers, blockquote `>`, ordered-list `N.`) and surrounding emphasis/backticks,
+/// *exactly* a skeleton placeholder token (case-insensitive, trailing dots/ellipsis
+/// ignored)? Anchored to the whole line so real prose containing the word is safe.
+fn is_skeleton_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // Strip leading Markdown structural characters (heading/list/quote markers,
+    // ordered-list digits + dot, and whitespace).
+    let core = t.trim_start_matches(|c: char| {
+        c == '#'
+            || c == '>'
+            || c == '-'
+            || c == '*'
+            || c == '+'
+            || c == '.'
+            || c == ' '
+            || c == '\t'
+            || c.is_ascii_digit()
+    });
+    // Strip surrounding emphasis / code ticks / whitespace.
+    let core = core.trim().trim_matches(['*', '_', '`', ' ', '\t']);
+    // Ignore trailing dots / unicode ellipsis.
+    let core = core.trim_end_matches(['.', '\u{2026}', ' ']);
+    let lc = core.to_ascii_lowercase();
+    matches!(lc.as_str(), "loading" | "please wait" | "loading content")
 }
 
 /// Below this many non-whitespace characters, main-content stripping is treated
@@ -1589,5 +1669,84 @@ mod tests {
             slice_element("<head><title>t</title></head>", "head"),
             Some("<head><title>t</title></head>")
         );
+    }
+
+    #[test]
+    fn skeleton_line_matches_only_pure_placeholders() {
+        assert!(is_skeleton_line("Loading..."));
+        assert!(is_skeleton_line("### Loading…"));
+        assert!(is_skeleton_line("- Loading"));
+        assert!(is_skeleton_line("1. **Loading...**"));
+        assert!(is_skeleton_line("> please wait"));
+        // Real content that merely contains the word must NOT match.
+        assert!(!is_skeleton_line("Loading dock tours available"));
+        assert!(!is_skeleton_line("Load More"));
+        assert!(!is_skeleton_line("Downloading the report"));
+        assert!(!is_skeleton_line("![loading](https://x/spinner.gif)"));
+        assert!(!is_skeleton_line(""));
+    }
+
+    #[test]
+    fn incomplete_render_needs_several_markers() {
+        let one = "# Real Title\n\nSome content.\n\nLoading...";
+        assert!(
+            !is_incomplete_render(one),
+            "a single Loading is not a skeleton"
+        );
+        let skeleton = "# Deals\n\n### Loading...\n\n### Loading...\n\n### Loading...\n";
+        assert!(is_incomplete_render(skeleton));
+    }
+
+    #[test]
+    fn strip_incomplete_markers_removes_only_placeholders() {
+        let md = "# Deals\n\n### Loading...\n\n### Loading...\n\nReal promo copy here.\n\n### Loading…\n\n![loading](https://x/spinner.gif)";
+        let out = strip_incomplete_markers(md);
+        assert!(!out.contains("Loading"), "placeholder lines removed: {out}");
+        assert!(out.contains("# Deals"));
+        assert!(out.contains("Real promo copy here."));
+        // The image with alt="loading" is preserved (not a bare placeholder line).
+        assert!(out.contains("![loading](https://x/spinner.gif)"));
+    }
+
+    #[test]
+    fn scrape_flags_skeleton_and_strips_loading_even_when_not_thin() {
+        // A chrome-heavy shell (well over the thin bar) whose content rails are all
+        // `Loading…` — the Target.com failure mode. Must be flagged incomplete and
+        // must not emit `Loading` noise.
+        let mut html =
+            String::from("<!doctype html><html><head><title>Shop</title></head><body><main>");
+        html.push_str("<h1>Featured categories</h1>");
+        for c in [
+            "Women",
+            "Men",
+            "Kids",
+            "Home",
+            "Grocery",
+            "Beauty",
+            "Toys",
+            "Electronics",
+        ] {
+            html.push_str(&format!(
+                "<a href=\"/c/{c}\">{c} department landing page</a>"
+            ));
+        }
+        html.push_str("<section><h2>Just in for summer</h2>");
+        for _ in 0..10 {
+            html.push_str("<li><h3>Loading...</h3></li>");
+        }
+        html.push_str("</section></main></body></html>");
+
+        let res = scrape(&html, "https://shop.example/", 200, "text/html", true);
+        assert!(res.incomplete, "skeleton page should be flagged incomplete");
+        assert!(
+            !res.markdown.contains("Loading"),
+            "no Loading noise: {}",
+            res.markdown
+        );
+        // The real chrome survives.
+        assert!(res.markdown.contains("Featured categories"));
+        // And it is NOT thin (chrome alone clears the bar) — proving length-based
+        // detection alone would have missed it.
+        assert!(!is_thin_content(&res.markdown, MIN_MAIN_CONTENT_CHARS));
     }
 }

@@ -340,25 +340,37 @@ where
         let scraped = statics.scrape(&body, url, resp.meta.status, &content_type, true);
         let md_ms = t_md.elapsed().as_millis() as u64;
 
-        // A thin, client-rendered SPA shell has almost no static main content.
-        // When Tier 2 is permitted this triggers the render-then-Markdown
-        // escalation below; when it is capped out (`--tier-max < 2`) we return the
-        // shell as-is and say so.
+        // A page needs the render pass when its static extraction is either
+        // **thin** (almost no main content) OR an **incomplete client-side
+        // render** — a skeleton screen whose real content has not loaded (many
+        // `Loading…` placeholders). The skeleton case is length-independent: a
+        // retail homepage carries enough nav/promo chrome to clear the thin bar
+        // while its product rails are still `Loading…`, so char-count alone would
+        // wrongly return the skeleton. When Tier 2 is permitted this triggers the
+        // render-then-Markdown escalation below; when capped out (`--tier-max < 2`)
+        // we return the (placeholder-stripped) shell and say so.
         let thin = draco_static::content::is_thin_content(&scraped.markdown, THIN_CONTENT_CHARS);
+        let incomplete = scraped.incomplete;
+        let needs_render = thin || incomplete;
+        let reason = if incomplete {
+            "incomplete render: skeleton/loading shell"
+        } else {
+            "thin client-rendered shell"
+        };
         run.record(
             SourceTier::Static,
             "static.markdown",
             StepOutcome::Matched,
             md_ms,
             Bucket::Parse,
-            Some(if thin && tier_max >= 2 {
+            Some(if needs_render && tier_max >= 2 {
                 format!(
-                    "{} chars (thin client-rendered shell — escalating to render)",
+                    "{} chars ({reason} — escalating to render)",
                     scraped.markdown.len()
                 )
-            } else if thin {
+            } else if needs_render {
                 format!(
-                    "{} chars (thin client-rendered shell — render skipped, tier_max={tier_max})",
+                    "{} chars ({reason} — render skipped, tier_max={tier_max})",
                     scraped.markdown.len()
                 )
             } else {
@@ -369,20 +381,22 @@ where
         run.markdown = Some(scraped.markdown);
         run.metadata = Some(scraped.metadata);
 
-        // Render-then-Markdown escalation: a thin client-rendered SPA shell has
-        // almost no static content, but the same Tier 2 isolate that leaks JSON
-        // endpoints also hydrates the DOM. When the shell is thin and Tier 2 is
-        // permitted, hydrate, serialize the live DOM, and re-scrape it — the
-        // isolate is the browser stand-in Firecrawl uses, feeding the identical
-        // HTML→Markdown transform. Upgrades `run.markdown`/`metadata` in place and
-        // records `runtime.render`; leaves them untouched if it can't do better.
-        if thin && tier_max >= 2 {
+        // Render-then-Markdown escalation: a thin or skeleton client-rendered
+        // shell has almost no real static content, but the same Tier 2 isolate
+        // that leaks JSON endpoints also hydrates the DOM. When a render is needed
+        // and Tier 2 is permitted, hydrate, serialize the live DOM, and re-scrape
+        // it — the isolate is the browser stand-in Firecrawl uses, feeding the
+        // identical HTML→Markdown transform. Upgrades `run.markdown`/`metadata` in
+        // place and records `runtime.render`; leaves them untouched if it can't do
+        // better.
+        if needs_render && tier_max >= 2 {
             try_render_markdown(
                 &mut run,
                 url,
                 &body,
                 resp.meta.status,
                 &content_type,
+                incomplete,
                 config,
                 capture,
             )
@@ -680,12 +694,14 @@ fn nonws_len(s: &str) -> usize {
 /// when the child reported a posture). Never returns a result — the Markdown path
 /// finalizes at its call site.
 #[cfg(feature = "tier2")]
+#[allow(clippy::too_many_arguments)]
 async fn try_render_markdown<T>(
     run: &mut Run,
     url: &str,
     body: &str,
     status: u16,
     content_type: &str,
+    shell_incomplete: bool,
     config: &Config,
     capture: &T,
 ) where
@@ -742,15 +758,27 @@ async fn try_render_markdown<T>(
     let prev_len = run.markdown.as_deref().map(nonws_len).unwrap_or(0);
     let new_len = nonws_len(&rescraped.markdown);
 
-    // Upgrade only when hydration actually de-thinned the page: strictly more
-    // content than the shell *and* past the thin-shell bar (a hydration that
-    // produced nothing, or only chrome, must not replace a cleaner static parse).
-    if new_len > prev_len
-        && !draco_static::content::is_thin_content(&rescraped.markdown, THIN_CONTENT_CHARS)
-    {
+    // Decide whether the rendered pass is an improvement. Two ways to win:
+    //   1. It resolved a skeleton: the shell was an incomplete render and the
+    //      hydrated re-scrape is no longer one (even if not longer — real content
+    //      replacing `Loading…` placeholders is the win, not raw length).
+    //   2. It added material content: strictly more than the shell and past the
+    //      thin-shell bar (guards against hydration that produced nothing/chrome).
+    // A hydration that is *still* a skeleton, or that adds nothing, is never
+    // preferred — we keep the (placeholder-stripped) static shell.
+    let resolved_skeleton = shell_incomplete && !rescraped.incomplete;
+    let added_content = new_len > prev_len
+        && !draco_static::content::is_thin_content(&rescraped.markdown, THIN_CONTENT_CHARS);
+
+    if !rescraped.incomplete && (resolved_skeleton || added_content) {
         run.markdown = Some(rescraped.markdown);
         run.metadata = Some(rescraped.metadata);
         run.md_tier = SourceTier::RuntimeInterception;
+        let why = if resolved_skeleton {
+            "resolved skeleton"
+        } else {
+            "recovered content"
+        };
         run.record(
             SourceTier::RuntimeInterception,
             "runtime.render",
@@ -758,19 +786,22 @@ async fn try_render_markdown<T>(
             cap_ms,
             Bucket::Runtime,
             Some(format!(
-                "hydrated DOM re-scraped to {new_len} chars (shell had {prev_len})"
+                "hydrated DOM re-scraped to {new_len} chars ({why}; shell had {prev_len})"
             )),
         );
     } else {
+        let detail = if rescraped.incomplete {
+            format!("hydration still a skeleton ({new_len} chars); kept static shell")
+        } else {
+            format!("hydration added no usable content ({new_len} vs {prev_len} chars); kept static shell")
+        };
         run.record(
             SourceTier::RuntimeInterception,
             "runtime.render",
             StepOutcome::Missed,
             cap_ms,
             Bucket::Runtime,
-            Some(format!(
-                "hydration added no usable content ({new_len} vs {prev_len} chars); kept static shell"
-            )),
+            Some(detail),
         );
     }
 }
@@ -780,12 +811,14 @@ async fn try_render_markdown<T>(
 /// Markdown. Signature mirrors the feature-on version so the call site is
 /// feature-agnostic.
 #[cfg(not(feature = "tier2"))]
+#[allow(clippy::too_many_arguments)]
 async fn try_render_markdown<T>(
     run: &mut Run,
     _url: &str,
     _body: &str,
     _status: u16,
     _content_type: &str,
+    _shell_incomplete: bool,
     _config: &Config,
     _capture: &T,
 ) where
@@ -1684,6 +1717,60 @@ mod tests {
             "tier-capped thin shell should note render skipped: {:?}",
             md_step.detail
         );
+    }
+
+    #[tokio::test]
+    async fn markdown_skeleton_shell_escalates_even_when_not_thin() {
+        // The Target.com failure mode: a chrome-heavy shell that is NOT thin (lots
+        // of nav/promo copy) but is an incomplete render (skeleton `Loading…`
+        // rails). It must still escalate to the render pass — char count alone
+        // would have wrongly returned the skeleton.
+        let fetcher = MockFetcher::ok_html(200, "<html><body><div id=root></div></body></html>");
+        // Long, non-thin chrome + flagged incomplete (as the real engine would).
+        let chrome = "# Store\n\n".to_string() + &"Featured category link. ".repeat(30);
+        let statics = MockStatic::default()
+            .with_markdown(&chrome)
+            .with_incomplete(true);
+
+        // A hydration that resolves the skeleton into real content.
+        let hydrated = format!(
+            "<html><head></head><body><main>{}</main></body></html>",
+            "<p>A real product rail with items that only appear after hydration completes.</p>"
+                .repeat(3)
+        );
+        let capture = MockCapture::rendered(hydrated);
+
+        let r = run_ladder(
+            "https://shop.example/",
+            &cfg_markdown(),
+            &fetcher,
+            &statics,
+            &capture,
+        )
+        .await;
+
+        assert_eq!(r.status, Status::Success);
+        assert_eq!(capture.calls(), 1, "a skeleton shell must boot the isolate");
+        assert_eq!(
+            r.source_tier,
+            Some(SourceTier::RuntimeInterception),
+            "resolved skeleton should be attributed to the render pass"
+        );
+        let md_step = r
+            .trace
+            .iter()
+            .find(|t| t.action == "static.markdown")
+            .unwrap();
+        assert!(
+            md_step
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("incomplete render"),
+            "skeleton shell should note the incomplete render: {:?}",
+            md_step.detail
+        );
+        assert!(r.markdown.unwrap().contains("real product rail"));
     }
 
     #[tokio::test]
