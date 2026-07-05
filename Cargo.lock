@@ -684,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "draco-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "draco-core",
@@ -696,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "draco-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "draco-jail"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "draco-runtime",
  "draco-types",
@@ -727,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "draco-net"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "bytes",
@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "draco-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "deno_core",
  "deno_error",
@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "draco-static"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "draco-types",
  "scraper",
@@ -764,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "draco-types"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",

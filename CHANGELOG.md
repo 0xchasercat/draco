@@ -3,6 +3,21 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.1.1] — 2026-07-05
+
+### Fixed
+- **Challenge detection no longer false-positives on CDN-fronted `200` pages.**
+  A response is now classified as a bot-wall challenge only when it carries the
+  definitive `cf-mitigated` header, or arrives with a **blocking status**
+  (`403`/`429`/`503`) *and* a specific interstitial token (a challenge-script
+  `src`, a captcha-delivery host, a verification class). Previously, benign
+  Cloudflare signals on an ordinary `200` — the `/cdn-cgi/challenge-platform/`
+  JS-detections beacon, `server: cloudflare`, `__cf_bm` cookies — or even a page
+  whose *copy* merely mentioned a vendor name were mislabeled `needs_browser`,
+  making Draco give up on sites `curl` reads fine. This defeated the tool's core
+  purpose; extraction now proceeds on any `2xx`. (Reported against a
+  Cloudflare-DNS site with no anti-bot enforcement.)
+
 ## [0.1.0] — 2026-07-05
 
 First release. A browserless, tiered data-extraction engine — a statically
@@ -65,4 +80,5 @@ buildable Rust workspace (7 crates) with a `draco` CLI.
   polyfill execution is used instead).
 - **musl fully-static** single-binary build is deferred.
 
+[0.1.1]: https://github.com/0xchasercat/draco/releases/tag/v0.1.1
 [0.1.0]: https://github.com/0xchasercat/draco/releases/tag/v0.1.0

@@ -1,13 +1,33 @@
 //! Challenge / bot-wall detection (spec §3 short-circuit).
 //!
-//! Before spending Tier 2 compute (booting V8), `draco-core` inspects the Tier 0
-//! HTML **and** response headers for known bot-wall signatures. On a match the
-//! ladder finalizes [`Status::NeedsBrowser`](draco_types::Status::NeedsBrowser)
-//! immediately — hydrating a challenge page in the isolate is wasted work, and
-//! Draco v0.1 deliberately does not defeat JS challenges.
+//! Before spending Tier 2 compute (booting V8), `draco-core` checks whether the
+//! Tier 0 response is a **genuine bot-wall interstitial** — a page that *replaces*
+//! the real content and blocks access. On a match the ladder finalizes
+//! [`Status::NeedsBrowser`](draco_types::Status::NeedsBrowser): Draco v0.1 does
+//! not defeat JS challenges, so there is nothing to extract.
 //!
-//! Detection is a pure function of `(status, headers, body)`, so it is fully
-//! unit-testable against fixture strings with no network.
+//! ## The cardinal rule: a `200 OK` is never a challenge
+//!
+//! Cloudflare, DataDome, Akamai, and PerimeterX front *millions* of ordinary
+//! sites. On a normal page they still set cookies (`__cf_bm`, `_abck`, `_px*`,
+//! `datadome`), emit `server: cloudflare` / `cf-ray` headers, and (with Bot Fight
+//! Mode / "JS Detections" on) inject a `/cdn-cgi/challenge-platform/…​/jsd/main.js`
+//! beacon into a perfectly normal `200` document. None of that is a challenge —
+//! it is the page you asked for. A marketing page can even mention "cloudflare"
+//! or "datadome" in its copy.
+//!
+//! So detection is deliberately narrow:
+//! 1. The one status-independent signal is the `cf-mitigated` response header,
+//!    which Cloudflare emits *only* when it actually issues a challenge.
+//! 2. Every other signal requires a **blocking status** (`403`/`429`/`503`) —
+//!    the codes CDNs serve interstitials with — *and* a specific interstitial
+//!    token (a challenge script `src`, a captcha-delivery host, a verification
+//!    class), never a bare vendor name or a benign cookie.
+//!
+//! A `200` (or any success/redirect) always returns `None` and flows through the
+//! normal extraction ladder. This is the difference between Draco succeeding
+//! where `curl` succeeds and Draco uselessly giving up. Detection is a pure
+//! function of `(status, headers, body)`, fully unit-testable offline.
 
 /// A recognized bot-wall / challenge vendor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,7 +36,7 @@ pub enum ChallengeKind {
     Cloudflare,
     /// DataDome.
     DataDome,
-    /// Akamai Bot Manager (`_abck` / `bm_sz` cookies, sensor markup).
+    /// Akamai Bot Manager.
     Akamai,
     /// PerimeterX / HUMAN.
     PerimeterX,
@@ -34,9 +54,8 @@ impl ChallengeKind {
     }
 }
 
-/// Header names/values worth inspecting are matched case-insensitively; we lower
-/// a joined header blob once and substring-scan it. Header order is irrelevant
-/// for detection (unlike for fingerprinting), so a flat blob is fine.
+/// Join headers into one lower-cased `name:value\n` blob for substring scanning.
+/// Header order is irrelevant for detection (unlike for fingerprinting).
 fn join_headers_lower(headers: &[(String, String)]) -> String {
     let mut out = String::new();
     for (k, v) in headers {
@@ -48,78 +67,84 @@ fn join_headers_lower(headers: &[(String, String)]) -> String {
     out
 }
 
-/// Inspect a Tier 0 response for a challenge signature.
+/// HTTP statuses a CDN serves a bot-wall interstitial with. A challenge replaces
+/// the page, so it is never a `2xx`/`3xx`.
+fn is_blocking_status(status: u16) -> bool {
+    matches!(status, 403 | 429 | 503)
+}
+
+/// Inspect a Tier 0 response for a **genuine** challenge interstitial.
 ///
-/// `status` is the HTTP status code, `headers` the response headers (any order),
-/// and `body` the raw HTML text. Returns the first matching [`ChallengeKind`],
-/// or `None` if the page looks like an ordinary document.
-///
-/// The checks are intentionally conservative: they key off vendor-specific
-/// header/cookie names and well-known interstitial markup, not generic 403s, so
-/// a plain "forbidden" page still escalates through the normal ladder rather
-/// than being mislabeled `needs_browser`.
+/// Returns the vendor on a match, or `None` for an ordinary document. See the
+/// module docs: the only status-independent signal is the `cf-mitigated` header;
+/// everything else requires a blocking status *and* a specific interstitial
+/// token, so a normal page behind a CDN (including a `200` that carries CDN
+/// cookies or a JS-detection beacon) is never misclassified.
 pub fn detect_challenge(
     status: u16,
     headers: &[(String, String)],
     body: &str,
 ) -> Option<ChallengeKind> {
     let hdr = join_headers_lower(headers);
+
+    // (1) Definitive, status-independent: Cloudflare sends `cf-mitigated`
+    // (value `challenge`) ONLY when it issues a challenge.
+    if hdr.contains("cf-mitigated") {
+        return Some(ChallengeKind::Cloudflare);
+    }
+
+    // (2) Every other signal requires a blocking status. A 200 OK is the real
+    // page — no matter which CDN fronts it or what beacons/cookies it carries.
+    if !is_blocking_status(status) {
+        return None;
+    }
+
     let body_lc = body.to_ascii_lowercase();
 
-    // ---- Cloudflare -----------------------------------------------------
-    // Header tells: `cf-mitigated: challenge`, `server: cloudflare` paired with a
-    // challenge status, and the `cf_chl_*` / `__cf_bm` cookie family.
-    if hdr.contains("cf-mitigated")
-        || hdr.contains("cf-chl-bypass")
-        || hdr.contains("__cf_chl")
-        || hdr.contains("cf_chl_")
-    {
-        return Some(ChallengeKind::Cloudflare);
-    }
-    let cf_server = hdr.contains("server:cloudflare");
-    if (cf_server && (status == 403 || status == 429 || status == 503))
+    // ---- Cloudflare interstitial ---------------------------------------------
+    // Specific tokens only: the challenge-platform script path, the classic
+    // verification class/opt token, or the interstitial titles.
+    if body_lc.contains("/cdn-cgi/challenge-platform/")
         || body_lc.contains("cf-browser-verification")
         || body_lc.contains("cf_chl_opt")
-        || body_lc.contains("challenge-platform")
-        || (body_lc.contains("just a moment") && body_lc.contains("cloudflare"))
+        || body_lc.contains("window._cf_chl_opt")
+        || body_lc.contains("just a moment")
+        || body_lc.contains("attention required! | cloudflare")
     {
         return Some(ChallengeKind::Cloudflare);
     }
 
-    // ---- DataDome -------------------------------------------------------
-    // `datadome` cookie / `x-datadome` header, or the DataDome challenge JS tag.
-    if hdr.contains("x-datadome")
-        || hdr.contains("datadome=")
-        || hdr.contains("set-cookie:datadome")
-        || body_lc.contains("datadome")
+    // ---- DataDome interstitial -----------------------------------------------
+    // The captcha-delivery host / challenge script, or the `x-datadome` response
+    // header on a blocking status.
+    if body_lc.contains("geo.captcha-delivery.com")
+        || body_lc.contains("js.datadome.co")
+        || body_lc.contains("dd_cookie_test")
+        || hdr.contains("x-datadome")
     {
         return Some(ChallengeKind::DataDome);
     }
 
-    // ---- Akamai Bot Manager --------------------------------------------
-    // The `_abck` / `bm_sz` sensor cookies and the akam sensor script are the tells.
-    if hdr.contains("_abck=")
-        || hdr.contains("bm_sz=")
-        || hdr.contains("akamai-bmp")
-        || body_lc.contains("_abck")
-        || body_lc.contains("bm-verify")
+    // ---- Akamai Bot Manager --------------------------------------------------
+    // Akamai block/sensor markup on a blocking status.
+    if body_lc.contains("bm-verify")
+        || body_lc.contains("errors.edgesuite.net")
+        || body_lc.contains("akamai bot manager")
     {
         return Some(ChallengeKind::Akamai);
     }
 
-    // ---- PerimeterX / HUMAN --------------------------------------------
-    // `_px*` cookies, the `x-px` header family, or the px captcha bootstrap.
-    if hdr.contains("x-px")
-        || hdr.contains("_pxhd=")
-        || hdr.contains("_px2=")
-        || hdr.contains("_px3=")
-        || body_lc.contains("px-captcha")
+    // ---- PerimeterX / HUMAN --------------------------------------------------
+    if body_lc.contains("px-captcha")
+        || body_lc.contains("captcha.px-cloud")
+        || body_lc.contains("/px/captcha")
         || body_lc.contains("_pxappid")
-        || body_lc.contains("perimeterx")
     {
         return Some(ChallengeKind::PerimeterX);
     }
 
+    // A blocking status with no recognized interstitial markup is a plain app
+    // 403/429/503, not a bot-wall — let the ladder handle it honestly.
     None
 }
 
@@ -134,75 +159,147 @@ mod tests {
             .collect()
     }
 
+    // ---- The regression that motivated the rewrite --------------------------
+
     #[test]
-    fn cloudflare_via_header() {
-        let got = detect_challenge(503, &hdr(&[("cf-mitigated", "challenge")]), "");
-        assert_eq!(got, Some(ChallengeKind::Cloudflare));
+    fn cloudflare_fronted_200_is_not_a_challenge() {
+        // chaser.sh: a normal 200 page behind Cloudflare's DNS with no anti-bot
+        // enforcement — CDN headers, a `__cf_bm` cookie, a JS-detections beacon,
+        // and marketing copy that literally mentions bot-walls. `curl` reads it
+        // fine, so Draco must NOT report needs_browser.
+        let body = r#"<!doctype html><html><head>
+            <title>chaser.sh — the browser that doesn't get blocked</title>
+            <meta name="description" content="beats cloudflare, datadome, perimeterx"></head>
+            <body><h1>hi</h1>
+            <script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>
+            <script defer src="https://static.cloudflareinsights.com/beacon.min.js"></script>
+            </body></html>"#;
+        let hdrs = hdr(&[
+            ("server", "cloudflare"),
+            ("cf-ray", "8abc123def-IAD"),
+            ("content-type", "text/html"),
+            ("set-cookie", "__cf_bm=token; path=/; HttpOnly"),
+        ]);
+        assert_eq!(detect_challenge(200, &hdrs, body), None);
     }
 
     #[test]
-    fn cloudflare_via_interstitial_body() {
+    fn vendor_names_in_body_copy_are_not_challenges_on_200() {
+        let body =
+            "<html><body>We bypass DataDome, PerimeterX, and Akamai bot manager.</body></html>";
+        assert_eq!(detect_challenge(200, &[], body), None);
+    }
+
+    // ---- Genuine challenges (blocking status + interstitial) -----------------
+
+    #[test]
+    fn cloudflare_via_mitigated_header_is_status_independent() {
+        assert_eq!(
+            detect_challenge(403, &hdr(&[("cf-mitigated", "challenge")]), ""),
+            Some(ChallengeKind::Cloudflare)
+        );
+    }
+
+    #[test]
+    fn cloudflare_just_a_moment_interstitial() {
         let body = r#"<!DOCTYPE html><html><head><title>Just a moment...</title>
             <script src="/cdn-cgi/challenge-platform/h/b/orchestrate/jsch/v1"></script></head>
             <body class="cf-browser-verification">Checking your browser…</body></html>"#;
-        let got = detect_challenge(403, &hdr(&[("server", "cloudflare")]), body);
-        assert_eq!(got, Some(ChallengeKind::Cloudflare));
-    }
-
-    #[test]
-    fn cloudflare_server_header_needs_challenge_status() {
-        // `server: cloudflare` with a 200 and ordinary body is NOT a challenge —
-        // Cloudflare fronts plenty of normal sites.
-        let got = detect_challenge(200, &hdr(&[("server", "cloudflare")]), "<html>hi</html>");
-        assert_eq!(got, None);
-    }
-
-    #[test]
-    fn datadome_via_cookie_and_body() {
-        let hdrs = hdr(&[("set-cookie", "datadome=abc; Path=/")]);
         assert_eq!(
-            detect_challenge(403, &hdrs, ""),
-            Some(ChallengeKind::DataDome)
+            detect_challenge(403, &hdr(&[("server", "cloudflare")]), body),
+            Some(ChallengeKind::Cloudflare)
         );
-        let body =
-            r#"<html><body><script src="https://js.datadome.co/tags.js"></script></body></html>"#;
+    }
+
+    #[test]
+    fn cloudflare_503_under_attack() {
+        let body = r#"<html><head><title>Just a moment...</title></head><body></body></html>"#;
         assert_eq!(
-            detect_challenge(200, &[], body),
+            detect_challenge(503, &hdr(&[("server", "cloudflare")]), body),
+            Some(ChallengeKind::Cloudflare)
+        );
+    }
+
+    #[test]
+    fn datadome_block_page() {
+        let body = r#"<html><body><script src="https://geo.captcha-delivery.com/captcha/"></script></body></html>"#;
+        assert_eq!(
+            detect_challenge(403, &[], body),
             Some(ChallengeKind::DataDome)
         );
     }
 
     #[test]
-    fn akamai_via_sensor_cookie() {
-        let hdrs = hdr(&[("set-cookie", "_abck=0~-1~-1; path=/")]);
+    fn datadome_200_with_tag_is_not_a_challenge() {
+        // A normal page that merely loads DataDome's script still served the real
+        // content (200) — not a block.
+        let body = r#"<html><body><script src="https://js.datadome.co/tags.js"></script>real content</body></html>"#;
+        assert_eq!(detect_challenge(200, &[], body), None);
+    }
+
+    #[test]
+    fn akamai_block_page() {
+        let body = r#"<html><body>Access Denied <script>bm-verify</script>
+            errors.edgesuite.net reference #18.abc</body></html>"#;
         assert_eq!(
-            detect_challenge(429, &hdrs, ""),
+            detect_challenge(403, &[], body),
             Some(ChallengeKind::Akamai)
         );
     }
 
     #[test]
-    fn perimeterx_via_body_and_header() {
+    fn perimeterx_block_page() {
         let body = r#"<html><head></head><body><div id="px-captcha"></div>
             <script>window._pxAppId = 'PXxxxx';</script></body></html>"#;
         assert_eq!(
             detect_challenge(403, &[], body),
             Some(ChallengeKind::PerimeterX)
         );
-        let hdrs = hdr(&[("set-cookie", "_px3=token; path=/")]);
+    }
+
+    #[test]
+    fn perimeterx_200_with_cookie_is_not_a_challenge() {
+        // `_px3` cookie on a 200 = normal PX-protected page that let us through.
         assert_eq!(
-            detect_challenge(200, &hdrs, ""),
-            Some(ChallengeKind::PerimeterX)
+            detect_challenge(
+                200,
+                &hdr(&[("set-cookie", "_px3=token; path=/")]),
+                "<html>ok</html>"
+            ),
+            None
+        );
+    }
+
+    // ---- Non-challenges ------------------------------------------------------
+
+    #[test]
+    fn cloudflare_server_header_with_200_is_not_a_challenge() {
+        assert_eq!(
+            detect_challenge(200, &hdr(&[("server", "cloudflare")]), "<html>hi</html>"),
+            None
         );
     }
 
     #[test]
     fn plain_forbidden_is_not_a_challenge() {
-        // A generic 403 with no vendor tell must escalate normally, not be
-        // mislabeled needs_browser.
+        // A generic app 403 with no bot-wall markup must NOT be needs_browser.
         let body = "<html><body><h1>403 Forbidden</h1><p>Access denied.</p></body></html>";
         let hdrs = hdr(&[("server", "nginx"), ("content-type", "text/html")]);
         assert_eq!(detect_challenge(403, &hdrs, body), None);
+    }
+
+    #[test]
+    fn challenge_platform_beacon_on_403_is_a_challenge_but_not_on_200() {
+        // The exact same beacon markup: a challenge on a 403, benign on a 200.
+        let body = r#"<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>"#;
+        assert_eq!(
+            detect_challenge(403, &hdr(&[("server", "cloudflare")]), body),
+            Some(ChallengeKind::Cloudflare)
+        );
+        assert_eq!(
+            detect_challenge(200, &hdr(&[("server", "cloudflare")]), body),
+            None
+        );
     }
 
     #[test]
@@ -215,8 +312,10 @@ mod tests {
 
     #[test]
     fn header_matching_is_case_insensitive() {
-        let got = detect_challenge(503, &hdr(&[("CF-Mitigated", "CHALLENGE")]), "");
-        assert_eq!(got, Some(ChallengeKind::Cloudflare));
+        assert_eq!(
+            detect_challenge(403, &hdr(&[("CF-Mitigated", "CHALLENGE")]), ""),
+            Some(ChallengeKind::Cloudflare)
+        );
     }
 
     #[test]
