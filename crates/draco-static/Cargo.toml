@@ -8,4 +8,6 @@ description = "Static (Tier 0) + heuristic API-replay (Tier 1) extraction for Dr
 [dependencies]
 draco-types = { workspace = true }
 serde_json = { workspace = true }
-# WS-B adds: tl (primary parser) and scraper (fallback) per canonical doc §10 & §14.
+# Tier 0/1 HTML parsing per canonical doc §10 & §14.
+tl = "0.7.8"          # primary: fast, zero-copy HTML parse
+scraper = "0.27.0"    # fallback: selector-based parse for gnarlier cases
