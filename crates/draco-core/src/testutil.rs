@@ -139,6 +139,8 @@ pub struct MockStatic {
     static_outcome: Option<ExtractedData>,
     build_id: Option<String>,
     app_router: bool,
+    /// Canned Markdown for the `scrape` seam; `None` → a small default body.
+    markdown: Option<String>,
 }
 
 impl MockStatic {
@@ -162,9 +164,8 @@ impl MockStatic {
     /// Tier 0 misses; Tier 1 discovers `build_id`.
     pub fn miss_then_build_id(build_id: &str) -> Self {
         Self {
-            static_outcome: None,
             build_id: Some(build_id.to_string()),
-            app_router: false,
+            ..Self::default()
         }
     }
 
@@ -180,9 +181,40 @@ impl MockStatic {
             ..Self::default()
         }
     }
+
+    /// Override the Markdown the `scrape` seam returns (for exercising the
+    /// Markdown / Both paths and the thin-SPA note).
+    pub fn with_markdown(mut self, md: &str) -> Self {
+        self.markdown = Some(md.to_string());
+        self
+    }
 }
 
 impl StaticEngine for MockStatic {
+    fn scrape(
+        &self,
+        _html: &str,
+        url: &str,
+        status: u16,
+        content_type: &str,
+        _only_main_content: bool,
+    ) -> draco_static::content::ScrapeResult {
+        // A deterministic stand-in for the real content engine: a tiny Markdown
+        // body plus the always-present synthetic metadata keys. Tests that care
+        // about real readability/markdown drive `draco-static` directly.
+        draco_static::content::ScrapeResult {
+            markdown: self
+                .markdown
+                .clone()
+                .unwrap_or_else(|| "# Mock\n\nbody".to_string()),
+            metadata: serde_json::json!({
+                "sourceURL": url,
+                "url": url,
+                "statusCode": status,
+                "contentType": content_type,
+            }),
+        }
+    }
     fn extract_static(&self, _html: &str) -> StaticOutcome {
         match &self.static_outcome {
             Some(d) => StaticOutcome::Hit(d.clone()),

@@ -79,6 +79,12 @@ pub struct TraceStep {
 }
 
 /// The complete, machine-parseable result of `draco extract`.
+///
+/// Historically this carried only `data` (the tiered JSON-API extraction). The
+/// Markdown-scrape flow (Firecrawl-style `URL → Markdown + metadata`) adds two
+/// **additive** fields, `markdown` and `metadata`; both are `Option` and elided
+/// from the wire when absent, so every pre-existing JSON consumer of the old
+/// shape keeps working.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExtractionResult {
     pub url: String,
@@ -88,6 +94,15 @@ pub struct ExtractionResult {
     /// Present iff `status == Success`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+    /// Clean Markdown of the page's main content (the default Markdown-scrape
+    /// output). Present when the Markdown path ran (`format` = markdown / both).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown: Option<String>,
+    /// Flat page metadata (title, description, `og:*`/`twitter:*`, canonical,
+    /// favicon, language, plus `sourceURL`/`url`/`statusCode`/`contentType`).
+    /// Populated alongside `markdown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
     pub timing: Timing,
     pub trace: Vec<TraceStep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -315,6 +330,8 @@ mod tests {
             status: Status::Success,
             source_tier: Some(SourceTier::RuntimeInterception),
             data: Some(json!({ "price": 42, "title": "Widget" })),
+            markdown: Some("# Widget\n\nA great widget.".into()),
+            metadata: Some(json!({ "title": "Widget", "statusCode": 200 })),
             timing: Timing {
                 network_ms: 210,
                 parse_ms: 4,
@@ -405,6 +422,8 @@ mod tests {
             status: Status::Unsupported,
             source_tier: None,
             data: None,
+            markdown: None,
+            metadata: None,
             timing: Timing::default(),
             trace: vec![],
             error: None,
@@ -416,5 +435,13 @@ mod tests {
         );
         assert!(!s.contains("\"data\""), "None data should be omitted: {s}");
         assert!(!s.contains("error"), "None error should be omitted: {s}");
+        assert!(
+            !s.contains("markdown"),
+            "None markdown should be omitted: {s}"
+        );
+        assert!(
+            !s.contains("metadata"),
+            "None metadata should be omitted: {s}"
+        );
     }
 }

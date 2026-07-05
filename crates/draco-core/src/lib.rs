@@ -64,9 +64,29 @@ pub use ranking::{
     SCORE_SAME_ORIGIN,
 };
 
+/// What `draco extract` should produce.
+///
+/// The default is [`OutputFormat::Markdown`]: Draco is first a Firecrawl-style
+/// scraper (URL → clean Markdown + metadata), and that path is the fast one — it
+/// never touches V8/the jail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputFormat {
+    /// Clean Markdown + metadata of the page's main content (the fast,
+    /// static-only path). **Default.**
+    #[default]
+    Markdown,
+    /// The tiered JSON-API extraction (Tier 0 embedded state → Tier 1 build-id
+    /// → Tier 2 runtime interception), populating `data`.
+    Json,
+    /// Both: Markdown + metadata AND the JSON-API extraction.
+    Both,
+}
+
 /// Orchestration configuration, assembled by the CLI from flags/env/config file.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// What to produce (Markdown / JSON / both). Default: Markdown.
+    pub format: OutputFormat,
     pub proxy: Option<String>,
     pub delay_ms: u64,
     pub timeout_ms: u64,
@@ -95,6 +115,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            format: OutputFormat::Markdown,
             proxy: None,
             delay_ms: 0,
             timeout_ms: 30_000,
@@ -124,8 +145,11 @@ mod tests {
     use draco_types::{Status, Timing};
 
     #[test]
-    fn config_default_runs_full_ladder() {
+    fn config_default_is_markdown_first_with_full_ladder_available() {
         let c = Config::default();
+        // Default output is Markdown (Firecrawl-style scrape).
+        assert_eq!(c.format, OutputFormat::Markdown);
+        // The JSON ladder ceiling is still fully available for --format json/both.
         assert_eq!(c.tier_max, 2);
         assert!(c.respect_robots);
     }

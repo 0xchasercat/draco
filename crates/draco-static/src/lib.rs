@@ -28,6 +28,8 @@
 use draco_types::{ExtractOrigin, ExtractedData, SourceTier};
 use serde_json::Value;
 
+pub mod content;
+
 /// Result of a Tier 0 static extraction attempt.
 #[derive(Debug, Clone)]
 pub enum StaticOutcome {
