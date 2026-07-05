@@ -46,9 +46,14 @@ enum Command {
         /// Tier 2 capture-window duration (ms).
         #[arg(long, default_value_t = 2_000)]
         capture_window_ms: u64,
-        /// Dev-only: run Tier 2 un-jailed.
+        /// Skip OS-level sandbox hardening; Tier 2 still runs V8 with no host
+        /// bindings.
         #[arg(long)]
         no_jail: bool,
+        /// Use the strict default-deny seccomp allowlist (maximum hardening; may
+        /// need per-host tuning).
+        #[arg(long)]
+        strict_sandbox: bool,
         /// Allow Tier 2 to replay a state-changing request (an unsafe HTTP
         /// method that is not a GraphQL/JSON-RPC read) picked by ranking. Off by
         /// default: such requests are withheld from replay for mutation-safety.
@@ -203,6 +208,7 @@ async fn async_main() {
             tier_max,
             capture_window_ms,
             no_jail,
+            strict_sandbox,
             allow_unsafe_replay,
             ignore_robots,
             pretty,
@@ -215,6 +221,7 @@ async fn async_main() {
                 tier_max,
                 capture_window_ms,
                 no_jail,
+                strict_sandbox,
                 allow_unsafe_replay,
             };
             let mut result = extract(&url, &config).await;

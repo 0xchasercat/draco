@@ -65,6 +65,11 @@ pub(crate) struct CaptureResult {
     pub bodies: Vec<Option<Vec<u8>>>,
     /// The child's terminal runtime outcome.
     pub outcome: RuntimeOutcome,
+    /// The achieved sandbox level the child reported (e.g.
+    /// `"hardened: seccomp+netns+landlock"` or `"isolate: v8 no host bindings
+    /// (macos)"`), surfaced as the `runtime.sandbox` trace step. `None` if the
+    /// child did not report one (e.g. the offline mock capture).
+    pub sandbox_level: Option<String>,
 }
 
 /// The Tier 2 capture seam: given the page URL + Tier-0 HTML, produce a
@@ -353,9 +358,12 @@ mod prod {
         frame::write_supervisor_frame(ipc, &hydrate, html)
             .map_err(|e| map_frame_err(e, "sending Hydrate"))?;
 
-        // 3. Collect Intercept frames until the terminal Result.
+        // 3. Collect Intercept frames until the terminal Result. Along the way the
+        //    child sends one Log carrying the achieved sandbox level (prefixed);
+        //    capture it for the `runtime.sandbox` trace step.
         let mut candidates = Vec::new();
         let mut bodies = Vec::new();
+        let mut sandbox_level: Option<String> = None;
         let outcome: RuntimeOutcome = loop {
             let f = match frame::read_jail_frame(ipc) {
                 Ok(f) => f,
@@ -385,8 +393,13 @@ mod prod {
                     bodies.push(if has_body { Some(f.body) } else { None });
                 }
                 JailToSupervisor::Result { outcome, .. } => break outcome,
-                // Diagnostic only; ignore for control flow.
-                JailToSupervisor::Log { .. } => {}
+                // A Log prefixed with the sandbox-level marker carries the achieved
+                // posture; other Logs are diagnostic only.
+                JailToSupervisor::Log { msg, .. } => {
+                    if let Some(level) = msg.strip_prefix(draco_jail::level::LEVEL_LOG_PREFIX) {
+                        sandbox_level = Some(level.to_string());
+                    }
+                }
                 JailToSupervisor::Error { reason, detail } => {
                     return Err(jail_error(reason, detail));
                 }
@@ -408,6 +421,7 @@ mod prod {
             candidates,
             bodies,
             outcome,
+            sandbox_level,
         })
     }
 
@@ -440,7 +454,10 @@ mod prod {
         }
     }
 
-    /// Spawn the child: jailed by default, or un-jailed when `config.no_jail`.
+    /// Spawn the child. Default: the OS-sandboxed (`hardened`) child via
+    /// [`draco_jail::spawn_jail_with`], selecting the strict seccomp model when
+    /// `config.strict_sandbox`. With `config.no_jail`, the isolate-only child (OS
+    /// sandbox skipped; V8 still has no host bindings).
     fn spawn(config: &Config) -> Result<Handle, DracoError> {
         if config.no_jail {
             #[cfg(target_os = "linux")]
@@ -449,14 +466,14 @@ mod prod {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                // On non-Linux, spawn_jail() is already the un-jailed path (with a
-                // warning), so there is no separate no_jail branch to take.
-                return draco_jail::spawn_jail().map(Handle::Jailed).map_err(|e| {
-                    jail_error(e.reason, format!("{} (no_jail on non-linux)", e.detail))
-                });
+                // On non-Linux there is no OS sandbox to skip: spawn_jail() is
+                // already the isolate path, so `no_jail` is a no-op distinction.
+                return draco_jail::spawn_jail()
+                    .map(Handle::Jailed)
+                    .map_err(|e| jail_error(e.reason, e.detail));
             }
         }
-        draco_jail::spawn_jail()
+        draco_jail::spawn_jail_with(config.strict_sandbox)
             .map(Handle::Jailed)
             .map_err(|e| jail_error(e.reason, e.detail))
     }
@@ -490,8 +507,11 @@ mod prod {
     }
 
     // -----------------------------------------------------------------------
-    // Un-jailed dev path (`--no-jail`): fork + re-exec `draco __jail` WITHOUT
-    // the namespace/seccomp/Landlock lockdown. Linux-only; local debugging.
+    // Isolate-mode path (`--no-jail` on Linux): fork + re-exec `draco __jail`
+    // WITHOUT the OS sandbox (netns/seccomp/Landlock). Tier 2 still hosts V8 with
+    // no host-capability bindings, so page JS stays contained; this only skips
+    // the defense-in-depth OS layer. Linux-only (elsewhere the isolate path is the
+    // normal spawn).
     // -----------------------------------------------------------------------
     #[cfg(target_os = "linux")]
     mod unjailed {
@@ -507,7 +527,7 @@ mod prod {
         /// Fd the child inherits its IPC socket on — matches draco-jail's contract.
         const JAIL_IPC_FD: i32 = 3;
 
-        /// A forked-but-un-jailed `draco __jail` child + the supervisor IPC end.
+        /// A forked isolate-mode `draco __jail` child + the supervisor IPC end.
         pub(super) struct UnjailedChild {
             pid: i32,
             ipc: UnixStream,
@@ -528,18 +548,22 @@ mod prod {
             }
         }
 
-        /// Spawn `draco __jail` un-jailed: socketpair → fork → (child) dup socket
-        /// onto fd 3 and exec self; (parent) keep the supervisor end.
+        /// Spawn `draco __jail` in isolate mode: socketpair → fork → (child) dup
+        /// socket onto fd 3 and exec self; (parent) keep the supervisor end.
         ///
-        /// Intentionally skips namespaces/seccomp/Landlock — for the `--no-jail`
-        /// dev flag only. The re-exec target is the running executable, whose
+        /// Intentionally skips the OS sandbox (netns/seccomp/Landlock) — the
+        /// `--no-jail` path. The re-exec target is the running executable, whose
         /// `__jail` hook routes into `draco_jail::run_jail_child`. We set
         /// [`draco_jail::JAIL_NO_SANDBOX_ENV`] in the child before exec so that
-        /// entry skips arming the sandbox and runs the capture payload directly.
+        /// entry skips arming the OS sandbox and runs the capture payload directly
+        /// (V8 still has no host-capability bindings).
         pub(super) fn spawn() -> Result<UnjailedChild, DracoError> {
+            // The user explicitly opted out of OS-level hardening on a platform
+            // where it was available. One concise, non-alarming line noting the
+            // achieved posture — Tier 2 still runs V8 with no host bindings.
             eprintln!(
-                "draco-core: WARNING — Tier 2 running with --no-jail: the V8 child has NO \
-                 seccomp/netns/Landlock sandbox. Dev use only."
+                "draco-core: --no-jail set; running Tier 2 in isolate mode (V8, no host \
+                 bindings) without the OS sandbox (seccomp/netns/Landlock)."
             );
 
             let (sup, child) = UnixStream::pair()
@@ -633,6 +657,7 @@ mod tests {
             candidates,
             bodies,
             outcome: RuntimeOutcome::Quiesced,
+            sandbox_level: None,
         }
     }
 
@@ -778,6 +803,7 @@ mod tests {
             }],
             bodies: vec![Some(br#"{"sku":"ABC","qty":1}"#.to_vec())],
             outcome: RuntimeOutcome::Quiesced,
+            sandbox_level: None,
         }
     }
 
