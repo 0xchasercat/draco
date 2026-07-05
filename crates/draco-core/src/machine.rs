@@ -789,29 +789,43 @@ fn scan_script_srcs(html: &str) -> Vec<String> {
         .collect()
 }
 
-/// Extract ES-module import/export specifiers (static `from "…"`, side-effect
-/// `import "…"`, re-export `export … from "…"`, and dynamic `import("…")`).
-/// Approximate (regex, not a full parse) — over-matching only causes a few
-/// harmless extra same-origin GETs; a future pass can swap in `oxc_parser`.
+/// Extract ES-module import/export specifiers from JS source via the **Oxc**
+/// parse-once AST — static `import … from`, side-effect `import "…"`, re-export
+/// `export … from` / `export * from`, and dynamic `import("…")` with a string
+/// literal. A real parse (vs. regex) means specifiers inside strings/comments
+/// are never matched and computed `import(expr)` is correctly ignored. Oxc
+/// recovers from syntax errors, so a partial/odd bundle still yields whatever
+/// specifiers it could parse.
 #[cfg(feature = "tier2")]
 fn extract_module_imports(src: &str) -> Vec<String> {
-    use std::sync::LazyLock;
-    static RE: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
-        vec![
-            // import ... from "x"  /  export ... from "x"
-            regex::Regex::new(r#"(?s)\b(?:import|export)\b[^;'"]*?\bfrom\s*["']([^"']+)["']"#)
-                .unwrap(),
-            // bare side-effect import "x"
-            regex::Regex::new(r#"(?s)\bimport\s*["']([^"']+)["']"#).unwrap(),
-            // dynamic import("x")
-            regex::Regex::new(r#"(?s)\bimport\s*\(\s*["']([^"']+)["']\s*\)"#).unwrap(),
-        ]
-    });
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    let allocator = Allocator::default();
+    let ret = Parser::new(&allocator, src, SourceType::mjs()).parse();
+    let mr = &ret.module_record;
+
     let mut out = Vec::new();
-    for re in RE.iter() {
-        for c in re.captures_iter(src) {
-            if let Some(m) = c.get(1) {
-                out.push(m.as_str().to_string());
+    // Static import/export module requests (the map keys are the specifiers).
+    for (spec, _) in mr.requested_modules.iter() {
+        out.push(spec.as_str().to_string());
+    }
+    // Dynamic `import("…")`: the span points at the argument; keep it only when
+    // it is a string literal (skip `import(dynamicExpr)`).
+    for di in mr.dynamic_imports.iter() {
+        let (start, end) = (
+            di.module_request.start as usize,
+            di.module_request.end as usize,
+        );
+        if let Some(slice) = src.get(start..end) {
+            let t = slice.trim();
+            let bytes = t.as_bytes();
+            if bytes.len() >= 2
+                && (bytes[0] == b'"' || bytes[0] == b'\'')
+                && bytes[bytes.len() - 1] == bytes[0]
+            {
+                out.push(t[1..t.len() - 1].to_string());
             }
         }
     }
@@ -1235,8 +1249,12 @@ mod tests {
             import { b } from '/x/b.js';
             import "./side-effect.js";
             export { c } from "./c.js";
+            export * from "./star.js";
             const p = import("./lazy.js");
-            const bare = "not an import";
+            const dyn = import(computedSpecifier);
+            // Oxc parses, so these decoys must NOT be extracted:
+            const decoy = "import x from './evil.js'";
+            // import ./commented-out.js
         "#;
         let mut got = extract_module_imports(src);
         got.sort();
@@ -1246,11 +1264,25 @@ mod tests {
             "/x/b.js",
             "./side-effect.js",
             "./c.js",
+            "./star.js",
             "./lazy.js",
         ] {
             assert!(got.contains(&want.to_string()), "missing {want}: {got:?}");
         }
-        assert!(!got.iter().any(|s| s == "not an import"));
+        // A real parse ignores specifiers inside string literals / comments and
+        // computed dynamic imports — the whole point of using Oxc over regex.
+        assert!(
+            !got.iter().any(|s| s.contains("evil")),
+            "false match: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|s| s.contains("commented")),
+            "false match: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|s| s == "computedSpecifier"),
+            "computed import matched: {got:?}"
+        );
     }
 
     #[tokio::test]
