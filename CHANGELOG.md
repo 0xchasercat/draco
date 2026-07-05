@@ -3,6 +3,38 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.8.0] — 2026-07-06
+
+### Added
+- **`POST /v1/map`** — Firecrawl-compatible site URL discovery. Merges the
+  site's `/sitemap.xml` (following a sitemap index one level, bounded) with
+  the target page's own `href` links, resolved and same-host filtered
+  (`includeSubdomains` opt-in), fragment-stripped, order-preserving deduped,
+  filtered by case-insensitive `search`, truncated to `limit` (default 5000).
+  An HTTP-error page is treated as unfetched rather than harvesting an error
+  template's links; `502` only when neither source is reachable.
+- **`POST /v1/crawl` + `GET|DELETE /v1/crawl/{id}`** — Firecrawl-compatible
+  async crawl jobs. Bounded BFS (default `limit` 10, hard cap 100; `maxDepth`
+  default 2) where every page runs the full extraction ladder, so crawled
+  SPAs hydrate exactly like single scrapes. Frontier links are harvested from
+  each page's *Markdown* (Draco absolutizes links, so no second fetch — and
+  JS-injected links come free when the render escalation ran). `includePaths`
+  / `excludePaths` are substring matches on the URL path (exclude wins);
+  same-host unless `allowExternalLinks`; `scrapeOptions.formats` selects
+  markdown/json per page. Pages share the daemon-wide `--max-concurrency`
+  budget; jobs are in-memory (no external queue), sequential within a job.
+- **MCP server** — Draco's scraping as Model Context Protocol tools:
+  - `draco mcp`: stdio transport (newline-delimited JSON-RPC 2.0), for agent
+    clients like Claude. stdout carries protocol messages only.
+  - `POST /mcp` on the daemon: minimal Streamable-HTTP subset (single-message
+    POST → single JSON response; `202` for notifications; no SSE/session).
+  - Protocol: initialize with version negotiation (2025-06-18 / 2025-03-26 /
+    2024-11-05), `tools/list`, `tools/call`, `ping`; tool-level failures are
+    `isError: true` results, protocol misuse is a JSON-RPC error; lifecycle is
+    tolerated but not enforced (uniform with the stateless HTTP binding).
+  - One tool: `draco_scrape` (`url`, `formats`, `tierMax`, `captureWindowMs`,
+    `timeout`, `ignoreRobots`), annotated read-only/open-world.
+
 ## [0.7.0] — 2026-07-06
 
 ### Added
