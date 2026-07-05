@@ -186,6 +186,12 @@ name = "draco-jail"
 version = "0.1.0"
 dependencies = [
  "draco-types",
+ "landlock",
+ "libc",
+ "nix",
+ "seccompiler",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
