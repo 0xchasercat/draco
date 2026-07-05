@@ -16,6 +16,9 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use draco_core::{extract, Config, OutputFormat};
 
+/// MCP server — stdio transport (`draco mcp`) + HTTP binding (`POST /mcp`).
+#[cfg(feature = "serve")]
+mod mcp;
 /// `draco serve` — persistent daemon with a Firecrawl-compatible REST API.
 #[cfg(feature = "serve")]
 mod serve;
@@ -150,6 +153,34 @@ enum Command {
         #[arg(long)]
         ignore_robots: bool,
         /// Default http/https/socks5 proxy URL; per-request `proxy` overrides.
+        #[arg(long)]
+        proxy: Option<String>,
+    },
+    /// Run an MCP (Model Context Protocol) server over stdio, exposing Draco's
+    /// scraping as MCP tools for agent clients (Claude, editors, …). The same
+    /// server is available on the daemon at `POST /mcp`.
+    #[cfg(feature = "serve")]
+    Mcp {
+        /// Default total request timeout (ms) for tool calls.
+        #[arg(long, default_value_t = 30_000)]
+        timeout: u64,
+        /// Default escalation-ladder cap (0, 1, or 2).
+        #[arg(long, default_value_t = 2)]
+        tier_max: u8,
+        /// Default Tier 2 capture-window duration (ms).
+        #[arg(long, default_value_t = 2_000)]
+        capture_window_ms: u64,
+        /// Skip OS-level sandbox hardening (Tier 2 still runs V8 with no host
+        /// bindings).
+        #[arg(long)]
+        no_jail: bool,
+        /// Use the strict default-deny seccomp allowlist for jailed children.
+        #[arg(long)]
+        strict_sandbox: bool,
+        /// Bypass robots.txt.
+        #[arg(long)]
+        ignore_robots: bool,
+        /// http/https/socks5 proxy URL.
         #[arg(long)]
         proxy: Option<String>,
     },
@@ -378,6 +409,33 @@ async fn async_main() {
             };
             if let Err(e) = serve::serve(opts).await {
                 eprintln!("draco serve: {e}");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(feature = "serve")]
+        Command::Mcp {
+            timeout,
+            tier_max,
+            capture_window_ms,
+            no_jail,
+            strict_sandbox,
+            ignore_robots,
+            proxy,
+        } => {
+            let defaults = Config {
+                format: OutputFormat::Markdown,
+                proxy,
+                delay_ms: 0,
+                timeout_ms: timeout,
+                respect_robots: !ignore_robots,
+                tier_max,
+                capture_window_ms,
+                no_jail,
+                strict_sandbox,
+                allow_unsafe_replay: false,
+            };
+            if let Err(e) = mcp::run_stdio(defaults).await {
+                eprintln!("draco mcp: {e}");
                 std::process::exit(1);
             }
         }
