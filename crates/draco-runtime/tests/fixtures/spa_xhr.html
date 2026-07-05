@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>XHR SPA</title>
+  </head>
+  <body>
+    <script>
+      // Classic XMLHttpRequest pattern.
+      (function () {
+        const xhr = new XMLHttpRequest();
+        xhr.open("GET", "/api/legacy?page=1");
+        xhr.setRequestHeader("x-requested-with", "XMLHttpRequest");
+        xhr.responseType = "json";
+        xhr.onload = function () {
+          window.__loaded = xhr.status;
+        };
+        xhr.send();
+      })();
+    </script>
+  </body>
+</html>

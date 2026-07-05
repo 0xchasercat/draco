@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Fetch SPA</title>
+    <script type="application/json" id="__NEXT_DATA__">{"props":{"pageProps":{}}}</script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      // Mainstream SPA pattern: fetch product data on load, render into #root.
+      (function () {
+        const root = document.getElementById("root");
+        fetch("/api/data", { headers: { accept: "application/json" } })
+          .then((r) => r.json())
+          .then((data) => {
+            root.textContent = JSON.stringify(data);
+          });
+      })();
+    </script>
+  </body>
+</html>

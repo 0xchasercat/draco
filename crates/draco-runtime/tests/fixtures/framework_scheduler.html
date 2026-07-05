@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Framework-scheduler hydration</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      // This fixture does NOT use a real framework bundle (the build sandbox is
+      // offline). Instead it reproduces the exact runtime surfaces a real
+      // framework's client runtime exercises during hydration, to prove the
+      // polyfill supports them end-to-end:
+      //   * MessageChannel/MessagePort  (React's scheduler uses these to flush
+      //     work off the microtask/macrotask boundary)
+      //   * a mount into a real-ish DOM node via document.getElementById /
+      //     createElement / appendChild
+      //   * an "effect" that fires after commit, issuing a data fetch
+      //   * a follow-up fetch scheduled via setTimeout (paint-deferred load)
+      (function () {
+        // --- Minimal React-scheduler-shaped work loop over MessageChannel. ---
+        const channel = new MessageChannel();
+        const taskQueue = [];
+        channel.port1.onmessage = function () {
+          const task = taskQueue.shift();
+          if (task) task();
+          if (taskQueue.length) channel.port2.postMessage(null);
+        };
+        function scheduleWork(fn) {
+          taskQueue.push(fn);
+          channel.port2.postMessage(null);
+        }
+
+        // --- "Render + commit" into the DOM. ---
+        function mount() {
+          const root = document.getElementById("root");
+          const view = document.createElement("div");
+          view.className = "app";
+          view.setAttribute("data-hydrated", "true");
+          root.appendChild(view);
+
+          // Effect after commit: load the primary resource (XHR path, like many
+          // data libraries' default transport).
+          scheduleWork(function effect() {
+            const xhr = new XMLHttpRequest();
+            xhr.open("GET", "/api/hydrate/state");
+            xhr.setRequestHeader("accept", "application/json");
+            xhr.responseType = "json";
+            xhr.onload = function () {
+              view.textContent = "state:" + xhr.status;
+              // A dependent fetch discovered only after the first resolves.
+              scheduleWork(function () {
+                fetch("/api/hydrate/details?id=42")
+                  .then((r) => r.json())
+                  .then((d) => {
+                    window.__details = d;
+                  });
+              });
+            };
+            xhr.send();
+          });
+        }
+
+        // Kick off "hydration" after a paint-deferred timer, like a framework
+        // that waits for the document to be interactive.
+        setTimeout(mount, 5);
+      })();
+    </script>
+  </body>
+</html>

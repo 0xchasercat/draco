@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Static, no fetch</title>
+  </head>
+  <body>
+    <div id="app">Hello</div>
+    <script>
+      // Runs, schedules a short timer, but never issues a network request.
+      (function () {
+        let counter = 0;
+        const el = document.getElementById("app");
+        setTimeout(function () {
+          counter += 1;
+          el.textContent = "done " + counter;
+        }, 10);
+      })();
+    </script>
+  </body>
+</html>
