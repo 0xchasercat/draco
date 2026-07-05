@@ -6,5 +6,15 @@ license.workspace = true
 description = "Sandbox supervisor + jailed child (netns/Landlock/seccomp) for Draco."
 
 [dependencies]
+# Portable: the frozen wire contract + the IPC frame codec (spec §6).
 draco-types = { workspace = true }
-# Slice 2 spike adds (Linux, cfg-gated): seccompiler, landlock, nix per canonical doc §7 & §14.
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+# Linux-only jail mechanics (spec §7 & §14). cfg-gated so non-Linux hosts build
+# the degraded, un-jailed path without pulling these in.
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.5.0"
+landlock = "0.4.5"
+nix = { version = "0.31.3", features = ["socket", "process", "sched", "resource", "fs", "user"] }
+libc = "0.2.186"
