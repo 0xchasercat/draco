@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Web-API hydration</title>
+  </head>
+  <body>
+    <div id="app"></div>
+
+    <!--
+      Script 0: a "fingerprint / analytics" shim that touches the standard
+      Web-API globals bare deno_core does NOT ship (btoa/atob, crypto.*,
+      structuredClone) and reads `document.currentScript.parentElement` — the
+      exact "X is not defined" / "reading 'parentElement'" class of hydration
+      crash we are hardening against. It must run to completion (throwing here
+      would, in the buggy runtime, cascade into later scripts).
+    -->
+    <script>
+      (function fingerprint() {
+        // base64 round-trip (btoa/atob).
+        const token = btoa("draco:hello-世界".replace(/[^\x00-\xff]/g, "_"));
+        const back = atob(token);
+        window.__b64ok = back.startsWith("draco:hello");
+
+        // crypto.randomUUID + crypto.getRandomValues.
+        const uuid = crypto.randomUUID();
+        window.__uuidok = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+          uuid,
+        );
+        const buf = new Uint8Array(16);
+        crypto.getRandomValues(buf);
+        window.__rngok = buf.length === 16;
+
+        // crypto.subtle must exist (feature-detection) even though it rejects.
+        window.__subtleok = typeof crypto.subtle === "object" && crypto.subtle !== null;
+
+        // structuredClone deep copy.
+        const src = { a: 1, nested: { list: [1, 2, 3], when: new Date(0) } };
+        const copy = structuredClone(src);
+        copy.nested.list.push(4);
+        window.__cloneok = src.nested.list.length === 3 && copy.nested.list.length === 4;
+
+        // TextEncoder / TextDecoder round-trip.
+        const enc = new TextEncoder().encode("draco");
+        const dec = new TextDecoder().decode(enc);
+        window.__textok = dec === "draco";
+
+        // The crash from the ticket: document.currentScript.parentElement.
+        // currentScript must be a non-null element whose parentElement resolves.
+        const cs = document.currentScript;
+        window.__csok = !!cs && !!cs.parentElement && cs.parentElement.nodeType === 1;
+        // Stash a marker on the host so a later script can prove we got here.
+        window.__fingerprintRan = window.__b64ok && window.__uuidok && window.__rngok &&
+          window.__subtleok && window.__cloneok && window.__textok && window.__csok;
+      })();
+    </script>
+
+    <!--
+      Script 1: the app's real hydration. It only fires its data fetch once the
+      fingerprint shim above has run without throwing — proving hydration reached
+      the fetch (nothing threw fatally on the standard globals).
+    -->
+    <script>
+      (function hydrate() {
+        if (!window.__fingerprintRan) {
+          // If the shim had thrown, this app would (in a real cascade) never get
+          // a clean global state; guard so the test asserts the positive path.
+          window.__hydrateBlocked = true;
+          return;
+        }
+        const app = document.getElementById("app");
+        fetch("/api/data", { headers: { accept: "application/json" } })
+          .then((r) => r.json())
+          .then((data) => {
+            app.textContent = JSON.stringify(data);
+          });
+      })();
+    </script>
+  </body>
+</html>

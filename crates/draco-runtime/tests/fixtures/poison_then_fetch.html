@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Poison then fetch</title>
+  </head>
+  <body>
+    <div id="app"></div>
+
+    <!--
+      Script 0 is "poison": a third-party (analytics/fingerprint) tag that throws
+      synchronously on load — here by referencing a symbol that is still not
+      defined. In a real browser this failing tag does NOT stop the page's own
+      scripts from running. The runtime must isolate it: each inline script is
+      evaluated in its own execute_script, so one throwing must not abort the
+      next.
+    -->
+    <script>
+      // ReferenceError: __definitely_not_a_global__ is not defined.
+      __definitely_not_a_global__.track({ event: "page_view" });
+      // (unreachable) — if this ran, it would hide the real endpoint below.
+      fetch("/api/should-not-run-because-line-above-threw");
+    </script>
+
+    <!--
+      Script 1: the app's own hydration fetch. It must still fire and be captured
+      even though script 0 threw.
+    -->
+    <script>
+      (function hydrate() {
+        const app = document.getElementById("app");
+        // Async failure paths that fire DURING the capture window, BEFORE the
+        // real fetch does: an unhandled promise rejection and a throwing timer.
+        // Without the async-error swallow, the unhandled rejection propagates out
+        // of poll_event_loop as a fatal error and aborts the whole window — so
+        // the *deferred* fetch below (scheduled after these failures, and only
+        // reached once the loop keeps running) would never be captured. This is
+        // what makes the swallow load-bearing for this test, not just the
+        // per-script sync isolation.
+        Promise.reject(new Error("third-party async blew up"));
+        setTimeout(function () {
+          throw new Error("third-party timer blew up");
+        }, 5);
+        // Deferred real fetch: only surfaces if the loop survived the failures.
+        setTimeout(function () {
+          fetch("/api/data", { headers: { accept: "application/json" } })
+            .then((r) => r.json())
+            .then((data) => {
+              app.textContent = JSON.stringify(data);
+            });
+        }, 20);
+      })();
+    </script>
+  </body>
+</html>

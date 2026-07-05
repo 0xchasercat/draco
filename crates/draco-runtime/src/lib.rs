@@ -320,15 +320,38 @@ async fn run_capture_inner(url: &str, html: &str, cfg: &CaptureConfig) -> Captur
     //    script is *not* fatal to the whole run — later scripts and already-
     //    scheduled async work may still surface intercepts — but if it happens
     //    before anything is captured we remember it so the outcome is `Threw`.
+    //
+    //    Before each inline script we point `document.currentScript` at a fresh
+    //    synthetic <script> element (appended to <head> by the polyfill), so a
+    //    script that reads `document.currentScript.parentElement` / `.dataset` /
+    //    `.src` during hydration — a common analytics/tag-manager pattern, and
+    //    one of the observed real-page crashes — resolves against a real element
+    //    for the *currently running* script rather than a stale or null one.
+    //    After the loop we reset it to a non-null default (the polyfill keeps it
+    //    non-null so late async reads stay safe). The per-script set is
+    //    best-effort: if it ever fails we log and proceed (the polyfill's default
+    //    currentScript still guarantees `.parentElement` never throws).
     let scripts = extract_inline_scripts(html);
     let mut threw_in_page = false;
     for (i, code) in scripts.into_iter().enumerate() {
+        if let Err(e) = runtime.execute_script(
+            "draco:currentScript",
+            format!("try {{ globalThis.document.__dracoSetCurrentScript({i}); }} catch (_) {{}}"),
+        ) {
+            // Non-fatal: the polyfill already installed a non-null default.
+            eprintln!("draco-runtime: could not set currentScript for page {i}: {e}");
+        }
         let name = format!("draco:page[{i}]");
         if let Err(e) = runtime.execute_script(name, code) {
             threw_in_page = true;
             eprintln!("draco-runtime: page script {i} threw: {e}");
         }
     }
+    // Reset currentScript after the synchronous script pass (best-effort).
+    let _ = runtime.execute_script(
+        "draco:currentScript:clear",
+        "try { globalThis.document.__dracoClearCurrentScript(); } catch (_) {}",
+    );
 
     // 4. Capture window: pump the event loop until quiescence or the hard cap.
     let outcome = drive_capture_window(&mut runtime, &cap, cfg, threw_in_page).await;
