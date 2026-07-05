@@ -550,6 +550,43 @@
         return elementChildren(this).length;
       },
     });
+    // parentElement / *ElementSibling: element-only views over the parent/sibling
+    // links. Real page + analytics code reads these (e.g. a script that walks up
+    // from `document.currentScript.parentElement` to find its host container), so
+    // they must resolve to a node — not `undefined` — whenever a parent/sibling
+    // element exists.
+    Object.defineProperty(node, "parentElement", {
+      get() {
+        const p = this.parentNode;
+        return p && p.nodeType === 1 ? p : null;
+      },
+    });
+    Object.defineProperty(node, "firstElementChild", {
+      get() {
+        const kids = elementChildren(this);
+        return kids.length ? kids[0] : null;
+      },
+    });
+    Object.defineProperty(node, "lastElementChild", {
+      get() {
+        const kids = elementChildren(this);
+        return kids.length ? kids[kids.length - 1] : null;
+      },
+    });
+    Object.defineProperty(node, "nextElementSibling", {
+      get() {
+        let n = this.nextSibling;
+        while (n && n.nodeType !== 1) n = n.nextSibling;
+        return n || null;
+      },
+    });
+    Object.defineProperty(node, "previousElementSibling", {
+      get() {
+        let n = this.previousSibling;
+        while (n && n.nodeType !== 1) n = n.previousSibling;
+        return n || null;
+      },
+    });
     Object.defineProperty(node, "textContent", {
       get() {
         return textOf(this);
@@ -1017,6 +1054,62 @@
     }
   }
 
+  // ------------------------------------------------------------------
+  // document.currentScript
+  //
+  // During synchronous execution of an inline <script>, the spec sets
+  // `document.currentScript` to that script element. Real fingerprint /
+  // analytics glue (Cloudflare Zaraz, tag managers) reads it to locate its own
+  // tag — `document.currentScript.parentElement`, `.dataset`, `.src` — and
+  // throws a TypeError if it is `undefined`. Bare deno_core has no DOM at all,
+  // so it is `undefined` here and that read is exactly one of the observed
+  // hydration crashes.
+  //
+  // The Rust driver sets a *fresh* synthetic <script> element per inline
+  // `page[N]` via `document.__dracoSetCurrentScript()` before evaluating it
+  // (see lib.rs), then clears it after the loop. As a safety net we also
+  // install a non-null default now, so `.parentElement`/`.dataset`/`.src`
+  // resolve even for code that reads `currentScript` outside that per-script
+  // window (e.g. from a microtask/timer that runs later).
+  function makeSyntheticScript() {
+    const el = doc.createElement("script");
+    el.src = "";
+    el.async = false;
+    el.defer = false;
+    el.type = "text/javascript";
+    // Attach to <head> so parentElement/parentNode resolve to a real node.
+    headEl.appendChild(el);
+    return el;
+  }
+  let _currentScript = makeSyntheticScript();
+  Object.defineProperty(doc, "currentScript", {
+    configurable: true,
+    get() {
+      return _currentScript;
+    },
+    set(v) {
+      _currentScript = v == null ? null : v;
+    },
+  });
+  // Hook the Rust driver uses to set an accurate per-script element. Passing a
+  // null/undefined id resets to a fresh default (never null) so late async code
+  // still sees a usable element; passing a string id tags the element (readable
+  // via `.dataset.dracoScript` / `.getAttribute("data-draco-script")`).
+  doc.__dracoSetCurrentScript = function (id) {
+    const el = makeSyntheticScript();
+    if (id != null) {
+      el.dataset.dracoScript = String(id);
+      el.setAttribute("data-draco-script", String(id));
+    }
+    _currentScript = el;
+    return el;
+  };
+  doc.__dracoClearCurrentScript = function () {
+    // Reset to a non-null default rather than null: matches "there is always a
+    // script running" during our capture window and keeps `.parentElement` safe.
+    _currentScript = makeSyntheticScript();
+  };
+
   global.document = doc;
 
   // Node type constants some libs read off Node.
@@ -1390,5 +1483,637 @@
   global.ResizeObserver = NoopObserver;
   global.IntersectionObserver = NoopObserver;
   global.PerformanceObserver = NoopObserver;
+
+  // ==================================================================
+  // Standard Web-API globals that bare deno_core does NOT ship.
+  //
+  // These are the "X is not defined" gaps that make real page scripts —
+  // especially analytics / fingerprint / UUID libraries — throw during
+  // hydration before the app ever fires its data fetch. Each is a pragmatic,
+  // spec-reasonable implementation: enough surface for feature-detection and
+  // ordinary use, not a spec-complete platform. Guarded with `if (!global.X)`
+  // so we never clobber anything deno_core (or an earlier section) provided.
+  // ==================================================================
+
+  // --- base64: btoa / atob (Latin1), matching browser semantics -----------
+  if (typeof global.btoa !== "function") {
+    const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    global.btoa = function btoa(input) {
+      const str = String(input);
+      let out = "";
+      let i = 0;
+      while (i < str.length) {
+        const c1 = str.charCodeAt(i++);
+        // Browser btoa throws on code points > 0xFF (not Latin1).
+        if (c1 > 0xff) {
+          throw new (global.DOMException || Error)(
+            "btoa: characters outside Latin1 range",
+            "InvalidCharacterError",
+          );
+        }
+        const c2 = i < str.length ? str.charCodeAt(i++) : NaN;
+        const c3 = i < str.length ? str.charCodeAt(i++) : NaN;
+        if ((!Number.isNaN(c2) && c2 > 0xff) || (!Number.isNaN(c3) && c3 > 0xff)) {
+          throw new (global.DOMException || Error)(
+            "btoa: characters outside Latin1 range",
+            "InvalidCharacterError",
+          );
+        }
+        const e1 = c1 >> 2;
+        const e2 = ((c1 & 3) << 4) | (c2 >> 4);
+        let e3 = ((c2 & 15) << 2) | (c3 >> 6);
+        let e4 = c3 & 63;
+        if (Number.isNaN(c2)) {
+          e3 = 64;
+          e4 = 64;
+        } else if (Number.isNaN(c3)) {
+          e4 = 64;
+        }
+        out += B64.charAt(e1) + B64.charAt(e2) +
+          (e3 === 64 ? "=" : B64.charAt(e3)) +
+          (e4 === 64 ? "=" : B64.charAt(e4));
+      }
+      return out;
+    };
+  }
+  if (typeof global.atob !== "function") {
+    const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    global.atob = function atob(input) {
+      // Be lenient: strip whitespace (browsers ignore it) rather than throw.
+      let str = String(input).replace(/[\t\n\f\r ]/g, "");
+      // Tolerate missing padding.
+      str = str.replace(/=+$/, "");
+      let out = "";
+      let buffer = 0;
+      let bits = 0;
+      for (let i = 0; i < str.length; i++) {
+        const idx = B64.indexOf(str.charAt(i));
+        if (idx < 0) continue; // lenient: skip stray chars
+        buffer = (buffer << 6) | idx;
+        bits += 6;
+        if (bits >= 8) {
+          bits -= 8;
+          out += String.fromCharCode((buffer >> bits) & 0xff);
+        }
+      }
+      return out;
+    };
+  }
+
+  // --- DOMException (btoa/atob and some libs throw/instanceof it) ----------
+  if (typeof global.DOMException !== "function") {
+    global.DOMException = class DOMException extends Error {
+      constructor(message, name) {
+        super(message || "");
+        this.name = name || "Error";
+        this.code = 0;
+      }
+    };
+  }
+
+  // --- TextEncoder / TextDecoder (interceptor.js already USES TextEncoder) --
+  // Bare deno_core ships neither. Note interceptor.js's Response.arrayBuffer()
+  // constructs `new TextEncoder()`, so without this a page calling
+  // `res.arrayBuffer()` would throw. UTF-8 only (the encoding the web defaults
+  // to); `encodeInto` and a minimal decoder cover normal use.
+  if (typeof global.TextEncoder !== "function") {
+    global.TextEncoder = class TextEncoder {
+      get encoding() {
+        return "utf-8";
+      }
+      encode(input) {
+        const str = String(input == null ? "" : input);
+        const bytes = [];
+        for (let i = 0; i < str.length; i++) {
+          let code = str.charCodeAt(i);
+          // Combine surrogate pairs into a single code point.
+          if (code >= 0xd800 && code <= 0xdbff && i + 1 < str.length) {
+            const next = str.charCodeAt(i + 1);
+            if (next >= 0xdc00 && next <= 0xdfff) {
+              code = 0x10000 + ((code - 0xd800) << 10) + (next - 0xdc00);
+              i++;
+            }
+          }
+          if (code < 0x80) {
+            bytes.push(code);
+          } else if (code < 0x800) {
+            bytes.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+          } else if (code < 0x10000) {
+            bytes.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+          } else {
+            bytes.push(
+              0xf0 | (code >> 18),
+              0x80 | ((code >> 12) & 0x3f),
+              0x80 | ((code >> 6) & 0x3f),
+              0x80 | (code & 0x3f),
+            );
+          }
+        }
+        return new Uint8Array(bytes);
+      }
+      encodeInto(source, dest) {
+        const encoded = this.encode(source);
+        const n = Math.min(encoded.length, dest.length);
+        dest.set(encoded.subarray(0, n));
+        return { read: source.length, written: n };
+      }
+    };
+  }
+  if (typeof global.TextDecoder !== "function") {
+    global.TextDecoder = class TextDecoder {
+      constructor(label, options) {
+        this._encoding = String(label || "utf-8").toLowerCase();
+        this._fatal = !!(options && options.fatal);
+        this._ignoreBOM = !!(options && options.ignoreBOM);
+      }
+      get encoding() {
+        return this._encoding;
+      }
+      get fatal() {
+        return this._fatal;
+      }
+      get ignoreBOM() {
+        return this._ignoreBOM;
+      }
+      decode(input) {
+        if (input == null) return "";
+        let bytes;
+        if (input instanceof Uint8Array) bytes = input;
+        else if (input instanceof ArrayBuffer) bytes = new Uint8Array(input);
+        else if (input && input.buffer instanceof ArrayBuffer) {
+          bytes = new Uint8Array(input.buffer, input.byteOffset || 0, input.byteLength);
+        } else bytes = new Uint8Array(input);
+        let out = "";
+        let i = 0;
+        const n = bytes.length;
+        while (i < n) {
+          const b0 = bytes[i++];
+          if (b0 < 0x80) {
+            out += String.fromCharCode(b0);
+          } else if (b0 >= 0xc0 && b0 < 0xe0 && i < n) {
+            const b1 = bytes[i++] & 0x3f;
+            out += String.fromCharCode(((b0 & 0x1f) << 6) | b1);
+          } else if (b0 >= 0xe0 && b0 < 0xf0 && i + 1 < n) {
+            const b1 = bytes[i++] & 0x3f;
+            const b2 = bytes[i++] & 0x3f;
+            out += String.fromCharCode(((b0 & 0x0f) << 12) | (b1 << 6) | b2);
+          } else if (b0 >= 0xf0 && i + 2 < n) {
+            const b1 = bytes[i++] & 0x3f;
+            const b2 = bytes[i++] & 0x3f;
+            const b3 = bytes[i++] & 0x3f;
+            let cp = ((b0 & 0x07) << 18) | (b1 << 12) | (b2 << 6) | b3;
+            cp -= 0x10000;
+            out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+          } else {
+            out += "�"; // replacement char
+          }
+        }
+        // Strip a leading UTF-8 BOM unless asked to keep it.
+        if (!this._ignoreBOM && out.charCodeAt(0) === 0xfeff) out = out.slice(1);
+        return out;
+      }
+    };
+  }
+  // Both TextEncoder/TextDecoder are now guaranteed present on `global`
+  // (globalThis), which is what interceptor.js's `new TextEncoder()` resolves
+  // against and what page code feature-detects.
+
+  // --- crypto: getRandomValues / randomUUID / subtle -----------------------
+  // Analytics, fingerprint, and UUID libraries feature-detect `crypto` and call
+  // getRandomValues / randomUUID on load. V8 gives us Math.random (no CSPRNG in
+  // this jitless isolate), which is fine for the purpose here: we are capturing
+  // endpoints, not doing real cryptography.
+  if (!global.crypto || typeof global.crypto.getRandomValues !== "function") {
+    const existing = global.crypto || {};
+    const cryptoObj = existing;
+    if (typeof cryptoObj.getRandomValues !== "function") {
+      cryptoObj.getRandomValues = function getRandomValues(typedArray) {
+        if (typedArray == null || typeof typedArray.length !== "number") {
+          throw new (global.TypeError || Error)("getRandomValues: not a typed array");
+        }
+        // Fill the underlying bytes with pseudo-random values.
+        const view =
+          typedArray.BYTES_PER_ELEMENT && typedArray.buffer
+            ? new Uint8Array(typedArray.buffer, typedArray.byteOffset || 0, typedArray.byteLength)
+            : typedArray;
+        for (let i = 0; i < view.length; i++) {
+          view[i] = (Math.random() * 256) | 0;
+        }
+        return typedArray;
+      };
+    }
+    if (typeof cryptoObj.randomUUID !== "function") {
+      cryptoObj.randomUUID = function randomUUID() {
+        // RFC 4122 v4 UUID from Math.random.
+        const bytes = new Uint8Array(16);
+        for (let i = 0; i < 16; i++) bytes[i] = (Math.random() * 256) | 0;
+        bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+        bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 10
+        const hex = [];
+        for (let i = 0; i < 256; i++) hex.push((i + 0x100).toString(16).slice(1));
+        return (
+          hex[bytes[0]] + hex[bytes[1]] + hex[bytes[2]] + hex[bytes[3]] + "-" +
+          hex[bytes[4]] + hex[bytes[5]] + "-" +
+          hex[bytes[6]] + hex[bytes[7]] + "-" +
+          hex[bytes[8]] + hex[bytes[9]] + "-" +
+          hex[bytes[10]] + hex[bytes[11]] + hex[bytes[12]] +
+          hex[bytes[13]] + hex[bytes[14]] + hex[bytes[15]]
+        );
+      };
+    }
+    if (!cryptoObj.subtle) {
+      // Present so `crypto.subtle` feature-detection succeeds, but every method
+      // rejects: we don't (and shouldn't) do real WebCrypto in the isolate. A
+      // rejected promise is caught by the app's own error handling (and by our
+      // unhandledrejection swallow if not) — it does not crash on access.
+      const reject = () =>
+        Promise.reject(
+          new (global.DOMException || Error)("SubtleCrypto not supported in draco isolate", "NotSupportedError"),
+        );
+      cryptoObj.subtle = {
+        encrypt: reject,
+        decrypt: reject,
+        sign: reject,
+        verify: reject,
+        digest: reject,
+        generateKey: reject,
+        deriveKey: reject,
+        deriveBits: reject,
+        importKey: reject,
+        exportKey: reject,
+        wrapKey: reject,
+        unwrapKey: reject,
+      };
+    }
+    global.crypto = cryptoObj;
+  }
+
+  // --- structuredClone -----------------------------------------------------
+  if (typeof global.structuredClone !== "function") {
+    global.structuredClone = function structuredClone(value) {
+      const seen = new Map();
+      function clone(v) {
+        if (v === null || typeof v !== "object") return v;
+        if (seen.has(v)) return seen.get(v);
+        // Structured types the JSON fallback would mangle.
+        if (v instanceof Date) return new Date(v.getTime());
+        if (typeof RegExp !== "undefined" && v instanceof RegExp) {
+          return new RegExp(v.source, v.flags);
+        }
+        if (typeof ArrayBuffer !== "undefined" && v instanceof ArrayBuffer) {
+          return v.slice(0);
+        }
+        if (typeof ArrayBuffer !== "undefined" && ArrayBuffer.isView(v)) {
+          // Typed arrays / DataView: copy over a cloned buffer.
+          const buf = v.buffer.slice(0);
+          return new v.constructor(buf, v.byteOffset, v.length != null ? v.length : undefined);
+        }
+        if (Array.isArray(v)) {
+          const out = [];
+          seen.set(v, out);
+          for (let i = 0; i < v.length; i++) out[i] = clone(v[i]);
+          return out;
+        }
+        if (typeof Map !== "undefined" && v instanceof Map) {
+          const out = new Map();
+          seen.set(v, out);
+          v.forEach((val, key) => out.set(clone(key), clone(val)));
+          return out;
+        }
+        if (typeof Set !== "undefined" && v instanceof Set) {
+          const out = new Set();
+          seen.set(v, out);
+          v.forEach((val) => out.add(clone(val)));
+          return out;
+        }
+        // Plain object.
+        const out = {};
+        seen.set(v, out);
+        for (const k of Object.keys(v)) out[k] = clone(v[k]);
+        return out;
+      }
+      return clone(value);
+    };
+  }
+
+  // --- queueMicrotask (deno_core provides one; be defensive) ---------------
+  if (typeof global.queueMicrotask !== "function") {
+    global.queueMicrotask = function queueMicrotask(cb) {
+      Promise.resolve().then(() => {
+        try {
+          cb();
+        } catch (e) {
+          reportError(e);
+        }
+      });
+    };
+  }
+
+  // --- Blob (minimal: parts + size/type/text()/arrayBuffer()) --------------
+  if (typeof global.Blob !== "function") {
+    global.Blob = class Blob {
+      constructor(parts, options) {
+        this._parts = [];
+        let size = 0;
+        if (Array.isArray(parts)) {
+          for (const p of parts) {
+            if (p == null) continue;
+            let s;
+            if (typeof p === "string") s = p;
+            else if (p instanceof global.Blob) s = p._text || "";
+            else if (typeof ArrayBuffer !== "undefined" && (p instanceof ArrayBuffer || ArrayBuffer.isView(p))) {
+              const view = p instanceof ArrayBuffer ? new Uint8Array(p) : new Uint8Array(p.buffer, p.byteOffset, p.byteLength);
+              let str = "";
+              for (let i = 0; i < view.length; i++) str += String.fromCharCode(view[i]);
+              s = str;
+            } else s = String(p);
+            this._parts.push(s);
+            size += s.length;
+          }
+        }
+        this._text = this._parts.join("");
+        this.size = size;
+        this.type = (options && options.type) ? String(options.type) : "";
+      }
+      text() {
+        return Promise.resolve(this._text);
+      }
+      arrayBuffer() {
+        const enc = new global.TextEncoder();
+        return Promise.resolve(enc.encode(this._text).buffer);
+      }
+      slice(start, end, contentType) {
+        const sliced = this._text.slice(start || 0, end == null ? this._text.length : end);
+        return new global.Blob([sliced], { type: contentType || this.type });
+      }
+      stream() {
+        // No ReadableStream here; return a no-op-ish object rather than throw.
+        return { getReader: () => ({ read: () => Promise.resolve({ done: true, value: undefined }) }) };
+      }
+    };
+  }
+  if (typeof global.File !== "function") {
+    global.File = class File extends global.Blob {
+      constructor(parts, name, options) {
+        super(parts, options);
+        this.name = String(name == null ? "" : name);
+        this.lastModified = (options && options.lastModified) || Date.now();
+      }
+    };
+  }
+
+  // --- URL.createObjectURL / revokeObjectURL -------------------------------
+  // Return a synthetic `blob:` URL; revoke is a no-op. Many bundles create an
+  // object URL for a worker/asset on load and only revoke it later.
+  if (global.URL && typeof global.URL.createObjectURL !== "function") {
+    let blobSeq = 0;
+    const origin = (global.location && global.location.origin) || "https://localhost";
+    global.URL.createObjectURL = function createObjectURL() {
+      blobSeq += 1;
+      return "blob:" + origin + "/draco-" + blobSeq + "-" + ((Math.random() * 1e9) | 0).toString(16);
+    };
+    global.URL.revokeObjectURL = function revokeObjectURL() {};
+  }
+
+  // --- AbortController / AbortSignal ---------------------------------------
+  // fetch({ signal }) is extremely common; without these, `new AbortController()`
+  // throws ReferenceError and the request never fires.
+  if (typeof global.AbortSignal !== "function") {
+    global.AbortSignal = class AbortSignal extends EventTarget {
+      constructor() {
+        super();
+        this.aborted = false;
+        this.reason = undefined;
+        this.onabort = null;
+      }
+      throwIfAborted() {
+        if (this.aborted) throw this.reason;
+      }
+      static abort(reason) {
+        const s = new global.AbortSignal();
+        s.aborted = true;
+        s.reason = reason;
+        return s;
+      }
+      static timeout() {
+        // We don't wire a real timer-backed abort; return a never-aborting signal.
+        return new global.AbortSignal();
+      }
+    };
+  }
+  if (typeof global.AbortController !== "function") {
+    global.AbortController = class AbortController {
+      constructor() {
+        this.signal = new global.AbortSignal();
+      }
+      abort(reason) {
+        if (this.signal.aborted) return;
+        this.signal.aborted = true;
+        this.signal.reason = reason == null ? new global.DOMException("Aborted", "AbortError") : reason;
+        const ev = new global.Event("abort");
+        if (typeof this.signal.onabort === "function") {
+          try {
+            this.signal.onabort(ev);
+          } catch (e) {
+            reportError(e);
+          }
+        }
+        this.signal.dispatchEvent(ev);
+      }
+    };
+  }
+
+  // --- CSS (feature-detection surface: CSS.supports / CSS.escape) ----------
+  if (typeof global.CSS !== "object" || global.CSS === null) {
+    global.CSS = {
+      supports() {
+        return false;
+      },
+      escape(value) {
+        // Minimal CSS.escape: backslash-escape non-alphanumeric ASCII.
+        return String(value).replace(/[^a-zA-Z0-9_-]/g, (ch) => "\\" + ch);
+      },
+    };
+  }
+
+  // --- Notification (feature-detection stub) -------------------------------
+  if (typeof global.Notification !== "function") {
+    const Notification = function Notification() {};
+    Notification.permission = "denied";
+    Notification.requestPermission = function () {
+      return Promise.resolve("denied");
+    };
+    global.Notification = Notification;
+  }
+
+  // --- Enrich navigator with fields fingerprint/analytics libs read --------
+  // The base navigator (above) already has userAgent/platform/language/etc.;
+  // fill any gaps defensively so property reads never surface `undefined` where
+  // a string/number is expected (some libs do `navigator.languages.join(...)`).
+  if (global.navigator) {
+    const nav = global.navigator;
+    if (typeof nav.userAgent !== "string") {
+      nav.userAgent =
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) draco/0.1 Safari/537.36";
+    }
+    if (typeof nav.platform !== "string") nav.platform = "Linux x86_64";
+    if (typeof nav.language !== "string") nav.language = "en-US";
+    if (!Array.isArray(nav.languages)) nav.languages = ["en-US", "en"];
+    if (typeof nav.hardwareConcurrency !== "number") nav.hardwareConcurrency = 1;
+    if (typeof nav.deviceMemory !== "number") nav.deviceMemory = 8;
+    if (typeof nav.maxTouchPoints !== "number") nav.maxTouchPoints = 0;
+    if (typeof nav.onLine !== "boolean") nav.onLine = true;
+    if (typeof nav.cookieEnabled !== "boolean") nav.cookieEnabled = true;
+    if (typeof nav.sendBeacon !== "function") {
+      nav.sendBeacon = function sendBeacon(url, data) {
+        try {
+          global.fetch(url, { method: "POST", body: data, keepalive: true });
+        } catch (_) {
+          /* ignore */
+        }
+        return true;
+      };
+    }
+    if (typeof nav.vendor !== "string") nav.vendor = "";
+    if (typeof nav.product !== "string") nav.product = "Gecko";
+    if (typeof nav.appName !== "string") nav.appName = "Netscape";
+    if (typeof nav.appVersion !== "string") {
+      nav.appVersion = "5.0 (X11; Linux x86_64)";
+    }
+  }
+
+  // ==================================================================
+  // Resilience: swallow uncaught async errors so one failing third-party
+  // script never aborts the capture loop.
+  //
+  // deno_core surfaces an unhandled promise rejection (or an error thrown from a
+  // queueMicrotask callback) as a *fatal* error out of `poll_event_loop`, which
+  // ends the capture window immediately — so a fingerprint/analytics script that
+  // does `Promise.reject(...)` or throws in a `.then()` would stop the page from
+  // ever reaching its data fetch. We install:
+  //   * window.onerror / addEventListener('error')
+  //   * window.onunhandledrejection / addEventListener('unhandledrejection')
+  // and hook deno_core's rejection + report-exception callbacks so those async
+  // failures are dispatched to page listeners, logged once quietly, and — by
+  // marking them handled — never abort the loop. A real browser behaves the same
+  // way: an uncaught error in one script does not halt the others.
+  // ==================================================================
+  global.onerror = null;
+  global.onunhandledrejection = null;
+
+  function describeError(e) {
+    try {
+      if (e && e.stack) return String(e.stack);
+      if (e && e.message) return String(e.message);
+      return String(e);
+    } catch (_) {
+      return "<unprintable error>";
+    }
+  }
+
+  function dispatchWindowError(err) {
+    // Build an ErrorEvent-ish object.
+    const ev = {
+      type: "error",
+      message: err && err.message ? String(err.message) : String(err),
+      error: err,
+      filename: (global.location && global.location.href) || "",
+      lineno: 0,
+      colno: 0,
+      defaultPrevented: false,
+      preventDefault() {
+        this.defaultPrevented = true;
+      },
+      stopPropagation() {},
+      stopImmediatePropagation() {},
+    };
+    // onerror(message, source, lineno, colno, error) per the classic signature.
+    if (typeof global.onerror === "function") {
+      try {
+        global.onerror(ev.message, ev.filename, ev.lineno, ev.colno, err);
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    try {
+      global.dispatchEvent(ev);
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  function dispatchUnhandledRejection(reason, promise) {
+    const ev = {
+      type: "unhandledrejection",
+      reason,
+      promise,
+      defaultPrevented: false,
+      preventDefault() {
+        this.defaultPrevented = true;
+      },
+      stopPropagation() {},
+      stopImmediatePropagation() {},
+    };
+    if (typeof global.onunhandledrejection === "function") {
+      try {
+        global.onunhandledrejection(ev);
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    try {
+      global.dispatchEvent(ev);
+    } catch (_) {
+      /* ignore */
+    }
+    return ev.defaultPrevented;
+  }
+
+  // Only log the first few swallowed errors, so a script that throws in a hot
+  // loop doesn't flood the (single, shared) capture log.
+  let swallowLogCount = 0;
+  const SWALLOW_LOG_MAX = 5;
+  function logSwallowed(kind, detail) {
+    if (swallowLogCount >= SWALLOW_LOG_MAX) return;
+    swallowLogCount += 1;
+    try {
+      Deno.core.print("[polyfill] swallowed " + kind + ": " + detail + "\n");
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  try {
+    if (Deno.core.setUnhandledPromiseRejectionHandler) {
+      Deno.core.setUnhandledPromiseRejectionHandler(function (promise, reason) {
+        // Give the page a chance to observe it, then mark handled so deno_core
+        // does NOT dispatch it as a fatal exception and abort the loop.
+        try {
+          dispatchUnhandledRejection(reason, promise);
+        } catch (_) {
+          /* ignore */
+        }
+        logSwallowed("unhandledrejection", describeError(reason));
+        return true; // handled — do not abort the event loop
+      });
+    }
+    if (Deno.core.setReportExceptionCallback) {
+      // Errors thrown from queueMicrotask callbacks (and other "report the
+      // exception" paths) route here. Default deno_core behavior re-dispatches
+      // them fatally; we swallow instead.
+      Deno.core.setReportExceptionCallback(function (err) {
+        try {
+          dispatchWindowError(err);
+        } catch (_) {
+          /* ignore */
+        }
+        logSwallowed("exception", describeError(err));
+      });
+    }
+  } catch (_) {
+    // If these hooks are unavailable in this deno_core build, the per-inline
+    // try/catch in lib.rs still isolates synchronous throws; we just lose the
+    // async-swallow. Do not let a missing hook break bootstrap.
+  }
 
 })(globalThis);

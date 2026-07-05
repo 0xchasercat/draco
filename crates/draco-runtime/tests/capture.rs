@@ -344,3 +344,104 @@ fn post_with_json_body_captures_body_bytes() {
     assert!(s.contains("\"name\":\"widget\""), "body wrong: {s}");
     assert!(s.contains("\"qty\":3"), "body wrong: {s}");
 }
+
+/// A page whose FIRST inline script exercises the standard Web-API globals that
+/// bare deno_core does not ship — `btoa`/`atob`, `crypto.randomUUID`,
+/// `crypto.getRandomValues`, `crypto.subtle` (feature-detect), `structuredClone`,
+/// `TextEncoder`/`TextDecoder` — and reads `document.currentScript.parentElement`
+/// (the exact "reading 'parentElement' of undefined" crash from the ticket).
+/// A LATER script then fetches `/api/data`. If any of those globals were missing
+/// (ReferenceError) or `currentScript` were null/undefined, the first script
+/// would throw and — in the observed real-page cascade — hydration would never
+/// reach the fetch. Asserting the `/api/data` intercept proves the whole crash
+/// class is gone and hydration survived.
+#[test]
+fn standard_web_api_globals_do_not_crash_hydration() {
+    let html = include_str!("fixtures/webapi_hydrate.html");
+    let report = run_capture("https://app.example.com/dashboard", html, &cfg());
+
+    assert!(
+        matches!(
+            report.outcome,
+            RuntimeOutcome::Quiesced | RuntimeOutcome::WindowClosed
+        ),
+        "unexpected outcome: {:?} (captured: {:?})",
+        report.outcome,
+        report.requests,
+    );
+
+    // Hydration reached the fetch: the fingerprint shim ran to completion on the
+    // now-present globals, so the guarded app fetch fired.
+    let data = find(&report.requests, "/api/data").unwrap_or_else(|| {
+        panic!(
+            "hydration did not reach the fetch — a standard global likely threw. captured: {:?}",
+            report.requests
+        )
+    });
+    assert_eq!(data.method, "GET");
+    assert_eq!(data.via, InterceptVia::Fetch);
+    assert!(
+        data.url.starts_with("https://app.example.com/"),
+        "url not absolutized: {}",
+        data.url
+    );
+    assert!(
+        data.headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("accept") && v.contains("application/json")),
+        "accept header lost: {:?}",
+        data.headers
+    );
+    // The fingerprint shim must NOT have thrown its way into blocking hydration.
+    assert!(
+        !report
+            .requests
+            .iter()
+            .any(|r| r.url.contains("should-not-run")),
+        "a script that should have been blocked ran anyway: {:?}",
+        report.requests
+    );
+}
+
+/// A "poison" page: script 0 THROWS synchronously (references a still-undefined
+/// symbol, like a broken third-party analytics/fingerprint tag), and for good
+/// measure script 1 also triggers an *async* failure (an unhandled promise
+/// rejection + a throwing timer) before firing its real `fetch("/api/data")`.
+///
+/// A failing third-party script must never stop the page: each inline script is
+/// isolated (script 0's throw does not abort script 1), and async failures are
+/// swallowed (they no longer abort the capture loop out of `poll_event_loop`).
+/// Asserting `/api/data` is captured proves the later script's fetch survived.
+#[test]
+fn throwing_third_party_script_does_not_block_later_fetch() {
+    let html = include_str!("fixtures/poison_then_fetch.html");
+    let report = run_capture("https://shop.example.com/", html, &cfg());
+
+    // We captured a request, so the run is a successful close (not Threw), even
+    // though an earlier script threw synchronously and async errors fired.
+    assert!(
+        matches!(
+            report.outcome,
+            RuntimeOutcome::Quiesced | RuntimeOutcome::WindowClosed
+        ),
+        "unexpected outcome: {:?} (captured: {:?})",
+        report.outcome,
+        report.requests,
+    );
+
+    let data = find(&report.requests, "/api/data").unwrap_or_else(|| {
+        panic!(
+            "later script's fetch was blocked by an earlier throw — captured: {:?}",
+            report.requests
+        )
+    });
+    assert_eq!(data.method, "GET");
+    assert_eq!(data.via, InterceptVia::Fetch);
+
+    // The poisoned script's own (unreachable) fetch must never have run.
+    assert!(
+        find(&report.requests, "should-not-run").is_none(),
+        "the line after the throw executed: {:?}",
+        report.requests
+    );
+}
