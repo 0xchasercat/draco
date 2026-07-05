@@ -8,4 +8,32 @@ description = "Stealth TLS/JA4 HTTP client for Draco."
 [dependencies]
 draco-types = { workspace = true }
 bytes = { workspace = true }
-# WS-A adds: wreq = "6.0.0-rc.29", tokio, and robots/backoff deps per canonical doc §9 & §14.
+tokio = { workspace = true }
+
+# Browser-faithful TLS/JA4 + HTTP/2 fingerprinting client (BoringSSL-backed).
+#   - `cookies`  : per-session cookie jar (`cookie_provider` / `Jar`).
+#   - `socks`    : socks5:// proxy support alongside http/https.
+#   - gzip/brotli/deflate/zstd: transparent decompression so bodies come back
+#                  decoded, matching what a real browser hands to the page.
+wreq = { version = "6.0.0-rc.29", default-features = false, features = [
+    "webpki-roots",
+    "tokio-rt",
+    "cookies",
+    "socks",
+    "gzip",
+    "brotli",
+    "deflate",
+    "zstd",
+] }
+# Chrome/Safari/Firefox emulation presets (the JA4/HTTP2 fingerprint database).
+wreq-util = { version = "3.0.0-rc.13", default-features = false, features = [
+    "emulation",
+] }
+
+url = "2"
+rand = "0.8"
+base64 = "0.22"
+
+[dev-dependencies]
+# Drive the async surface in unit tests (offline only; live tests are #[ignore]).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
