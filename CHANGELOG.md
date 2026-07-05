@@ -3,6 +3,44 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.5.0] — 2026-07-06
+
+**Tier 2 DOM engine replaced: real happy-dom, baked into a V8 snapshot.** The
+hand-written ~2,185-line DOM/scheduler polyfill is gone. The isolate now runs a
+real browser-grade DOM — [happy-dom](https://github.com/capricorn86/happy-dom) —
+on a base of ecosystem web-primitive polyfills, bundled with **Rolldown** (Oxc)
+and evaluated **once** into a V8 startup snapshot at build time. This dramatically
+widens the set of SPAs that hydrate (real events, custom elements,
+MutationObserver, CSSOM, `MessageChannel`) instead of the previous ~dozen
+hand-stubbed DOM primitives.
+
+### Changed
+- **`draco-runtime` DOM engine → happy-dom.** `build.rs` bakes `js/base.iife.js`
+  (whatwg-url, text-encoding, structured-clone + a Node-compat shim with
+  `op_sleep`-backed timers + `MessageChannel`) and `js/happydom.iife.js` into a V8
+  startup snapshot (`DRACO_SNAPSHOT.bin`). Each isolate restores it in
+  ~single-digit ms rather than re-parsing ~2.6 MB of JS (~95 ms) per spawn — a
+  ~3.4× cold-start win (~112 ms → ~33 ms to first hydrated DOM in the bench).
+- Per-isolate `js/glue.js` constructs a fresh happy-dom `Window` for the target
+  URL, mirrors its DOM globals onto `globalThis`, installs the `op_raze_fetch`
+  fetch/XHR interceptor (page JS still does zero real I/O), swallows async
+  errors, and loads the fetched HTML.
+- **`--jitless` retained.** Benchmarking showed JIT vs. jitless is within noise
+  here (the cost is snapshot restore + DOM construction, not hot JIT-tier loops),
+  so the W^X / seccomp lockdown stays — no `mprotect(PROT_EXEC)` relaxation.
+
+### Removed
+- `js/polyfill.js` and `js/interceptor.js` (the hand-rolled DOM, scheduler, and
+  Web-API shims) — fully superseded. One clean code path, no legacy engine.
+
+### Notes
+- The DOM bundles are vendored + regenerable (`vendor/happy-dom/`, Rolldown);
+  `cargo build` needs no network — it only bakes the committed bundles into the
+  snapshot.
+- Known follow-on: apps delivered as ES modules (`<script type="module">` /
+  dynamic `import()`) still need an isolate module loader — a fast-follow. Classic
+  hydration payloads (Webpack/Next/Nuxt/Vite legacy) work today.
+
 ## [0.4.1] — 2026-07-06
 
 ### Fixed
