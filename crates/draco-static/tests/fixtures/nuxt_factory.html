@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Nuxt Store (factory)</title>
+  </head>
+  <body>
+    <div id="__nuxt"><div id="__layout"><h1>Catalog</h1></div></div>
+    <script>
+      window.__NUXT__ = (function (a, b, c) {
+        return {
+          layout: "default",
+          data: [{ products: a }],
+          state: { cartCount: b },
+          serverRendered: c,
+        };
+      })(
+        [
+          { id: 1, title: "Alpha", price: 10 },
+          { id: 2, title: "Beta", price: 20 },
+        ],
+        0,
+        true
+      );
+    </script>
+    <script src="/_nuxt/entry.abcdef.js" defer></script>
+  </body>
+</html>
