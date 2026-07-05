@@ -1,45 +1,127 @@
 # Draco
 
 A browserless, tiered data-extraction engine. Draco escalates through the
-cheapest successful extraction tier — static embedded state, then Next.js
-build-id API replay, then a sandboxed V8 runtime that intercepts an SPA's own
-data requests and replays them with a stealth HTTP client.
+**cheapest successful extraction tier** and stops as soon as one yields data:
 
-> **Authoritative design:** the canonical architecture & execution spec is the
-> single source of truth for every crate, the frozen `draco-types` wire
-> contract, the IPC frame format, the security model, and the implementation
-> plan. Implement against it.
+1. **Tier 0 — static embedded state.** Parse the raw HTML for `__NEXT_DATA__`,
+   JSON-LD, and object-literal `window.__NUXT__`. No JS executed.
+2. **Tier 1 — heuristic API replay.** Discover a Next.js `buildId` and fetch the
+   `/_next/data/<buildId>/…​.json` endpoint directly. Still no JS.
+3. **Tier 2 — runtime interception.** Boot a jailed, jitless V8 isolate, let the
+   page's own SPA code hydrate, intercept the `fetch`/`XHR` it fires for its
+   data, rank the intercepts, and **replay the winner** with the stealth HTTP
+   client — returning the raw JSON the app itself consumed.
+
+The browser engine is a *discovery oracle*, not a renderer: Draco never paints a
+page, it just learns which API the page wanted and calls it directly.
+
+> **Design:** the canonical architecture & execution spec remains the reference
+> for the frozen `draco-types` wire contract, the IPC frame format, and the
+> security model. This README reflects what shipped in **v0.1.0**.
+
+## Install / build
+
+```sh
+git clone https://github.com/0xchasercat/draco && cd draco
+cargo build --release
+```
+
+Build prerequisites (for wreq's BoringSSL + bindgen, and deno_core's V8):
+`cmake`, a C/C++ compiler, `clang`/`libclang`, `perl`, `pkg-config`.
+- Debian/Ubuntu: `apt install build-essential cmake clang libclang-dev perl pkg-config`
+- Fedora: `dnf install gcc gcc-c++ cmake clang clang-devel llvm-devel perl pkgconf`
+- macOS: Xcode Command Line Tools + `brew install cmake`
+
+## Usage
+
+```sh
+# Full ladder (Tier 0 → 1 → 2):
+draco extract "https://example.com/product/42" --pretty
+
+# Cap the ladder (0 = static only, 1 = +build-id, 2 = +runtime):
+draco extract "https://example.com" --tier-max 1
+
+# Filter the output with JSONPath:
+draco extract "https://example.com" --extract '$.props.pageProps'
+
+# Politeness + stealth:
+draco extract "https://example.com" --proxy socks5://127.0.0.1:9050 --delay 500
+```
+
+Output is always an `ExtractionResult` JSON on stdout: `status`, `source_tier`,
+`data`, a `timing` breakdown, and a full escalation `trace`. Exit codes:
+`0` success · `1` error · `2` unsupported · `3` needs_browser.
+
+Selected flags: `--extract <JSONPATH>`, `--tier-max <0|1|2>`, `--proxy`,
+`--delay <ms>`, `--timeout <ms>`, `--capture-window-ms <ms>`, `--ignore-robots`,
+`--no-jail` (dev: run Tier 2 un-jailed), `--allow-unsafe-replay` (permit
+replaying a state-changing request), `--pretty`.
 
 ## Workspace layout
 
 | Crate | Role |
 |-------|------|
-| `draco-types` | Frozen wire + result contract (no I/O). **Implemented.** |
-| `draco-net` | Stealth TLS/JA4 HTTP client (wreq). *Stub → WS-A.* |
-| `draco-static` | Tier 0 static + Tier 1 build-id extraction. *Stub → WS-B.* |
-| `draco-jail` | Sandbox supervisor + child (netns/Landlock/seccomp). *Stub → Slice 2.* |
-| `draco-runtime` | Tier 2 V8 isolate + interceptor. *Stub → Slice 3.* |
-| `draco-core` | Escalation state machine + ranking + replay. *Stub → WS-C.* |
-| `draco-cli` | `draco` CLI + output contract. *Stub → WS-D.* |
+| `draco-types` | Frozen wire + result contract (no I/O) |
+| `draco-net` | Stealth TLS/JA4 HTTP client (wreq/BoringSSL): cookie jar, proxy, robots, backoff |
+| `draco-static` | Tier 0 static extraction + Tier 1 build-id replay |
+| `draco-jail` | Sandbox supervisor + jailed child: userns/netns air-gap, Landlock, two-phase seccomp, IPC codec |
+| `draco-runtime` | Tier 2 V8 isolate (jitless), DOM + scheduler polyfill, `fetch`/`XHR` interception, capture window |
+| `draco-core` | Escalation state machine, challenge short-circuit, ranking policy, replay |
+| `draco-cli` | The `draco` CLI + output contract |
 
-## Status: Slice 0
+## Feature flags
 
-The workspace compiles green; `draco-types` is fully implemented with
-round-trip tests. All other crates are compiling skeletons with frozen public
-signatures and `todo!()` bodies, ready for parallel implementation.
+- **default (`tier2`)** — the full engine, including the jailed V8 runtime.
+- **`--no-default-features`** — a lean Tier 0/1 build with **no V8 and no jail
+  linked** (smaller, faster to build); Tier 2 reports `unsupported`.
 
 ```sh
-cargo build --workspace
-cargo test  -p draco-types
+cargo build -p draco-cli --no-default-features   # lean, V8-free
 ```
+
+## Security model (Tier 2)
+
+Untrusted page JS is only ever evaluated inside a child process that is
+network-air-gapped (user + network namespace, no interfaces), filesystem-locked
+(Landlock), and syscall-filtered (two-phase seccomp-bpf, default `KILL`). V8 runs
+`--jitless --single-threaded` so no executable memory is needed and `mprotect`
+with `PROT_EXEC` is denied. The child only ever *reports* the API request it
+intercepted; the air-gapped supervisor replays it. On non-Linux (or with
+`--no-jail`) Tier 2 runs **un-jailed with a loud warning** — dev use only.
+
+Draco v0.1 deliberately does **not** defeat JS challenge walls
+(Cloudflare/DataDome/…); those short-circuit to `needs_browser`.
+
+### Validation status
+
+The full un-jailed Tier 2 pipeline (fetch → V8 capture → rank → replay) is
+covered by the test suite, including a **real Vue 3 bundle** that hydrates in the
+isolate and leaks its data fetch. The jail's *runtime enforcement* (seccomp
+kills, netns, Landlock) requires a real kernel (≥ 5.13 + unprivileged userns) and
+is validated per **[docs/BARE_METAL_VALIDATION.md](docs/BARE_METAL_VALIDATION.md)**.
 
 ## Platforms (v0.1)
 
 `x86_64-unknown-linux-gnu` (primary, full jail) and `aarch64-apple-darwin`
-(dev; Tier 2 runs un-jailed with a warning). The jail's seccomp/Landlock/netns
-layers are Linux-only and need kernel ≥ 5.13 + unprivileged user namespaces.
+(dev; Tier 2 runs un-jailed). The jail's seccomp/Landlock/netns layers are
+Linux-only.
 
-## Planned CI gates
+## Development
 
-`cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, and `cargo-deny`
-(licenses + advisories — to be wired once the dependency set stabilizes).
+```sh
+cargo test --workspace                                  # full suite
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
+
+## Compliance & intended use
+
+Draco is for public data, properties you operate, and APIs you're permitted to
+use. Defaults are polite (robots.txt respected, per-host rate limiting, bounded
+retries). JA4/TLS emulation is for compatibility, not to defeat authentication or
+access controls. You are responsible for compliance with target sites' Terms of
+Service and applicable law.
+
+## License
+
+MIT OR Apache-2.0.
