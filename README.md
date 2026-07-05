@@ -147,6 +147,45 @@ Concurrency is bounded (`--max-concurrency`, default 8); excess requests queue.
 Warm-process SPA hydration answers in ~150 ms end-to-end on the local benchmark
 fixture (fetch → hydrate → serialize → Markdown).
 
+Beyond scraping, the daemon speaks two more Firecrawl endpoints:
+
+- **`POST /v1/map`** — fast site URL discovery: merges `/sitemap.xml` (sitemap
+  indexes followed one level) with the page's own links; same-host filtered
+  (`includeSubdomains` opt-in), deduped, `search`-filtered, `limit`-capped.
+  ```sh
+  curl -X POST localhost:3002/v1/map -H 'content-type: application/json' \
+    -d '{"url": "https://docs.example.com", "search": "guide"}'
+  # → { "success": true, "links": [ … ] }
+  ```
+- **`POST /v1/crawl`** — async crawl jobs: a bounded same-host BFS (`limit`
+  default 10, cap 100; `maxDepth` default 2; `includePaths`/`excludePaths`
+  path filters) where every page runs the full extraction ladder — crawled
+  SPAs hydrate like single scrapes. Frontier links are harvested from each
+  page's Markdown (already absolutized; JS-injected links included when the
+  render escalation ran). Poll `GET /v1/crawl/{id}` for
+  `{ status, total, completed, data: [ per-page results ] }`; `DELETE` cancels.
+  Jobs are in-memory and share the daemon's concurrency budget.
+
+### MCP server (`draco mcp` / `POST /mcp`)
+
+Draco's scraping is available as **Model Context Protocol tools** for agent
+clients (Claude Desktop/Code, editors, orchestrators):
+
+```sh
+draco mcp                        # stdio transport (newline-delimited JSON-RPC)
+```
+
+```json
+{ "mcpServers": { "draco": { "command": "draco", "args": ["mcp", "--no-jail"] } } }
+```
+
+The same server is bound on the daemon at `POST /mcp` (minimal Streamable-HTTP
+subset: single-message POST → single JSON response, `202` for notifications).
+One tool today: `draco_scrape` (`url`, `formats: ["markdown"|"json"]`,
+`tierMax`, `captureWindowMs`, `timeout`, `ignoreRobots`) — annotated read-only.
+Tool-level failures come back as `isError` results the model can react to;
+protocol misuse is a proper JSON-RPC error.
+
 ## Workspace layout
 
 | Crate | Role |
