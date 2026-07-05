@@ -3,6 +3,20 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.6.1] — 2026-07-06
+
+### Changed
+- **ES-module import extraction now uses the Oxc parse-once AST** instead of
+  regex. The supervisor's module-graph crawl (`extract_module_imports`) parses
+  each fetched module with `oxc_parser` and reads its `ModuleRecord` — static
+  `import`/`export … from` / `export * from` (the requested-module specifiers)
+  plus dynamic `import("…")` string literals. A real parse means specifiers
+  inside string literals or comments are never matched, and computed
+  `import(expr)` is correctly ignored — eliminating the regex over-matching. Oxc
+  error-recovery keeps extraction working on partial/odd bundles. (`<script src>`
+  discovery in HTML stays a regex; the Oxc path is JS-only.) tier2-gated; the lean
+  build pulls in no Oxc crates.
+
 ## [0.6.0] — 2026-07-06
 
 **ES-module & external-script apps now hydrate.** Previously the Tier 2 isolate
