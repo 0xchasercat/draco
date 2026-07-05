@@ -14,8 +14,13 @@ path = "src/main.rs"
 # (deno_core/V8). With `--no-default-features` the CLI builds V8-free: the
 # `__jail` re-exec hook and the Tier 2 branch compile out, and Tier 2 finalizes
 # `Unsupported`. Both configurations MUST build (canonical §4).
-default = ["tier2"]
+default = ["tier2", "serve"]
 tier2 = ["draco-core/tier2"]
+# DEFAULT ON. `draco serve` — the persistent daemon with the Firecrawl-compatible
+# REST API (axum). Independent of `tier2`: a lean serve build (`--no-default-features
+# --features serve`) exposes the same API with the ladder capped at the static
+# tiers. `--no-default-features` drops both, keeping the minimal CLI axum-free.
+serve = ["dep:axum", "dep:serde", "tokio/net", "tokio/signal", "tokio/sync"]
 
 # draco-core is brought in as a DIRECT path dep (not `workspace = true`) with
 # default-features off, so the CLI's own `tier2` feature is the single switch that
@@ -32,3 +37,10 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 # WS-D adds: serde_json_path (for --extract) per canonical doc §12 & §14.
 serde_json_path = "0.7"
+# `serve` feature: the daemon's HTTP layer.
+axum = { version = "0.8", optional = true }
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Router-level tests drive handlers via `oneshot` (no sockets).
+tower = { version = "0.5", features = ["util"] }
