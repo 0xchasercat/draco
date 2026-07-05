@@ -845,12 +845,14 @@ dependencies = [
  "axum",
  "clap",
  "draco-core",
+ "draco-net",
  "draco-types",
  "serde",
  "serde_json",
  "serde_json_path",
  "tokio",
  "tower",
+ "url",
 ]
 
 [[package]]

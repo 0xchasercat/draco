@@ -20,7 +20,18 @@ tier2 = ["draco-core/tier2"]
 # REST API (axum). Independent of `tier2`: a lean serve build (`--no-default-features
 # --features serve`) exposes the same API with the ladder capped at the static
 # tiers. `--no-default-features` drops both, keeping the minimal CLI axum-free.
-serve = ["dep:axum", "dep:serde", "tokio/net", "tokio/signal", "tokio/sync"]
+serve = [
+    "dep:axum",
+    "dep:serde",
+    "dep:draco-net",
+    "dep:url",
+    "tokio/net",
+    "tokio/signal",
+    "tokio/sync",
+    "tokio/io-std",
+    "tokio/io-util",
+    "tokio/time",
+]
 
 # draco-core is brought in as a DIRECT path dep (not `workspace = true`) with
 # default-features off, so the CLI's own `tier2` feature is the single switch that
@@ -37,9 +48,11 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 # WS-D adds: serde_json_path (for --extract) per canonical doc §12 & §14.
 serde_json_path = "0.7"
-# `serve` feature: the daemon's HTTP layer.
+# `serve` feature: the daemon's HTTP layer + map/crawl discovery + MCP.
 axum = { version = "0.8", optional = true }
 serde = { workspace = true, optional = true }
+draco-net = { workspace = true, optional = true }
+url = { version = "2", optional = true }
 
 [dev-dependencies]
 # Router-level tests drive handlers via `oneshot` (no sockets).
