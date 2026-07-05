@@ -112,6 +112,41 @@ JS itself still performs zero I/O.
 A thin shell that can't be improved (hydration adds nothing, or the isolate is
 unavailable) falls back to the static shell — never a crash, never a regression.
 
+### Daemon mode (`draco serve`)
+
+Run Draco as a **persistent HTTP daemon with a Firecrawl-compatible REST API** —
+the process stays warm (no per-scrape binary spawn), and existing Firecrawl
+clients can point at it unchanged:
+
+```sh
+draco serve                    # http://127.0.0.1:3002 (Firecrawl's default port)
+draco serve --host 0.0.0.0 --port 8080 --max-concurrency 16
+```
+
+```sh
+curl -X POST http://127.0.0.1:3002/v1/scrape \
+  -H 'content-type: application/json' \
+  -d '{"url": "https://spa.example.com", "formats": ["markdown"]}'
+# → { "success": true, "data": { "markdown": …, "metadata": { "title", "sourceURL", … } } }
+```
+
+- `formats`: `"markdown"` (default) and/or `"json"` (the tiered JSON-API
+  extraction, under `data.json`). Formats Draco doesn't produce yet (`html`,
+  `rawHtml`, `links`, `screenshot`) are rejected with a clear `400`.
+- Unknown Firecrawl fields (`onlyMainContent`, `waitFor`, …) are accepted and
+  ignored; failures use the `{ "success": false, "error": … }` envelope
+  (`502` upstream/network, `422` unsupported target, `400` bad request).
+- Draco extensions per request: `tierMax`, `captureWindowMs`, `noJail`,
+  `allowUnsafeReplay`, `ignoreRobots`, `proxy` — plus `timeout` (Firecrawl's).
+  Server-wide defaults come from the `draco serve` flags.
+- Every response carries a `draco` object (`sourceTier`, `timing`, `trace`) —
+  the same honest execution report as the CLI envelope.
+- `GET /health` → `{ "status": "ok", "version": … }`.
+
+Concurrency is bounded (`--max-concurrency`, default 8); excess requests queue.
+Warm-process SPA hydration answers in ~150 ms end-to-end on the local benchmark
+fixture (fetch → hydrate → serialize → Markdown).
+
 ## Workspace layout
 
 | Crate | Role |
@@ -126,14 +161,17 @@ unavailable) falls back to the static shell — never a crash, never a regressio
 
 ## Feature flags
 
-- **default (`tier2`)** — everything, including the V8 isolate for `--format json`
-  runtime interception.
-- **`--no-default-features`** — a lean build with **no V8/jail linked**. Markdown
-  scraping and static/build-id JSON extraction still work; runtime interception
-  reports `unsupported`. Smaller binary, faster build.
+- **default (`tier2`, `serve`)** — everything: the V8 isolate for `--format json`
+  runtime interception / render-then-Markdown, plus the `draco serve` daemon.
+- **`serve`** — the persistent HTTP daemon (axum). Independent of `tier2`:
+  `--no-default-features --features serve` exposes the same REST API with the
+  ladder capped at the static tiers.
+- **`--no-default-features`** — a lean build with **no V8/jail/axum linked**.
+  Markdown scraping and static/build-id JSON extraction still work; runtime
+  interception reports `unsupported`. Smaller binary, faster build.
 
 ```sh
-cargo build -p draco-cli --no-default-features   # lean, V8-free
+cargo build -p draco-cli --no-default-features   # lean, V8-free, axum-free
 ```
 
 ## Security model (only relevant to `--format json` Tier 2)
