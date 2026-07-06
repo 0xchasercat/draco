@@ -3,6 +3,46 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.11.0] — 2026-07-06
+
+### Added
+- **Content formats `html`, `rawHtml`, `links`** — the scrape surface is now a
+  true multi-select `formats` set, not a three-way choice. `html` is the cleaned,
+  absolutized main-content HTML (the same DOM pre-processing that feeds the
+  Markdown transform); `rawHtml` is the unmodified fetched body; `links` is every
+  absolutized `<a href>` on the page. All compose with `markdown`/`json`/
+  `endpoints` in one request. On a client-rendered page, `html`/`links` reflect
+  the hydrated DOM when the render escalation wins (`rawHtml` stays the raw fetch).
+- **`onlyMainContent` and `waitFor`** are now honored (previously accepted and
+  ignored). `onlyMainContent` (default `true`) toggles boilerplate stripping for
+  `markdown`/`html`; `waitFor` is a Firecrawl-style alias for the Tier 2 capture
+  window (`captureWindowMs` wins if both are given).
+- **CLI verbs mirror the REST/MCP surface**: `draco discover <url>` (≙
+  `POST /v1/discover`) and `draco map <url>` (≙ `POST /v1/map`) join `draco scrape`.
+
+### Changed
+- **`draco extract` is renamed to `draco scrape`** to match `POST /v1/scrape` —
+  point-of-parity with Firecrawl clients. The old `extract` verb is **removed**
+  (no alias). `--format` is now **repeatable** and accepts `markdown`, `html`,
+  `raw-html`, `links`, `json`, `endpoints` (plus `both` as `markdown`+`json`).
+- **Crawl `includePaths`/`excludePaths` are now regex** matched against the URL
+  pathname (Firecrawl semantics), with `regexOnFullURL` to match the full URL —
+  previously they were case-sensitive substring matches (a drop-in-compat bug).
+- **Map** now discovers sitemaps from `robots.txt` `Sitemap:` directives, honors
+  `ignoreSitemap`/`sitemapOnly`, defaults `includeSubdomains` to `true`, and
+  raises the `limit` cap to 100000 — Firecrawl parity.
+- Formats the DOM-only engine cannot produce (`screenshot`, `screenshot@fullPage`,
+  `actions`, and the not-yet-implemented `extract`/`changeTracking`/`summary`/
+  `branding`/`product`/`menu`) now return a clear **HTTP 422** ("needs a browser")
+  rather than a generic 400 — an unrecognized token is still a 400. Unknown request
+  fields remain accepted-and-ignored for drop-in compatibility.
+
+### Fixed
+- The lean (`--no-default-features`) build no longer fails to compile: the Tier 2
+  `try_tier2` lacked its `#[cfg(feature = "tier2")]` gate and collided with the
+  lean stub. (Pre-existing since ≤v0.10.0; masked because gates only built the
+  default feature set.)
+
 ## [0.10.0] — 2026-07-06
 
 ### Added
