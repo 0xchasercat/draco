@@ -847,6 +847,7 @@ dependencies = [
  "draco-core",
  "draco-net",
  "draco-types",
+ "regex",
  "serde",
  "serde_json",
  "serde_json_path",
