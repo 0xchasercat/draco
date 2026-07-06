@@ -491,7 +491,15 @@ async fn run_capture_inner_with_resources(
                 Err(e) => eprintln!("draco-runtime: bad module specifier for script {i}: {e}"),
             }
         } else {
-            let name = format!("draco:page[{i}]");
+            // Use an absolute script name so dynamic `import("./chunk.js")` inside
+            // a classic inline script resolves against the page URL. A synthetic
+            // non-hierarchical name like `draco:page[0]` becomes a cannot-be-a-base
+            // referrer and breaks SvelteKit/Vite bootstraps.
+            let name = if script.inline {
+                spec_str.clone()
+            } else {
+                format!("draco:page[{i}]")
+            };
             if let Err(e) = runtime.execute_script(name, source) {
                 threw_in_page = true;
                 eprintln!("draco-runtime: page script {i} threw: {e}");
@@ -1129,6 +1137,31 @@ mod tests {
             Some("module")
         );
         assert_eq!(attr_value("<script>", "type"), None);
+    }
+
+    #[test]
+    fn classic_inline_dynamic_import_resolves_against_page_url() {
+        let html = r#"<script>
+            import("./entry.js").then((m) => m.run());
+        </script>"#;
+        let mut resources = HashMap::new();
+        resources.insert(
+            "https://example.com/app/entry.js".to_string(),
+            br#"export function run() { fetch("./api/data"); }"#.to_vec(),
+        );
+        let report = run_capture_with_resources(
+            "https://example.com/app/",
+            html,
+            &CaptureConfig {
+                capture_window_ms: 500,
+                quiesce_ms: 20,
+                max_intercepts: 8,
+                stub_response_json: "{}".to_string(),
+            },
+            resources,
+        );
+        assert_eq!(report.requests.len(), 1, "{report:?}");
+        assert_eq!(report.requests[0].url, "https://example.com/app/api/data");
     }
 
     #[test]
