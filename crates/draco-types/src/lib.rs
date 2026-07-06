@@ -293,6 +293,13 @@ pub enum SupervisorToJail {
         /// JSON `op_raze_fetch` resolves with, to keep hydration going (default `"{}"`).
         stub_response_json: String,
     },
+    /// Response to a child `LoadScript` request. The frame body carries raw JS
+    /// source when `ok`; missing/non-2xx/fetch-error is reported as `ok=false`.
+    Script {
+        id: u32,
+        ok: bool,
+        url: String,
+    },
     Shutdown,
 }
 
@@ -312,6 +319,13 @@ pub enum JailToSupervisor {
         headers: Vec<(String, String)>,
         has_body: bool,
         via: InterceptVia,
+    },
+    /// Request a dynamically appended script chunk from the supervisor. The child
+    /// remains air-gapped; the supervisor decides whether/how to fetch and replies
+    /// with `SupervisorToJail::Script` carrying source bytes or a miss.
+    LoadScript {
+        id: u32,
+        url: String,
     },
     /// Terminal report for a `Hydrate`.
     Result {
