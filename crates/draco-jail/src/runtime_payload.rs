@@ -4,24 +4,36 @@
 //! payload the jailed child runs once its sandbox is armed. The flow mirrors the
 //! frozen IPC contract (canonical §6) and the jail-child-per-hydrate model:
 //!
-//! 1. Announce readiness with [`JailToSupervisor::Ready`].
-//! 2. Read **one** [`SupervisorToJail::Hydrate`] frame — its body carries the raw
-//!    page HTML.
+//! 1. Announce readiness with [`JailToSupervisor::Ready`] (once, at boot).
+//! 2. Read a [`SupervisorToJail::Hydrate`] frame — its body carries the raw
+//!    page HTML (preceded by zero or more `Resource` frames).
 //! 3. Map the Hydrate fields onto a [`draco_runtime::CaptureConfig`] and call
-//!    [`draco_runtime::run_capture`], which boots a V8 isolate, evaluates the
-//!    page's inline scripts, and returns every fetch/XHR the SPA attempted.
+//!    [`draco_runtime::run_capture_with_resources`], which boots a **fresh** V8
+//!    isolate, evaluates the page's scripts, and returns every fetch/XHR the
+//!    SPA attempted.
 //! 4. Stream one [`JailToSupervisor::Intercept`] per [`CapturedRequest`] (the
 //!    request body, if any, rides that frame's body), then a terminal
-//!    [`JailToSupervisor::Result`], then return so the process exits.
+//!    [`JailToSupervisor::Result`].
+//! 5. **Loop back to step 2** for the next job, until a `Shutdown` frame (or a
+//!    clean channel EOF) closes the worker.
 //!
-//! ## Why one capture per process
+//! ## Warm worker: many captures per process, fresh isolate each
 //!
-//! [`draco_runtime::run_capture`] builds its **own** current-thread tokio runtime
-//! internally and sets V8 flags process-globally exactly once. Calling it twice
-//! in one process is unsupported (V8 flags are latched; a fresh isolate per
-//! process is the design). The supervisor therefore spawns a new jailed child for
-//! every `Hydrate`, and this payload handles a single one and exits. A `Shutdown`
-//! (or a clean channel EOF) before any `Hydrate` is an orderly no-op close.
+//! The child is a **reusable warm worker**: it pays the process spawn + sandbox
+//! arming cost once, then services many `Hydrate` jobs over its lifetime. Each
+//! job gets a pristine isolate — [`draco_runtime::run_capture_with_resources`]
+//! builds a fresh current-thread tokio runtime and a fresh snapshot-restored
+//! `JsRuntime` per call (V8 flags are latched once behind a `Once`, so repeated
+//! calls are safe and verified not to bleed state between isolates). This is the
+//! child side of the daemon's warm isolate pool: the supervisor keeps a set of
+//! these workers idle and dispatches a job to one, amortizing the ~fork+exec +
+//! seccomp/namespace arming + first snapshot restore across every scrape rather
+//! than paying it per scrape.
+//!
+//! The accumulated `Resource` map is **cleared between jobs**, so one page's
+//! prefetched subresources can never resolve for the next. A `Shutdown` (or EOF)
+//! before any `Hydrate` is an orderly no-op close; the supervisor also sends
+//! `Shutdown` to recycle a worker after a bounded number of jobs.
 //!
 //! ## Threading / async
 //!
@@ -130,10 +142,11 @@ pub fn run_capture_loop(
         )?;
     }
 
-    // Read control frames until Hydrate (or Shutdown / EOF). `Resource` frames
-    // arrive first, carrying the supervisor-prefetched script subresources; we
+    // Service jobs until Shutdown / EOF. `Resource` frames arrive before each
+    // `Hydrate`, carrying the supervisor-prefetched script subresources; we
     // accumulate them into the `{url -> source}` map the isolate's module loader
-    // serves. A capture is once-per-process, so we do not loop over Hydrates.
+    // serves, and clear it after each job so no page's subresources leak into
+    // the next.
     let mut resources: HashMap<String, Vec<u8>> = HashMap::new();
     loop {
         let msg = match frame::read_supervisor_frame(&mut stream) {
@@ -164,12 +177,14 @@ pub fn run_capture_loop(
                     stub_response_json,
                 };
 
-                // capture() owns its OWN current-thread tokio runtime and inits V8
-                // flags process-globally. We are plain sync here — do NOT wrap it.
-                let report = capture(&url, &html, &cfg, resources);
+                // capture() builds its OWN current-thread tokio runtime and a
+                // fresh snapshot-restored isolate per call (V8 flags latched once
+                // behind a `Once`). We are plain sync here — do NOT wrap it.
+                let report = capture(&url, &html, &cfg, std::mem::take(&mut resources));
                 emit_report(&mut stream, report)?;
-                // One capture per process: return so the child exits.
-                return Ok(());
+                // Job done. Loop for the next one; the resource map was consumed
+                // by `capture` (via `take`), so the next job starts with a clean
+                // slate.
             }
             SupervisorToJail::Shutdown => return Ok(()),
         }
@@ -201,8 +216,8 @@ fn capture(
     tests::CANNED
         .lock()
         .unwrap()
-        .take()
-        .expect("test must queue a canned CaptureReport before Hydrate")
+        .pop_front()
+        .expect("test must queue a canned CaptureReport before each Hydrate")
 }
 
 /// Serialize a [`CaptureReport`] onto the wire: one `Intercept` per captured
@@ -261,17 +276,28 @@ mod tests {
     use super::*;
     use crate::frame::{read_jail_frame, write_supervisor_frame};
     use draco_types::{InterceptVia, RuntimeOutcome};
+    use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::thread;
 
-    // The canned report the `#[cfg(test)]` `capture()` above hands back.
-    pub(super) static CANNED: Mutex<Option<CaptureReport>> = Mutex::new(None);
-    // Serializes the tests that queue a canned report, so parallel test threads
-    // cannot cross-consume each other's `CANNED` slot.
+    // The queue of canned reports the `#[cfg(test)]` `capture()` above pops, one
+    // per serviced `Hydrate` — a queue (not a single slot) so a multi-job test
+    // can pre-load one report per job the looping worker will service.
+    pub(super) static CANNED: Mutex<VecDeque<CaptureReport>> = Mutex::new(VecDeque::new());
+    // Serializes the tests that queue canned reports, so parallel test threads
+    // cannot cross-consume each other's reports.
     static CAPTURE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn set_canned(report: CaptureReport) {
-        *CANNED.lock().unwrap() = Some(report);
+        let mut q = CANNED.lock().unwrap();
+        q.clear();
+        q.push_back(report);
+    }
+
+    fn queue_canned(reports: Vec<CaptureReport>) {
+        let mut q = CANNED.lock().unwrap();
+        q.clear();
+        q.extend(reports);
     }
 
     fn cap(url: &str, via: InterceptVia, body: Option<&str>) -> CapturedRequest {
@@ -371,6 +397,89 @@ mod tests {
         // No rendered DOM in this report → empty Result body.
         assert!(result.body.is_empty(), "expected empty Result body");
 
+        drop(sup);
+        child_handle.join().unwrap().unwrap();
+    }
+
+    /// The warm-worker contract: one `Ready`, then the worker services **many**
+    /// `Hydrate` jobs over its lifetime (each with its own terminal `Result`),
+    /// and the per-job `Resource` map does not leak between jobs. Closing the
+    /// channel ends the worker cleanly.
+    #[test]
+    fn worker_services_multiple_jobs_until_eof() {
+        let _guard = CAPTURE_TEST_LOCK.lock().unwrap();
+        // One canned report per job the worker will service.
+        queue_canned(vec![
+            CaptureReport {
+                outcome: RuntimeOutcome::Quiesced,
+                requests: vec![cap("https://x.com/api/1", InterceptVia::Fetch, None)],
+                rendered_html: None,
+            },
+            CaptureReport {
+                outcome: RuntimeOutcome::NoIntercepts,
+                requests: vec![],
+                rendered_html: Some("<html><body>job 2</body></html>".into()),
+            },
+            CaptureReport {
+                outcome: RuntimeOutcome::Quiesced,
+                requests: vec![cap("https://x.com/api/3", InterceptVia::Xhr, Some("{}"))],
+                rendered_html: None,
+            },
+        ]);
+
+        let (sup, child) = UnixStream::pair().unwrap();
+        let child_handle = thread::spawn(move || run_capture_loop(child, None));
+        let mut sup = sup;
+
+        // One Ready at boot — NOT once per job.
+        let ready = read_jail_frame(&mut sup).unwrap();
+        assert!(matches!(ready.header, JailToSupervisor::Ready { .. }));
+
+        // Three back-to-back jobs on the SAME worker. Each job: a Resource frame
+        // (proving the map is accepted + cleared per job), a Hydrate, then the
+        // job's Intercepts + terminal Result.
+        let expected_counts = [1u32, 0, 1];
+        for (job, &count) in expected_counts.iter().enumerate() {
+            write_supervisor_frame(
+                &mut sup,
+                &SupervisorToJail::Resource {
+                    url: format!("https://x.com/job{job}.js"),
+                },
+                b"// prefetched source",
+            )
+            .unwrap();
+            write_supervisor_frame(
+                &mut sup,
+                &SupervisorToJail::Hydrate {
+                    url: format!("https://x.com/page{job}"),
+                    capture_window_ms: 500,
+                    quiesce_ms: 50,
+                    max_intercepts: 8,
+                    stub_response_json: "{}".into(),
+                },
+                b"<html></html>",
+            )
+            .unwrap();
+
+            // Drain this job's Intercepts, then its terminal Result.
+            let mut seen = 0u32;
+            loop {
+                let f = read_jail_frame(&mut sup).unwrap();
+                match f.header {
+                    JailToSupervisor::Intercept { .. } => seen += 1,
+                    JailToSupervisor::Result {
+                        intercept_count, ..
+                    } => {
+                        assert_eq!(intercept_count, count, "job {job} intercept count");
+                        assert_eq!(seen, count, "job {job} streamed Intercepts");
+                        break;
+                    }
+                    other => panic!("job {job}: unexpected {other:?}"),
+                }
+            }
+        }
+
+        // Closing the channel ends the worker cleanly (no Shutdown needed).
         drop(sup);
         child_handle.join().unwrap().unwrap();
     }

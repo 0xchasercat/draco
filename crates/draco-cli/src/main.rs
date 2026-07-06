@@ -131,6 +131,14 @@ enum Command {
         /// Maximum concurrent extractions; excess requests queue.
         #[arg(long, default_value_t = 8)]
         max_concurrency: usize,
+        /// Warm Tier 2 isolate workers to keep pooled (0 = auto, ≈ CPU count).
+        /// Reused across requests so each scrape skips the jail-spawn + snapshot
+        /// cost; also caps concurrent isolates.
+        #[arg(long, default_value_t = 0)]
+        isolate_pool_size: usize,
+        /// Recycle a pooled worker after this many captures (leak hygiene).
+        #[arg(long, default_value_t = 100)]
+        isolate_max_jobs: u32,
         /// Default total request timeout (ms); per-request `timeout` overrides.
         #[arg(long, default_value_t = 30_000)]
         timeout: u64,
@@ -379,6 +387,8 @@ async fn async_main() {
             host,
             port,
             max_concurrency,
+            isolate_pool_size,
+            isolate_max_jobs,
             timeout,
             tier_max,
             capture_window_ms,
@@ -401,10 +411,21 @@ async fn async_main() {
                 strict_sandbox,
                 allow_unsafe_replay: false,
             };
+            // Pool size 0 → auto: the available parallelism (CPU count), a sane
+            // cap on concurrent isolates. Fall back to 4 if it can't be probed.
+            let isolate_pool_size = if isolate_pool_size == 0 {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            } else {
+                isolate_pool_size
+            };
             let opts = serve::ServeOptions {
                 host,
                 port,
                 max_concurrency,
+                isolate_pool_size,
+                isolate_max_jobs,
                 defaults,
             };
             if let Err(e) = serve::serve(opts).await {

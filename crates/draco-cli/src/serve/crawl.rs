@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use draco_core::{extract, Config, OutputFormat};
+use draco_core::{extract_with_pool, Config, OutputFormat};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use url::Url;
@@ -350,7 +350,7 @@ async fn run_crawl(state: Arc<AppState>, id: String, plan: CrawlPlan) {
             let Ok(_permit) = state.gate.acquire().await else {
                 break; // Gate closed: daemon shutting down.
             };
-            let result = extract(&page_url, &plan.config).await;
+            let result = extract_with_pool(&page_url, &plan.config, &state.tier2_pool).await;
             let (code, mut body) = to_firecrawl(&result, plan.format);
             if code == StatusCode::OK {
                 Some((body["data"].take(), result.markdown))
@@ -531,6 +531,7 @@ mod tests {
                 ..Config::default()
             },
             gate: Semaphore::new(2),
+            tier2_pool: draco_core::Tier2Pool::new(1, 100, true, false),
             crawl: JobStore::default(),
         })
     }
