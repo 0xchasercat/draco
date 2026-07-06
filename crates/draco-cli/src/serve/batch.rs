@@ -69,6 +69,9 @@ pub(crate) struct BatchRequest {
     ignore_robots: Option<bool>,
     #[serde(default)]
     proxy: Option<String>,
+    /// Optional webhook (bare URL string or object) for lifecycle events.
+    #[serde(default)]
+    webhook: Option<super::webhook::WebhookSpec>,
 }
 
 pub(crate) async fn start_handler(
@@ -153,7 +156,8 @@ pub(crate) async fn start_handler(
     };
 
     let id = state.batch.create_with_total(valid.len());
-    tokio::spawn(run_batch(state.clone(), id.clone(), valid, config));
+    let sink = super::webhook::WebhookSink::new(req.webhook, id.clone(), "batch_scrape");
+    tokio::spawn(run_batch(state.clone(), id.clone(), valid, config, sink));
 
     let mut body = json!({
         "success": true,
@@ -219,12 +223,23 @@ pub(crate) async fn cancel_handler(
 /// The batch worker: dispatch every URL as a task that acquires the daemon gate
 /// before extracting, so concurrency is bounded by `--max-concurrency`. Records
 /// each result (or error) as it finishes; a cancelled job stops dispatching.
-async fn run_batch(state: Arc<AppState>, id: String, urls: Vec<String>, config: Config) {
+async fn run_batch(
+    state: Arc<AppState>,
+    id: String,
+    urls: Vec<String>,
+    config: Config,
+    sink: super::webhook::WebhookSink,
+) {
+    use super::webhook::WebhookEvent;
+    let sink = Arc::new(sink);
+    sink.emit(WebhookEvent::Started, json!([]));
+
     let mut set = tokio::task::JoinSet::new();
     for url in urls {
         let state = state.clone();
         let id = id.clone();
         let config = config.clone();
+        let sink = sink.clone();
         set.spawn(async move {
             if state.batch.is_cancelled(&id) {
                 return;
@@ -243,7 +258,9 @@ async fn run_batch(state: Arc<AppState>, id: String, urls: Vec<String>, config: 
             }
             let (code, mut body) = to_firecrawl(&result);
             if code == StatusCode::OK {
-                state.batch.record_page(&id, Some(body["data"].take()));
+                let doc = body["data"].take();
+                sink.emit(WebhookEvent::Page, json!([doc.clone()]));
+                state.batch.record_page(&id, Some(doc));
             } else {
                 let msg = body["error"]
                     .as_str()
@@ -255,7 +272,13 @@ async fn run_batch(state: Arc<AppState>, id: String, urls: Vec<String>, config: 
         });
     }
     while set.join_next().await.is_some() {}
-    state.batch.finish(&id);
+
+    // Terminal event: completed / failed. Cancelled (or unknown) fires neither.
+    match state.batch.finish(&id) {
+        Some(super::jobs::JobStatus::Completed) => sink.emit(WebhookEvent::Completed, json!([])),
+        Some(super::jobs::JobStatus::Failed) => sink.emit(WebhookEvent::Failed, json!([])),
+        _ => {}
+    }
 }
 
 #[cfg(test)]

@@ -193,6 +193,17 @@ Beyond scraping, the daemon speaks two more Firecrawl endpoints:
   Poll `GET /v1/batch/scrape/{id}` (paginated `?skip=&limit=`, `next` when more
   remains) for `{ status, total, completed, creditsUsed, expiresAt, next, data }`;
   `GET /v1/batch/scrape/{id}/errors` lists per-URL failures; `DELETE` cancels.
+- **Webhooks** — crawl and batch requests accept a `webhook` (a bare URL string
+  or `{ url, headers, metadata, events }`). The job fires `started`, `page`
+  (with the scraped document), `completed`, and `failed` events — payload
+  `{ success, type, id, data, metadata }`, `type` prefixed by job kind
+  (`crawl.page`, `batch_scrape.completed`). Delivery is fire-and-forget with a
+  10s deadline and +1/+5/+15min retries; the endpoint is never robots-gated.
+
+  ```sh
+  curl -X POST localhost:3002/v1/crawl -H 'content-type: application/json' \
+    -d '{"url": "https://site.example", "webhook": "https://my.app/hook"}'
+  ```
 
 ### API discovery/replay (`endpoints` / `POST /v1/discover`)
 

@@ -3,6 +3,22 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.13.0] — 2026-07-06
+
+### Added
+- **Webhooks** for crawl and batch scrape. A request may carry a `webhook` — a
+  bare URL string or `{ url, headers, metadata, events }` — and the job fires
+  Firecrawl's four lifecycle events: `started`, `page` (with the scraped
+  `Document`), `completed`, and `failed`. The `events` filter uses bare names;
+  the delivered payload's `type` is prefixed by job kind (`crawl.page`,
+  `batch_scrape.completed`, …). Payloads are
+  `{ success, type, id, data, metadata }`, `metadata` echoing the config's.
+  - Delivery is fire-and-forget (a slow/dead endpoint never stalls the job),
+    `POST`ed as JSON via the pooled client with a 10s deadline, retried at
+    +1min / +5min / +15min on any non-2xx or transport error, then dropped.
+    Custom `headers` are sent on every attempt; the endpoint is never
+    robots-gated.
+
 ## [0.12.1] — 2026-07-06
 
 ### Fixed
