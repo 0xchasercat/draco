@@ -225,6 +225,20 @@ fn scrape_tool_descriptor() -> Value {
                     "type": "integer",
                     "description": "Alias for captureWindowMs: ms to let the page settle (Tier 2)."
                 },
+                "includeTags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "CSS selectors to keep; only matching subtrees survive into markdown/html."
+                },
+                "excludeTags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "CSS selectors to drop before extraction."
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "Extra request headers (name→value) sent with the fetch."
+                },
                 "tierMax": {
                     "type": "integer",
                     "minimum": 0,
@@ -338,6 +352,24 @@ async fn call_tool(
     }
     if let Some(only_main) = args.get("onlyMainContent").and_then(Value::as_bool) {
         config.only_main_content = only_main;
+    }
+    if let Some(arr) = args.get("includeTags").and_then(Value::as_array) {
+        config.include_tags = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+    }
+    if let Some(arr) = args.get("excludeTags").and_then(Value::as_array) {
+        config.exclude_tags = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+    }
+    if let Some(obj) = args.get("headers").and_then(Value::as_object) {
+        config.headers = obj
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect();
     }
     if let Some(t) = args.get("timeout").and_then(Value::as_u64) {
         config.timeout_ms = t;

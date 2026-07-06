@@ -133,6 +133,22 @@ pub fn session_opts(config: &Config) -> SessionOpts {
         delay_ms: config.delay_ms,
         respect_robots: config.respect_robots,
         timeout_ms: config.timeout_ms,
+        headers: config.headers.clone(),
+    }
+}
+
+/// Apply `includeTags`/`excludeTags` to fetched HTML when either is set,
+/// borrowing the original otherwise (the common no-filter case allocates
+/// nothing). `markdown`/`html` derive from this; `rawHtml`/`links` do not.
+fn filter_body<'a>(body: &'a str, config: &Config) -> std::borrow::Cow<'a, str> {
+    if config.include_tags.is_empty() && config.exclude_tags.is_empty() {
+        std::borrow::Cow::Borrowed(body)
+    } else {
+        std::borrow::Cow::Owned(draco_static::content::apply_tag_filters(
+            body,
+            &config.include_tags,
+            &config.exclude_tags,
+        ))
     }
 }
 
@@ -366,8 +382,12 @@ where
     if config.formats.wants_static_content() {
         let t_md = Instant::now();
         let content_type = content_type_of(&resp.meta.headers);
+        // includeTags/excludeTags pre-filter the DOM before extraction; markdown
+        // and html derive from the filtered HTML. `rawHtml` stays the raw fetch
+        // and `links` is harvested from the full page (all links, unfiltered).
+        let filtered = filter_body(&body, config);
         let scraped = statics.scrape(
-            &body,
+            filtered.as_ref(),
             url,
             resp.meta.status,
             &content_type,
@@ -425,7 +445,7 @@ where
         }
         if config.formats.html {
             run.html = Some(draco_static::content::clean_html(
-                &body,
+                filtered.as_ref(),
                 url,
                 config.only_main_content,
             ));
@@ -1145,8 +1165,16 @@ async fn try_render_markdown<F, T>(
     // Merge the shell's real <head> (title, OG, canonical, <base>) with the
     // hydrated <body>, then re-run the identical Firecrawl-parity content engine.
     let merged = draco_static::content::merge_rendered_document(body, rendered);
-    let rescraped =
-        draco_static::content::scrape(&merged, url, status, content_type, config.only_main_content);
+    // Same includeTags/excludeTags pre-filter as the static path, on the
+    // hydrated DOM.
+    let merged_filtered = filter_body(&merged, config);
+    let rescraped = draco_static::content::scrape(
+        merged_filtered.as_ref(),
+        url,
+        status,
+        content_type,
+        config.only_main_content,
+    );
 
     let prev_len = run.markdown.as_deref().map(nonws_len).unwrap_or(0);
     let new_len = nonws_len(&rescraped.markdown);
@@ -1171,7 +1199,7 @@ async fn try_render_markdown<F, T>(
         // the raw fetch). Only when the render actually won.
         if config.formats.html {
             run.html = Some(draco_static::content::clean_html(
-                &merged,
+                merged_filtered.as_ref(),
                 url,
                 config.only_main_content,
             ));
@@ -1632,6 +1660,25 @@ mod tests {
             tier_max,
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn filter_body_borrows_when_no_tags_and_filters_when_set() {
+        let html = r#"<body><nav>menu</nav><main>real content</main></body>"#;
+        // No include/exclude tags → borrow the original untouched.
+        let none = Config::default();
+        let borrowed = filter_body(html, &none);
+        assert!(matches!(borrowed, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(borrowed.as_ref(), html);
+        // excludeTags set → owned, filtered (nav gone, main kept).
+        let cfg = Config {
+            exclude_tags: vec!["nav".to_string()],
+            ..Config::default()
+        };
+        let filtered = filter_body(html, &cfg);
+        assert!(matches!(filtered, std::borrow::Cow::Owned(_)));
+        assert!(!filtered.contains("menu"));
+        assert!(filtered.contains("real content"));
     }
 
     #[tokio::test]
