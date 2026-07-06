@@ -277,6 +277,7 @@ impl MockCapture {
                 outcome: RuntimeOutcome::Quiesced,
                 sandbox_level: Some(Self::MOCK_LEVEL.to_string()),
                 rendered_html: None,
+                logs: Vec::new(),
             }),
             calls: AtomicUsize::new(0),
         }
@@ -291,6 +292,25 @@ impl MockCapture {
                 outcome: RuntimeOutcome::NoIntercepts,
                 sandbox_level: Some(Self::MOCK_LEVEL.to_string()),
                 rendered_html: None,
+                logs: Vec::new(),
+            }),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    /// Capture yields no intercepts but *does* report page-side diagnostics
+    /// (`CaptureResult::logs`) — the "page hydrated to nothing, and here is
+    /// why" case. Drives the `runtime.log` trace-step tests without forking a
+    /// child.
+    pub fn with_logs(logs: Vec<String>) -> Self {
+        Self {
+            result: Ok(CaptureResult {
+                candidates: Vec::new(),
+                bodies: Vec::new(),
+                outcome: RuntimeOutcome::NoIntercepts,
+                sandbox_level: Some(Self::MOCK_LEVEL.to_string()),
+                rendered_html: None,
+                logs,
             }),
             calls: AtomicUsize::new(0),
         }
@@ -308,6 +328,7 @@ impl MockCapture {
                 outcome: RuntimeOutcome::Quiesced,
                 sandbox_level: Some(Self::MOCK_LEVEL.to_string()),
                 rendered_html: Some(dom.into()),
+                logs: Vec::new(),
             }),
             calls: AtomicUsize::new(0),
         }

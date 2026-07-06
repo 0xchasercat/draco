@@ -42,6 +42,10 @@ pub(crate) struct DiscoverRequest {
     allow_unsafe_replay: Option<bool>,
     #[serde(default)]
     ignore_robots: Option<bool>,
+    /// Surface Tier 2 page-side diagnostics as `runtime.log` trace steps
+    /// (Draco extension; mirrors the CLI `--runtime-log` flag).
+    #[serde(default)]
+    runtime_log: Option<bool>,
     #[serde(default)]
     proxy: Option<String>,
 }
@@ -82,6 +86,7 @@ pub(crate) async fn discover_handler(
             Some(ignore) => !ignore,
             None => state.defaults.respect_robots,
         },
+        runtime_log: req.runtime_log.unwrap_or(state.defaults.runtime_log),
         ..state.defaults.clone()
     };
 

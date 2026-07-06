@@ -76,6 +76,11 @@ pub(crate) struct CaptureResult {
     /// escalation ([`crate::machine`]); `None` otherwise (empty body, or the
     /// offline mock capture).
     pub rendered_html: Option<String>,
+    /// Page-side runtime diagnostics (glue-swallowed exceptions, console.error
+    /// lines, page-script throws), carried as `Error`-level `Log` frames ahead
+    /// of the terminal `Result`. Bounded child-side; surfaced as `runtime.log`
+    /// trace steps when [`Config::runtime_log`](crate::Config) asks for them.
+    pub logs: Vec<String>,
 }
 
 /// The Tier 2 capture seam: given the page URL + Tier-0 HTML, produce a
@@ -299,6 +304,37 @@ fn effective_capture_window_ms(requested: u64) -> u64 {
     requested.min(MAX_SUPERVISOR_CAPTURE_WINDOW_MS)
 }
 
+/// Per-fetch timeout clamp for script **subresources** (the supervisor prefetch
+/// and on-demand `LoadScript` chunks). The session's own timeout (default 30 s)
+/// is sized for the page fetch; letting a single hung chunk CDN pin a capture
+/// for that long multiplies into the tens of seconds the capture-window clamp
+/// was supposed to prevent. A chunk that can't answer in 2.5 s is treated as
+/// missing — the page sees the same `onerror` shape as a network miss.
+#[cfg(feature = "tier2")]
+pub(crate) const SUBRESOURCE_FETCH_TIMEOUT_MS: u64 = 2_500;
+
+/// Total wall budget for servicing on-demand `LoadScript` requests within one
+/// Hydrate job. The child's capture window only bounds event-loop *pump* time —
+/// it cannot preempt a synchronous `op_raze_load_script` mid-JS-turn, and a
+/// chunk loader that requests scripts back-to-back inside one turn would extend
+/// the job unboundedly. Past this budget the supervisor answers `ok: false`
+/// immediately (no fetch), so hydration degrades exactly like missing chunks.
+#[cfg(feature = "tier2")]
+const DYNAMIC_LOAD_BUDGET_MS: u64 = 4_000;
+
+/// Derive the [`draco_net::SessionOpts`] used for script subresource fetches
+/// from the session's own: per-fetch timeout clamped to
+/// [`SUBRESOURCE_FETCH_TIMEOUT_MS`], and the politeness `delay_ms` dropped —
+/// browsers burst-load a page's chunks over pooled connections, and a per-host
+/// delay would serialize every prefetch wave.
+#[cfg(feature = "tier2")]
+pub(crate) fn subresource_opts(opts: &draco_net::SessionOpts) -> draco_net::SessionOpts {
+    let mut o = opts.clone();
+    o.timeout_ms = o.timeout_ms.min(SUBRESOURCE_FETCH_TIMEOUT_MS);
+    o.delay_ms = 0;
+    o
+}
+
 fn default_quiesce_ms(capture_window_ms: u64) -> u64 {
     (capture_window_ms / 6).clamp(150, 500)
 }
@@ -350,7 +386,7 @@ mod prod {
 
     use super::{
         default_quiesce_ms, effective_capture_window_ms, jail_error, CaptureResult, Config,
-        ScriptResource, Tier2Capture, MAX_INTERCEPTS,
+        ScriptResource, Tier2Capture, DYNAMIC_LOAD_BUDGET_MS, MAX_INTERCEPTS,
     };
     use crate::ranking::Candidate;
 
@@ -497,6 +533,7 @@ mod prod {
             };
             frame::write_supervisor_frame(ipc, &hydrate, html)
                 .map_err(|e| map_frame_err(e, "sending Hydrate"))?;
+            let hydrate_sent = std::time::Instant::now();
 
             // 3. Collect Intercept frames until the terminal Result. On the FIRST
             //    job the child's boot-time sandbox-level Log is still queued ahead
@@ -504,6 +541,7 @@ mod prod {
             let mut candidates = Vec::new();
             let mut bodies = Vec::new();
             let mut rendered_html: Option<String> = None;
+            let mut logs: Vec<String> = Vec::new();
             let outcome: RuntimeOutcome = loop {
                 let f = match frame::read_jail_frame(ipc) {
                     Ok(f) => f,
@@ -537,7 +575,18 @@ mod prod {
                         bodies.push(if has_body { Some(f.body) } else { None });
                     }
                     JailToSupervisor::LoadScript { id, url } => {
-                        let body = fetch_dynamic_script(&url, opts).unwrap_or_default();
+                        // The capture window cannot preempt these synchronous
+                        // loads mid-JS-turn, so the supervisor enforces its own
+                        // wall budget: past it, answer "missing" immediately
+                        // rather than fetching — hydration degrades exactly like
+                        // a missing chunk instead of pinning the job open.
+                        let within_budget =
+                            (hydrate_sent.elapsed().as_millis() as u64) < DYNAMIC_LOAD_BUDGET_MS;
+                        let body = if within_budget {
+                            fetch_dynamic_script(&url, opts).unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
                         let ok = !body.is_empty();
                         let reply = SupervisorToJail::Script { id, ok, url };
                         frame::write_supervisor_frame(ipc, &reply, &body)
@@ -553,11 +602,14 @@ mod prod {
                         break outcome;
                     }
                     // A Log prefixed with the sandbox-level marker carries the
-                    // achieved posture (boot-time, once); other Logs are
-                    // diagnostic only.
+                    // achieved posture (boot-time, once); other Logs are the
+                    // runtime's page-side diagnostics — collect them (defensive
+                    // re-bound: the child already caps count and length).
                     JailToSupervisor::Log { msg, .. } => {
                         if let Some(level) = msg.strip_prefix(draco_jail::level::LEVEL_LOG_PREFIX) {
                             self.sandbox_level = Some(level.to_string());
+                        } else if logs.len() < 64 {
+                            logs.push(msg);
                         }
                     }
                     JailToSupervisor::Error { reason, detail } => {
@@ -579,6 +631,7 @@ mod prod {
                 outcome,
                 sandbox_level: self.sandbox_level.clone(),
                 rendered_html,
+                logs,
             })
         }
 
@@ -837,12 +890,16 @@ mod prod {
     }
 
     fn fetch_dynamic_script(url: &str, opts: &draco_net::SessionOpts) -> Option<Vec<u8>> {
+        // Subresource posture: per-fetch timeout clamped, politeness delay
+        // dropped (see `subresource_opts`) — a hung chunk CDN must fail fast,
+        // not pin the capture for the session's full page-fetch timeout.
+        let opts = super::subresource_opts(opts);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .enable_io()
             .build()
             .ok()?;
-        let resp = rt.block_on(draco_net::fetch_target(url, opts)).ok()?;
+        let resp = rt.block_on(draco_net::fetch_target(url, &opts)).ok()?;
         (200..300)
             .contains(&resp.meta.status)
             .then(|| resp.body.to_vec())
@@ -1051,6 +1108,7 @@ mod tests {
             outcome: RuntimeOutcome::Quiesced,
             sandbox_level: None,
             rendered_html: None,
+            logs: Vec::new(),
         }
     }
 
@@ -1236,6 +1294,7 @@ mod tests {
             outcome: RuntimeOutcome::Quiesced,
             sandbox_level: None,
             rendered_html: None,
+            logs: Vec::new(),
         }
     }
 

@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "draco-cli"
-version = "0.13.5"
+version = "0.13.6"
 dependencies = [
  "axum",
  "base64",
@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "draco-core"
-version = "0.13.5"
+version = "0.13.6"
 dependencies = [
  "async-trait",
  "bytes",
@@ -869,6 +869,7 @@ dependencies = [
  "draco-runtime",
  "draco-static",
  "draco-types",
+ "futures-util",
  "libc",
  "oxc_allocator",
  "oxc_parser",
@@ -881,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "draco-jail"
-version = "0.13.5"
+version = "0.13.6"
 dependencies = [
  "draco-runtime",
  "draco-types",
@@ -895,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "draco-net"
-version = "0.13.5"
+version = "0.13.6"
 dependencies = [
  "axum",
  "base64",
@@ -910,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "draco-runtime"
-version = "0.13.5"
+version = "0.13.6"
 dependencies = [
  "deno_core",
  "deno_error",
@@ -923,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "draco-static"
-version = "0.13.5"
+version = "0.13.6"
 dependencies = [
  "dom_smoothie",
  "draco-types",
@@ -938,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "draco-types"
-version = "0.13.5"
+version = "0.13.6"
 dependencies = [
  "serde",
  "serde_json",
