@@ -548,7 +548,6 @@ mod tests {
             exclude_paths: vec![],
             regex_on_full_url: false,
             allow_external: false,
-            format: OutputFormat::Markdown,
             config: Config::default(),
         }
     }
@@ -666,6 +665,8 @@ mod tests {
 
     #[tokio::test]
     async fn bad_format_rejected_before_spawning() {
+        // "rawHtml" is a supported format now; use an unrecognized token to
+        // exercise the pre-spawn 400 short-circuit.
         let app = crawl_router(test_state());
         let resp = app
             .oneshot(
@@ -676,7 +677,7 @@ mod tests {
                     .body(Body::from(
                         json!({
                             "url": "https://s.example/",
-                            "scrapeOptions": { "formats": ["rawHtml"] }
+                            "scrapeOptions": { "formats": ["bogus"] }
                         })
                         .to_string(),
                     ))

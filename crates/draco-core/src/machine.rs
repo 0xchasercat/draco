@@ -755,6 +755,7 @@ where
     )
 }
 
+#[cfg(feature = "tier2")]
 async fn try_tier2<F, T>(
     run: &mut Run,
     url: &str,
@@ -1464,6 +1465,7 @@ mod tests {
     use super::*;
     use crate::ranking::Candidate;
     use crate::testutil::{err_fetcher, noop_capture, MockCapture, MockFetcher, MockStatic};
+    use crate::FormatSet;
     use draco_types::{ExtractOrigin, ExtractedData, InterceptVia, NetKind};
     use serde_json::json;
 
@@ -1611,7 +1613,7 @@ mod tests {
     /// covered by its own tests below.
     fn cfg(tier_max: u8) -> Config {
         Config {
-            format: OutputFormat::Json,
+            formats: FormatSet::json_only(),
             tier_max,
             ..Config::default()
         }
@@ -1923,9 +1925,12 @@ mod tests {
             ),
         ]);
         let config = Config {
-            format: OutputFormat::Json,
+            formats: FormatSet {
+                json: true,
+                endpoints: true,
+                ..FormatSet::none()
+            },
             tier_max: 2,
-            discover_endpoints: true,
             ..Config::default()
         };
         let r = run_ladder("https://x.com/p", &config, &fetcher, &statics, &capture).await;
@@ -1950,9 +1955,12 @@ mod tests {
         let statics = MockStatic::miss_no_build_id();
         let capture = MockCapture::empty();
         let config = Config {
-            format: OutputFormat::Json,
+            formats: FormatSet {
+                json: true,
+                endpoints: true,
+                ..FormatSet::none()
+            },
             tier_max: 1,
-            discover_endpoints: true,
             ..Config::default()
         };
         let r = run_ladder("https://x.com/p", &config, &fetcher, &statics, &capture).await;
@@ -2068,7 +2076,7 @@ mod tests {
     /// A Markdown-format config.
     fn cfg_markdown() -> Config {
         Config {
-            format: OutputFormat::Markdown,
+            formats: FormatSet::markdown_only(),
             ..Config::default()
         }
     }
@@ -2332,7 +2340,11 @@ mod tests {
 
     fn cfg_both() -> Config {
         Config {
-            format: OutputFormat::Both,
+            formats: FormatSet {
+                markdown: true,
+                json: true,
+                ..FormatSet::none()
+            },
             ..Config::default()
         }
     }
