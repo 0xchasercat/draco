@@ -190,6 +190,10 @@ struct CaptureState {
     max_intercepts: u32,
     /// Verbatim stub body (already normalized; never empty).
     stub_body: String,
+    /// Prefetched script/module/chunk resources keyed by absolute URL. Exposed to
+    /// the page-side glue so dynamic `<script src>` chunk loaders can execute
+    /// already-fetched chunks without giving the isolate network access.
+    resources: Rc<RefCell<HashMap<String, Vec<u8>>>>,
     /// The hydrated DOM serialized after the capture window (via `op_raze_dom`),
     /// for the render-then-Markdown escalation. `None` until serialization runs.
     rendered_html: Option<String>,
@@ -256,6 +260,22 @@ fn op_raze_fetch(
     Ok(resp.to_string())
 }
 
+/// Return a prefetched script/module/chunk resource by absolute URL. Used by the
+/// glue's dynamic `<script src>` hook (webpack/Next chunk loader path). Missing
+/// resources return `None` so the page-side loader can fire `onerror` exactly like
+/// a failed network load.
+#[deno_core::op2]
+#[string]
+fn op_raze_resource(state: &mut OpState, #[string] url: String) -> Option<String> {
+    let cap = state.borrow::<Rc<RefCell<CaptureState>>>().clone();
+    let resources = cap.borrow().resources.clone();
+    let out = resources
+        .borrow()
+        .get(&url)
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+    out
+}
+
 /// Receive the hydrated DOM serialized by the page side
 /// (`document.documentElement.outerHTML`) and stash it in [`CaptureState`] for the
 /// render-then-Markdown escalation. Called once, after the capture window closes.
@@ -309,7 +329,7 @@ fn op_resolve_url(#[string] base: String, #[string] rel: String) -> String {
 
 deno_core::extension!(
     draco_runtime_ext,
-    ops = [op_raze_fetch, op_sleep, op_resolve_url, op_raze_dom],
+    ops = [op_raze_fetch, op_sleep, op_resolve_url, op_raze_resource, op_raze_dom],
     options = { cap: Rc<RefCell<CaptureState>> },
     state = |state, options| {
         state.put::<Rc<RefCell<CaptureState>>>(options.cap);
@@ -399,17 +419,19 @@ async fn run_capture_inner_with_resources(
 ) -> CaptureReport {
     let stub_body = normalize_stub_body(&cfg.stub_response_json);
 
+    // Module loader + script-injection hook are backed by the supervisor-prefetched
+    // script sources, so `<script type="module">`, `import()`, and webpack/Next
+    // dynamic `<script src>` chunks resolve without the (air-gapped) isolate ever
+    // touching the network.
+    let modules = Rc::new(RefCell::new(resources));
+
     let cap = Rc::new(RefCell::new(CaptureState {
         requests: Vec::new(),
         max_intercepts: cfg.max_intercepts,
         stub_body: stub_body.clone(),
+        resources: modules.clone(),
         rendered_html: None,
     }));
-
-    // Module loader backed by the supervisor-prefetched script sources, so
-    // `<script type="module">` and `import()` resolve without the (air-gapped)
-    // isolate ever touching the network.
-    let modules = Rc::new(RefCell::new(resources));
 
     // Restore the DOM-engine snapshot and register the ops for this isolate.
     let mut runtime = JsRuntime::new(RuntimeOptions {
@@ -1137,6 +1159,33 @@ mod tests {
             Some("module")
         );
         assert_eq!(attr_value("<script>", "type"), None);
+    }
+
+    #[test]
+    fn appended_script_chunk_runs_from_prefetched_resources() {
+        let html = r#"<script>
+            const s = document.createElement("script");
+            s.src = "/_next/static/chunks/feature.abc123.js";
+            document.head.appendChild(s);
+        </script>"#;
+        let mut resources = HashMap::new();
+        resources.insert(
+            "https://example.com/_next/static/chunks/feature.abc123.js".to_string(),
+            br#"fetch("/api/from-chunk");"#.to_vec(),
+        );
+        let report = run_capture_with_resources(
+            "https://example.com/",
+            html,
+            &CaptureConfig {
+                capture_window_ms: 500,
+                quiesce_ms: 20,
+                max_intercepts: 8,
+                stub_response_json: "{}".to_string(),
+            },
+            resources,
+        );
+        assert_eq!(report.requests.len(), 1, "{report:?}");
+        assert_eq!(report.requests[0].url, "https://example.com/api/from-chunk");
     }
 
     #[test]

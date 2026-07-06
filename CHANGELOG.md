@@ -3,6 +3,19 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.13.2] — 2026-07-06
+
+### Fixed
+- **Next.js / webpack dynamic chunk loading** now works in the air-gapped runtime.
+  Draco executes prefetched `<script src>` chunks when page code appends or inserts
+  script nodes, instead of letting happy-dom's disabled file loader fail them with
+  `ChunkLoadError`. This restores endpoint discovery for pages whose API calls live
+  behind lazy chunks.
+- **Chunk prefetching** now also follows likely webpack/Next chunk-loader references
+  inside fetched bundles (direct `_next/static/chunks/*.js` literals and chunk
+  id/name/hash maps), so dynamically appended chunks are available to the runtime
+  without giving the isolate network access.
+
 ## [0.13.1] — 2026-07-06
 
 ### Fixed

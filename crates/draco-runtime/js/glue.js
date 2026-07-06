@@ -161,6 +161,69 @@
   }
   g.XMLHttpRequest = XHR;
 
+  // Dynamic script chunk loader hook. Frameworks such as Next/Webpack load lazy
+  // chunks by creating <script src="/_next/static/chunks/..."></script> and
+  // resolving a promise from onload/onerror. happy-dom's script loading is disabled
+  // (the isolate is air-gapped), so execute prefetched chunk sources synchronously
+  // when such script nodes are appended/inserted. Missing chunks fire onerror so
+  // page code sees the same failure shape as a network miss.
+  function scriptSrc(node) {
+    try {
+      if (!node || String(node.tagName || "").toLowerCase() !== "script") return null;
+      const raw = node.src || (node.getAttribute && node.getAttribute("src"));
+      return raw ? absolutize(raw) : null;
+    } catch (_) { return null; }
+  }
+  function fireScriptEvent(node, type, url) {
+    try {
+      const ev = { type, target: node, currentTarget: node, srcElement: node, url };
+      const h = node && node["on" + type];
+      if (typeof h === "function") h.call(node, ev);
+      if (node && typeof node.dispatchEvent === "function" && typeof Event === "function") {
+        node.dispatchEvent(new Event(type));
+      }
+    } catch (_) {}
+  }
+  function maybeRunScriptNode(node) {
+    const u = scriptSrc(node);
+    if (!u || node.__dracoLoaded) return false;
+    node.__dracoLoaded = true;
+    let src = null;
+    try { src = ops.op_raze_resource(u); } catch (_) { src = null; }
+    if (typeof src !== "string") { fireScriptEvent(node, "error", u); return false; }
+    try {
+      // Indirect eval runs in global scope. //# sourceURL gives stack traces an
+      // absolute URL and lets relative dynamic imports inside chunks resolve.
+      (0, eval)(src + "\n//# sourceURL=" + u);
+      fireScriptEvent(node, "load", u);
+      return true;
+    } catch (e) {
+      logSwallowed("script", e);
+      fireScriptEvent(node, "error", u);
+      return true;
+    }
+  }
+  function hookInsertion(proto, name) {
+    if (!proto || typeof proto[name] !== "function") return;
+    const orig = proto[name];
+    proto[name] = function (...args) {
+      // Run known prefetched scripts BEFORE insertion so happy-dom's disabled file
+      // loader never tries (and fails) to fetch them itself.
+      const handled = (() => { try { return maybeRunScriptNode(args[0]); } catch (_) { return false; } })();
+      if (handled && name !== "append") return args[0];
+      if (handled && name === "append") return undefined;
+      return orig.apply(this, args);
+    };
+  }
+  try {
+    hookInsertion(g.Node && g.Node.prototype, "appendChild");
+    hookInsertion(g.Node && g.Node.prototype, "insertBefore");
+    hookInsertion(g.Element && g.Element.prototype, "append");
+    hookInsertion(w.Node && w.Node.prototype, "appendChild");
+    hookInsertion(w.Node && w.Node.prototype, "insertBefore");
+    hookInsertion(w.Element && w.Element.prototype, "append");
+  } catch (_) {}
+
   // 4. Load the fetched HTML so the framework's mount container exists. Prefer
   //    write() (full-document parse); fall back to setting body/head innerHTML.
   if (html) {
