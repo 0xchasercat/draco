@@ -1235,6 +1235,42 @@ mod tests {
     }
 
     #[test]
+    fn performance_api_shim_keeps_web_vitals_chunks_running() {
+        let html = r#"<script>
+            const s = document.createElement("script");
+            s.src = "/_next/static/chunks/web-vitals.js";
+            document.head.appendChild(s);
+        </script>"#;
+        let mut resources = HashMap::new();
+        resources.insert(
+            "https://example.com/_next/static/chunks/web-vitals.js".to_string(),
+            br#"
+                globalThis.performance.getEntriesByType("layout-shift");
+                globalThis.performance.getEntries();
+                globalThis.performance.mark("draco-test");
+                fetch("/api/after-performance");
+            "#
+            .to_vec(),
+        );
+        let report = run_capture_with_resources(
+            "https://example.com/",
+            html,
+            &CaptureConfig {
+                capture_window_ms: 500,
+                quiesce_ms: 20,
+                max_intercepts: 8,
+                stub_response_json: "{}".to_string(),
+            },
+            resources,
+        );
+        assert_eq!(report.requests.len(), 1, "{report:?}");
+        assert_eq!(
+            report.requests[0].url,
+            "https://example.com/api/after-performance"
+        );
+    }
+
+    #[test]
     fn appended_script_chunk_can_load_through_supervisor_callback() {
         let html = r#"<script>
             const s = document.createElement("script");
