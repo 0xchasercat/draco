@@ -157,6 +157,10 @@ impl FormatSet {
 pub struct Config {
     /// What to produce — the set of requested output formats. Default: markdown.
     pub formats: FormatSet,
+    /// Strip boilerplate (nav/header/footer/ads) to the main content —
+    /// Firecrawl's `onlyMainContent`. Applies to the `markdown` and `html`
+    /// formats (`rawHtml` is always the unmodified fetch). Default: `true`.
+    pub only_main_content: bool,
     pub proxy: Option<String>,
     pub delay_ms: u64,
     pub timeout_ms: u64,
@@ -186,6 +190,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             formats: FormatSet::markdown_only(),
+            only_main_content: true,
             proxy: None,
             delay_ms: 0,
             timeout_ms: 30_000,

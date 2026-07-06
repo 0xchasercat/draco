@@ -136,9 +136,16 @@ enum Command {
         /// Cap the escalation ladder (0, 1, or 2).
         #[arg(long, default_value_t = 2)]
         tier_max: u8,
-        /// Tier 2 capture-window duration (ms).
-        #[arg(long, default_value_t = 2_000)]
-        capture_window_ms: u64,
+        /// Tier 2 capture-window duration (ms). Defaults to 2000 when neither
+        /// this nor `--wait-for` is given; an explicit `--capture-window-ms`
+        /// always wins over `--wait-for` if both are passed.
+        #[arg(long)]
+        capture_window_ms: Option<u64>,
+        /// Firecrawl-style alias for `--capture-window-ms` (ms to wait for the
+        /// page to settle before extracting). Ignored when
+        /// `--capture-window-ms` is also given.
+        #[arg(long)]
+        wait_for: Option<u64>,
         /// Skip OS-level sandbox hardening; Tier 2 still runs V8 with no host
         /// bindings.
         #[arg(long)]
@@ -155,6 +162,11 @@ enum Command {
         /// Bypass robots.txt.
         #[arg(long)]
         ignore_robots: bool,
+        /// Strip boilerplate (nav/header/footer/ads) to the main content
+        /// (Firecrawl's `onlyMainContent`). On by default; pass this to get
+        /// the full page instead.
+        #[arg(long)]
+        no_main_content: bool,
         /// Pretty-print the JSON envelope (no effect on raw Markdown output).
         #[arg(long)]
         pretty: bool,

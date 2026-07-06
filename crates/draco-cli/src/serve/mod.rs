@@ -14,11 +14,14 @@
 //! - `formats` defaults to `["markdown"]`. Draco's `"json"` is the tiered
 //!   JSON-API extraction (embedded state → build-id replay → runtime
 //!   interception) — a superset of "structured data from the page", surfaced
-//!   under `data.json` like Firecrawl's json format. Formats Draco does not
-//!   produce yet (`html`, `rawHtml`, `links`, `screenshot`, …) are rejected
-//!   with a clear `400` rather than silently dropped.
-//! - Unknown request fields (`onlyMainContent`, `waitFor`, `mobile`, …) are
-//!   accepted and ignored, so real-world Firecrawl client payloads work.
+//!   under `data.json` like Firecrawl's json format. `html`, `rawHtml`, and
+//!   `links` are also supported; only browser-only formats Draco's DOM-only
+//!   engine cannot produce (`screenshot`, `actions`, …) are rejected with a
+//!   clear `422` (`400` for a token that's unrecognized outright).
+//! - `onlyMainContent` (default `true`) and `waitFor` (an alias for
+//!   `captureWindowMs` — see below) are honored. Other unknown request fields
+//!   (`mobile`, `headers`, `includeTags`, `excludeTags`, …) are accepted and
+//!   ignored, so real-world Firecrawl client payloads still work.
 //! - Failures use Firecrawl's `{ "success": false, "error": … }` envelope.
 //! - Every response also carries a `draco` extension object (`sourceTier`,
 //!   `timing`, `trace`) — Draco's honest execution report. Extra keys are
@@ -159,11 +162,13 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
 }
 
-/// Firecrawl-shaped scrape request. Unknown fields are deliberately ignored so
-/// stock Firecrawl client payloads (`onlyMainContent`, `waitFor`, `mobile`, …)
-/// deserialize cleanly; camelCase to match their wire format. The `tierMax` /
-/// `captureWindowMs` / `noJail` / `allowUnsafeReplay` / `ignoreRobots` / `proxy`
-/// fields are Draco extensions mirroring the CLI flags.
+/// Firecrawl-shaped scrape request. `onlyMainContent` and `waitFor` are
+/// honored (see below); remaining unknown fields are deliberately ignored so
+/// stock Firecrawl client payloads (`mobile`, `headers`, `includeTags`, …)
+/// still deserialize cleanly. camelCase to match their wire format. The
+/// `tierMax` / `captureWindowMs` / `noJail` / `allowUnsafeReplay` /
+/// `ignoreRobots` / `proxy` fields are Draco extensions mirroring the CLI
+/// flags.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ScrapeRequest {
@@ -173,6 +178,17 @@ struct ScrapeRequest {
     /// Total request timeout in ms (Firecrawl field).
     #[serde(default)]
     timeout: Option<u64>,
+    /// Strip boilerplate to the main content (Firecrawl field). Defaults to
+    /// the daemon's `Config::only_main_content` default (`true`) when absent.
+    #[serde(default)]
+    only_main_content: Option<bool>,
+    /// Firecrawl field: milliseconds to wait for the page to settle before
+    /// extracting. Draco has no separate "wait" step — Tier 2's capture
+    /// window already serves this purpose — so `waitFor` is treated as an
+    /// alias for `captureWindowMs`: it only takes effect when the caller
+    /// didn't also send an explicit `captureWindowMs` (see the handler).
+    #[serde(default)]
+    wait_for: Option<u64>,
     // ---- Draco extensions ------------------------------------------------
     #[serde(default)]
     tier_max: Option<u8>,
@@ -212,11 +228,17 @@ async fn scrape(
 
     let config = Config {
         formats,
+        only_main_content: req
+            .only_main_content
+            .unwrap_or(state.defaults.only_main_content),
         proxy: req.proxy.clone().or_else(|| state.defaults.proxy.clone()),
         timeout_ms: req.timeout.unwrap_or(state.defaults.timeout_ms),
         tier_max: req.tier_max.unwrap_or(state.defaults.tier_max),
+        // `waitFor` is an alias for the capture window: an explicit
+        // `captureWindowMs` always wins when both are given.
         capture_window_ms: req
             .capture_window_ms
+            .or(req.wait_for)
             .unwrap_or(state.defaults.capture_window_ms),
         no_jail: req.no_jail.unwrap_or(state.defaults.no_jail),
         allow_unsafe_replay: req
@@ -519,7 +541,9 @@ mod tests {
 
     #[test]
     fn firecrawl_client_payload_deserializes_with_unknown_fields() {
-        // A realistic Firecrawl SDK payload: unknown fields must be ignored.
+        // A realistic Firecrawl SDK payload: `onlyMainContent`/`waitFor` are
+        // honored (see the dedicated tests below); genuinely unknown fields
+        // (`mobile`, `headers`, …) must still be ignored rather than erroring.
         let req: ScrapeRequest = serde_json::from_value(json!({
             "url": "https://example.com",
             "formats": ["markdown"],
@@ -532,6 +556,8 @@ mod tests {
         .unwrap();
         assert_eq!(req.url, "https://example.com");
         assert_eq!(req.timeout, Some(15_000));
+        assert_eq!(req.only_main_content, Some(true));
+        assert_eq!(req.wait_for, Some(123));
         assert!(req.tier_max.is_none());
     }
 
