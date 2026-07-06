@@ -273,6 +273,14 @@ pub(crate) async fn cancel_handler(
 // Worker
 // ===================================================================
 
+/// The result of scraping one crawl page: success (with the data payload +
+/// Markdown for frontier harvesting), a `robots.txt` skip, or a failure.
+enum PageOutcome {
+    Ok(Value, Option<String>),
+    RobotsBlocked,
+    Failed(String),
+}
+
 /// The BFS worker: scrape pages breadth-first from the seed, harvesting new
 /// frontier URLs from each page's Markdown, until the frontier drains, the
 /// page budget is spent, or the job is cancelled.
@@ -291,24 +299,30 @@ async fn run_crawl(state: Arc<AppState>, id: String, plan: CrawlPlan) {
 
         // One page = one daemon-wide permit, held only for the extraction so a
         // long crawl can't monopolize the gate between pages.
-        let entry = {
+        let outcome = {
             let Ok(_permit) = state.gate.acquire().await else {
                 break; // Gate closed: daemon shutting down.
             };
             let result = extract_with_pool(&page_url, &plan.config, &state.tier2_pool).await;
-            let (code, mut body) = to_firecrawl(&result);
-            if code == StatusCode::OK {
-                Ok((body["data"].take(), result.markdown))
+            if super::is_robots_blocked(&result) {
+                PageOutcome::RobotsBlocked
             } else {
-                Err(body["error"]
-                    .as_str()
-                    .unwrap_or("extraction failed")
-                    .to_string())
+                let (code, mut body) = to_firecrawl(&result);
+                if code == StatusCode::OK {
+                    PageOutcome::Ok(body["data"].take(), result.markdown)
+                } else {
+                    PageOutcome::Failed(
+                        body["error"]
+                            .as_str()
+                            .unwrap_or("extraction failed")
+                            .to_string(),
+                    )
+                }
             }
         };
 
-        match entry {
-            Ok((data, markdown)) => {
+        match outcome {
+            PageOutcome::Ok(data, markdown) => {
                 state.crawl.record_page(&id, Some(data));
                 // Frontier growth from this page's Markdown links (children
                 // sit at depth + 1, which must stay within max_depth).
@@ -331,7 +345,11 @@ async fn run_crawl(state: Arc<AppState>, id: String, plan: CrawlPlan) {
                     }
                 }
             }
-            Err(msg) => {
+            PageOutcome::RobotsBlocked => {
+                state.crawl.record_robots_blocked(&id, &page_url);
+                state.crawl.record_page(&id, None);
+            }
+            PageOutcome::Failed(msg) => {
                 state.crawl.record_error(&id, &page_url, &msg);
                 state.crawl.record_page(&id, None);
             }
