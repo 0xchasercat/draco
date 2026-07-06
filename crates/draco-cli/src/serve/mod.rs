@@ -376,6 +376,20 @@ pub(crate) fn error_body(message: &str) -> Value {
     json!({ "success": false, "error": message })
 }
 
+/// Whether a failed extraction was a `robots.txt` denial (draco-net's
+/// [`draco_types::NetKind::Robots`]) rather than a transport/HTTP failure — so
+/// the crawl/batch workers can route the URL to `robotsBlocked` instead of
+/// `errors`, matching Firecrawl's split.
+pub(crate) fn is_robots_blocked(result: &ExtractionResult) -> bool {
+    matches!(
+        &result.error,
+        Some(DracoError::Network {
+            reason: draco_types::NetKind::Robots,
+            ..
+        })
+    )
+}
+
 /// Pagination query for async-job status endpoints (`?skip=&limit=`), shared by
 /// `/v1/crawl/{id}` and `/v1/batch/scrape/{id}`. Both default to "from the
 /// start, everything (up to the 10 MiB page cap)".
@@ -719,6 +733,28 @@ mod tests {
         assert_eq!(body["success"], false);
         let msg = body["error"].as_str().unwrap();
         assert!(msg.contains("connect timed out"), "{msg}");
+    }
+
+    #[test]
+    fn robots_denial_is_detected_but_other_net_errors_are_not() {
+        // A robots.txt denial (NetKind::Robots) → routed to robotsBlocked.
+        let mut r = success_result();
+        r.status = Status::Error;
+        r.error = Some(DracoError::Network {
+            reason: draco_types::NetKind::Robots,
+            detail: "blocked by robots.txt: /private".into(),
+        });
+        assert!(is_robots_blocked(&r));
+
+        // A plain HTTP/transport failure is NOT a robots block (→ errors).
+        r.error = Some(DracoError::Network {
+            reason: draco_types::NetKind::Status,
+            detail: "HTTP 500".into(),
+        });
+        assert!(!is_robots_blocked(&r));
+
+        // A success is not a robots block.
+        assert!(!is_robots_blocked(&success_result()));
     }
 
     #[test]

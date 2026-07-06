@@ -3,6 +3,17 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.12.1] — 2026-07-06
+
+### Fixed
+- **`robotsBlocked` is now populated** on the crawl/batch `/errors` endpoints,
+  matching Firecrawl (which lists URLs skipped by `robots.txt` separately from
+  `errors`). v0.12.0 always returned `[]` and folded robots denials into
+  `errors` — that was not parity. draco-net now signals a robots denial as a
+  distinct `NetKind::Robots` (was an indistinguishable `NetKind::Status`), and
+  the crawl/batch workers route those URLs to `robotsBlocked` instead of
+  `errors`.
+
 ## [0.12.0] — 2026-07-06
 
 ### Added

@@ -394,7 +394,7 @@ fn robots_cache() -> &'static Mutex<HashMap<String, Arc<Robots>>> {
 }
 
 /// Fetch (once per host, then cached) and consult robots.txt; deny → a
-/// `NetKind::Status` network error carrying the disallowed path. A robots file
+/// `NetKind::Robots` network error carrying the disallowed path. A robots file
 /// that cannot be fetched is treated as "allow all" (standard crawler
 /// behavior), and is cached so we do not re-probe on every request.
 async fn enforce_robots(
@@ -566,7 +566,7 @@ impl Robots {
         }
         match best {
             Some((_, false)) => Err(net_err(
-                NetKind::Status,
+                NetKind::Robots,
                 format!("blocked by robots.txt: {path}"),
             )),
             _ => Ok(()),
