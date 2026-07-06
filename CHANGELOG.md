@@ -3,6 +3,20 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.13.4] — 2026-07-06
+
+### Fixed
+- **Dynamic script loading is now supervisor-mediated** for chunks that are not in
+  the initial prefetch set. When page code appends a `<script src>` chunk, the
+  air-gapped isolate asks the supervisor over IPC; the supervisor fetches the raw
+  JS with `draco-net`, returns the source bytes, and the runtime evaluates them and
+  fires `onload`. This preserves the jail's no-network invariant while covering
+  code-split Next/Webpack chunks whose URLs are computed too dynamically for static
+  prefetch heuristics.
+- **Tier 2 capture windows are capped at 2500 ms** at the supervisor boundary so a
+  bad hydration path fails fast instead of spending tens of seconds before falling
+  back.
+
 ## [0.13.3] — 2026-07-06
 
 ### Fixed

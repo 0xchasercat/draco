@@ -190,6 +190,9 @@
     node.__dracoLoaded = true;
     let src = null;
     try { src = ops.op_raze_resource(u); } catch (_) { src = null; }
+    if (typeof src !== "string") {
+      try { src = ops.op_raze_load_script(u); } catch (_) { src = null; }
+    }
     if (typeof src !== "string") { fireScriptEvent(node, "error", u); return false; }
     try {
       // Indirect eval runs in global scope. //# sourceURL gives stack traces an
