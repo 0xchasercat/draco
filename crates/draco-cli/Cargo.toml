@@ -25,6 +25,7 @@ serve = [
     "dep:serde",
     "dep:draco-net",
     "dep:url",
+    "dep:regex",
     "tokio/net",
     "tokio/signal",
     "tokio/sync",
@@ -53,6 +54,11 @@ axum = { version = "0.8", optional = true }
 serde = { workspace = true, optional = true }
 draco-net = { workspace = true, optional = true }
 url = { version = "2", optional = true }
+# `crawl`'s includePaths/excludePaths regex matching (Firecrawl v1 semantics).
+# Already resolves to v1.12.x transitively via draco-core/serde_json_path;
+# declared directly (not `workspace = true` — there is no workspace entry)
+# to mirror how the other `serve`-only deps above are gated.
+regex = { version = "1", optional = true }
 
 [dev-dependencies]
 # Router-level tests drive handlers via `oneshot` (no sockets).

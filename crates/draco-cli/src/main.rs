@@ -1,20 +1,27 @@
 //! # draco (CLI)
 //!
 //! Command-line interface + output contract. Draco is first a **URL → Markdown
-//! scraper** (Firecrawl-style): `draco extract <url>` fetches a page and prints
+//! scraper** (Firecrawl-style): `draco scrape <url>` fetches a page and prints
 //! clean Markdown of its main content to stdout. `--format json` switches to the
 //! tiered JSON-API extraction (embedded state → build-id replay → runtime
 //! interception), and `--format both` returns Markdown, metadata, and JSON in
-//! one envelope.
+//! one envelope. `--format` is repeatable, so any combination of
+//! markdown/html/raw-html/links/json/endpoints may be requested together
+//! (mirroring the daemon's `formats: [...]` array).
 //!
-//! Output rules: for the default `markdown` format the raw Markdown string is
-//! printed (pipeable: `draco extract url > page.md`); `--json` instead prints the
-//! full [`ExtractionResult`] envelope. For `json`/`both` the envelope is always
-//! printed. The `--extract <JSONPATH>` filter runs over `result.data`, and the
-//! status→exit-code mapping (spec §12) is preserved in all modes.
+//! Output rules: for the default `markdown`-only format the raw Markdown string
+//! is printed (pipeable: `draco scrape url > page.md`); `--json` instead prints
+//! the full [`ExtractionResult`] envelope. Any other combination of formats
+//! always prints the envelope. The `--extract <JSONPATH>` filter runs over
+//! `result.data`, and the status→exit-code mapping (spec §12) is preserved in
+//! all modes.
+//!
+//! Beyond `scrape`, the CLI also exposes `discover` (API endpoint discovery +
+//! replay, mirroring `POST /v1/discover`) and, under the `serve` feature,
+//! `map` (fast site URL discovery, mirroring `POST /v1/map`).
 
 use clap::{Parser, Subcommand, ValueEnum};
-use draco_core::{extract, Config, OutputFormat};
+use draco_core::{extract, Config, FormatSet};
 
 /// MCP server — stdio transport (`draco mcp`) + HTTP binding (`POST /mcp`).
 #[cfg(feature = "serve")]
@@ -32,7 +39,7 @@ use serde_json_path::JsonPath;
     version,
     about = "URL → Markdown scraper (with an optional tiered JSON-API extraction mode)",
     long_about = "Draco — a browserless URL → Markdown scraper.\n\n\
-        By default `draco extract <url>` fetches a page and prints clean Markdown of \
+        By default `draco scrape <url>` fetches a page and prints clean Markdown of \
         its main content (headings, links, lists, code, tables), dropping nav/header/\
         footer boilerplate — the fast, static-only path. Use `--format json` for the \
         tiered JSON-API extraction (embedded state → Next.js build-id replay → runtime \
@@ -43,46 +50,75 @@ struct Cli {
     command: Command,
 }
 
-/// CLI surface for [`OutputFormat`].
+/// CLI surface for [`FormatSet`] — the multi-select `--format` flag, repeatable
+/// so any combination of outputs can be requested in one invocation (e.g.
+/// `--format markdown --format links`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lower")]
 enum FormatArg {
     /// Clean Markdown + metadata of the page's main content (default).
     Markdown,
+    /// Cleaned, absolutized HTML of the page's main content.
+    Html,
+    /// The unmodified fetched HTML.
+    #[value(name = "raw-html", alias = "rawhtml")]
+    RawHtml,
+    /// Every absolutized `<a href>` on the page.
+    Links,
     /// Tiered JSON-API extraction, populating `data`.
     Json,
-    /// Both Markdown + metadata AND the JSON-API extraction.
-    Both,
     /// Discover the JSON/XHR API endpoints the page's JavaScript calls, ranked,
     /// and replay the best one — populates `endpoints` (and `data`).
     Endpoints,
+    /// Convenience alias for `markdown` + `json` together.
+    Both,
 }
 
-impl From<FormatArg> for OutputFormat {
-    fn from(f: FormatArg) -> Self {
-        match f {
-            FormatArg::Markdown => OutputFormat::Markdown,
-            FormatArg::Json => OutputFormat::Json,
-            FormatArg::Both => OutputFormat::Both,
-            // Discovery replays the winner into `data`, so its content dimension
-            // is the JSON path; the ranked catalog rides `endpoints` on top.
-            FormatArg::Endpoints => OutputFormat::Json,
+/// Fold repeated `--format` values into a [`FormatSet`].
+///
+/// An empty slice (the flag was never given) means "use the default",
+/// [`FormatSet::markdown_only`]. Otherwise each `FormatArg` sets its matching
+/// flag; `both` is sugar for `markdown` + `json` together (composes with any
+/// other formats given alongside it, e.g. `--format both --format links`).
+fn formats_from_args(args: &[FormatArg]) -> FormatSet {
+    if args.is_empty() {
+        return FormatSet::markdown_only();
+    }
+    let mut set = FormatSet::none();
+    for arg in args {
+        match arg {
+            FormatArg::Markdown => set.markdown = true,
+            FormatArg::Html => set.html = true,
+            FormatArg::RawHtml => set.raw_html = true,
+            FormatArg::Links => set.links = true,
+            FormatArg::Json => set.json = true,
+            FormatArg::Endpoints => set.endpoints = true,
+            FormatArg::Both => {
+                set.markdown = true;
+                set.json = true;
+            }
         }
     }
+    set
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Scrape a URL to Markdown (default), or extract JSON with `--format json`.
-    Extract {
+    /// Scrape a URL to Markdown (default), or to any combination of
+    /// markdown/html/raw-html/links/json/endpoints with (repeatable)
+    /// `--format`. Mirrors `POST /v1/scrape`.
+    Scrape {
         /// Target URL.
         url: String,
-        /// Output format: `markdown` (default), `json`, or `both`.
-        #[arg(long, value_enum, default_value_t = FormatArg::Markdown)]
-        format: FormatArg,
-        /// For `--format markdown`: print the full ExtractionResult JSON envelope
-        /// instead of the raw Markdown string. (No effect for json/both, which
-        /// always print the envelope.)
+        /// Output format(s); repeatable (e.g. `--format markdown --format
+        /// links`). Defaults to `markdown` alone when omitted. `both` is sugar
+        /// for `markdown` + `json`.
+        #[arg(long, value_enum)]
+        format: Vec<FormatArg>,
+        /// Print the full ExtractionResult JSON envelope instead of the raw
+        /// Markdown string, even when the only requested format is `markdown`.
+        /// (No effect when any other format is also requested — the envelope
+        /// is always printed then.)
         #[arg(long)]
         json: bool,
         /// JSONPath filter applied to `.data` before printing.
@@ -98,6 +134,57 @@ enum Command {
         #[arg(long, default_value_t = 30_000)]
         timeout: u64,
         /// Cap the escalation ladder (0, 1, or 2).
+        #[arg(long, default_value_t = 2)]
+        tier_max: u8,
+        /// Tier 2 capture-window duration (ms). Defaults to 2000 when neither
+        /// this nor `--wait-for` is given; an explicit `--capture-window-ms`
+        /// always wins over `--wait-for` if both are passed.
+        #[arg(long)]
+        capture_window_ms: Option<u64>,
+        /// Firecrawl-style alias for `--capture-window-ms` (ms to wait for the
+        /// page to settle before extracting). Ignored when
+        /// `--capture-window-ms` is also given.
+        #[arg(long)]
+        wait_for: Option<u64>,
+        /// Skip OS-level sandbox hardening; Tier 2 still runs V8 with no host
+        /// bindings.
+        #[arg(long)]
+        no_jail: bool,
+        /// Use the strict default-deny seccomp allowlist (maximum hardening; may
+        /// need per-host tuning).
+        #[arg(long)]
+        strict_sandbox: bool,
+        /// Allow Tier 2 to replay a state-changing request (an unsafe HTTP
+        /// method that is not a GraphQL/JSON-RPC read) picked by ranking. Off by
+        /// default: such requests are withheld from replay for mutation-safety.
+        #[arg(long)]
+        allow_unsafe_replay: bool,
+        /// Bypass robots.txt.
+        #[arg(long)]
+        ignore_robots: bool,
+        /// Strip boilerplate (nav/header/footer/ads) to the main content
+        /// (Firecrawl's `onlyMainContent`). On by default; pass this to get
+        /// the full page instead.
+        #[arg(long)]
+        no_main_content: bool,
+        /// Pretty-print the JSON envelope (no effect on raw Markdown output).
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Discover the JSON/XHR API endpoints a page's JavaScript calls (ranked)
+    /// and replay the best one into `data`. Mirrors `POST /v1/discover`; always
+    /// runs the Tier 2 isolate regardless of `--tier-max`.
+    Discover {
+        /// Target URL.
+        url: String,
+        /// http/https/socks5 proxy URL.
+        #[arg(long)]
+        proxy: Option<String>,
+        /// Total request timeout (ms).
+        #[arg(long, default_value_t = 30_000)]
+        timeout: u64,
+        /// Cap the escalation ladder (0, 1, or 2). Discovery needs Tier 2, so
+        /// this is only meaningful as a value ≥ 2.
         #[arg(long, default_value_t = 2)]
         tier_max: u8,
         /// Tier 2 capture-window duration (ms).
@@ -119,7 +206,41 @@ enum Command {
         /// Bypass robots.txt.
         #[arg(long)]
         ignore_robots: bool,
-        /// Pretty-print the JSON envelope (no effect on raw Markdown output).
+        /// Pretty-print the JSON envelope.
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Fast, shallow discovery of a site's URLs (sitemap + on-page links).
+    /// Mirrors `POST /v1/map`.
+    #[cfg(feature = "serve")]
+    Map {
+        /// Target URL (the site to map).
+        url: String,
+        /// Case-insensitive substring filter on the returned URL list.
+        #[arg(long)]
+        search: Option<String>,
+        /// Max links to return.
+        #[arg(long, default_value_t = 5_000)]
+        limit: usize,
+        /// Restrict results to the exact host (by default, subdomains of the
+        /// target host are included too).
+        #[arg(long)]
+        exclude_subdomains: bool,
+        /// Skip all sitemap sources (robots.txt-discovered and default) —
+        /// on-page hrefs only.
+        #[arg(long)]
+        ignore_sitemap: bool,
+        /// Return only sitemap-derived links; never fetch the page itself.
+        /// Mutually exclusive with `--ignore-sitemap`.
+        #[arg(long)]
+        sitemap_only: bool,
+        /// http/https/socks5 proxy URL.
+        #[arg(long)]
+        proxy: Option<String>,
+        /// Total request timeout (ms), applied to every fetch the map performs.
+        #[arg(long, default_value_t = 30_000)]
+        timeout: u64,
+        /// Pretty-print the JSON envelope.
         #[arg(long)]
         pretty: bool,
     },
@@ -296,16 +417,23 @@ fn render(result: &ExtractionResult, pretty: bool) -> String {
 
 /// Decide what to print to stdout, and return it **with a trailing newline**.
 ///
-/// * `markdown` format (the default) prints the raw `markdown` string — clean
-///   and pipeable (`draco extract url > page.md`) — unless `--json` is set, in
-///   which case the full envelope is printed. If a `markdown` run produced no
-///   markdown (e.g. a challenge → `NeedsBrowser`, or a fetch error), we fall
-///   back to the envelope so the failure is still legible on stdout.
-/// * `json` / `both` always print the full [`ExtractionResult`] envelope.
+/// * A markdown-only [`FormatSet`] (the default) prints the raw `markdown`
+///   string — clean and pipeable (`draco scrape url > page.md`) — unless
+///   `--json` is set, in which case the full envelope is printed. If a
+///   markdown-only run produced no markdown (e.g. a challenge →
+///   `NeedsBrowser`, or a fetch error), we fall back to the envelope so the
+///   failure is still legible on stdout.
+/// * Any other combination of formats always prints the full
+///   [`ExtractionResult`] envelope.
 ///
 /// `pretty` only affects envelope output.
-fn render_output(result: &ExtractionResult, format: FormatArg, json: bool, pretty: bool) -> String {
-    let print_envelope = json || !matches!(format, FormatArg::Markdown);
+fn render_output(
+    result: &ExtractionResult,
+    formats: FormatSet,
+    json: bool,
+    pretty: bool,
+) -> String {
+    let print_envelope = json || formats != FormatSet::markdown_only();
     if !print_envelope {
         if let Some(md) = result.markdown.as_deref() {
             return format!("{md}\n");
@@ -353,7 +481,7 @@ fn main() {
 async fn async_main() {
     let cli = Cli::parse();
     match cli.command {
-        Command::Extract {
+        Command::Scrape {
             url,
             format,
             json,
@@ -363,16 +491,62 @@ async fn async_main() {
             timeout,
             tier_max,
             capture_window_ms,
+            wait_for,
+            no_jail,
+            strict_sandbox,
+            allow_unsafe_replay,
+            ignore_robots,
+            no_main_content,
+            pretty,
+        } => {
+            let formats = formats_from_args(&format);
+            let config = Config {
+                formats,
+                only_main_content: !no_main_content,
+                proxy,
+                delay_ms: delay,
+                timeout_ms: timeout,
+                respect_robots: !ignore_robots,
+                tier_max,
+                // `--capture-window-ms` wins; `--wait-for` is the Firecrawl-style
+                // alias; 2000ms when neither is given.
+                capture_window_ms: capture_window_ms.or(wait_for).unwrap_or(2_000),
+                no_jail,
+                strict_sandbox,
+                allow_unsafe_replay,
+            };
+            let mut result = extract(&url, &config).await;
+            if let Some(expr) = extract_expr.as_deref() {
+                result = filter_result(result, expr);
+            }
+            print!("{}", render_output(&result, formats, json, pretty));
+            std::process::exit(status_to_exit_code(result.status));
+        }
+        Command::Discover {
+            url,
+            proxy,
+            timeout,
+            tier_max,
+            capture_window_ms,
             no_jail,
             strict_sandbox,
             allow_unsafe_replay,
             ignore_robots,
             pretty,
         } => {
+            // Discovery + replay: the ranked endpoint catalog plus the winner
+            // replayed into `data` (mirrors `discover::discover_handler`'s
+            // `Config` construction). `endpoints` forces the Tier 2 capture;
+            // `json` carries the replayed winner.
             let config = Config {
-                format: format.into(),
+                formats: FormatSet {
+                    json: true,
+                    endpoints: true,
+                    ..FormatSet::none()
+                },
+                only_main_content: true,
                 proxy,
-                delay_ms: delay,
+                delay_ms: 0,
                 timeout_ms: timeout,
                 respect_robots: !ignore_robots,
                 tier_max,
@@ -380,14 +554,70 @@ async fn async_main() {
                 no_jail,
                 strict_sandbox,
                 allow_unsafe_replay,
-                discover_endpoints: matches!(format, FormatArg::Endpoints),
             };
-            let mut result = extract(&url, &config).await;
-            if let Some(expr) = extract_expr.as_deref() {
-                result = filter_result(result, expr);
-            }
-            print!("{}", render_output(&result, format, json, pretty));
+            let result = extract(&url, &config).await;
+            println!("{}", render(&result, pretty));
             std::process::exit(status_to_exit_code(result.status));
+        }
+        #[cfg(feature = "serve")]
+        Command::Map {
+            url,
+            search,
+            limit,
+            exclude_subdomains,
+            ignore_sitemap,
+            sitemap_only,
+            proxy,
+            timeout,
+            pretty,
+        } => {
+            if ignore_sitemap && sitemap_only {
+                eprintln!("draco map: --ignore-sitemap and --sitemap-only are mutually exclusive");
+                std::process::exit(1);
+            }
+            let target = match serve::map::parse_http_url(&url) {
+                Ok(u) => u,
+                Err(msg) => {
+                    eprintln!("draco map: {msg}");
+                    std::process::exit(1);
+                }
+            };
+            // Project the same CLI flags into a `Config` purely to reuse
+            // `draco_core::session_opts`'s Config → SessionOpts mapping (the
+            // same helper `map_handler` uses); the rest of `Config` is unused
+            // by `map_site`.
+            let config = Config {
+                proxy,
+                timeout_ms: timeout,
+                respect_robots: true,
+                ..Config::default()
+            };
+            let session = draco_core::session_opts(&config);
+            let opts = serve::map::MapOptions {
+                target,
+                session,
+                search,
+                limit,
+                include_subdomains: !exclude_subdomains,
+                ignore_sitemap,
+                sitemap_only,
+            };
+            match serve::map::map_site(&opts).await {
+                Ok(outcome) => {
+                    let body = serde_json::json!({ "success": true, "links": outcome.links });
+                    let out = if pretty {
+                        serde_json::to_string_pretty(&body).expect("serialize map result")
+                    } else {
+                        serde_json::to_string(&body).expect("serialize map result")
+                    };
+                    println!("{out}");
+                }
+                Err(serve::map::MapError::BadRequest(msg))
+                | Err(serve::map::MapError::Upstream(msg)) => {
+                    eprintln!("draco map: {msg}");
+                    std::process::exit(1);
+                }
+            }
         }
         #[cfg(feature = "serve")]
         Command::Serve {
@@ -405,9 +635,10 @@ async fn async_main() {
             proxy,
         } => {
             let defaults = Config {
-                // Per-request `formats` decides markdown/json; this default is
+                // Per-request `formats` decides markdown/json/…; this default is
                 // overwritten on every request but keeps the struct total.
-                format: OutputFormat::Markdown,
+                formats: FormatSet::markdown_only(),
+                only_main_content: true,
                 proxy,
                 delay_ms: 0,
                 timeout_ms: timeout,
@@ -417,7 +648,6 @@ async fn async_main() {
                 no_jail,
                 strict_sandbox,
                 allow_unsafe_replay: false,
-                discover_endpoints: false,
             };
             // Pool size 0 → auto: the available parallelism (CPU count), a sane
             // cap on concurrent isolates. Fall back to 4 if it can't be probed.
@@ -452,7 +682,8 @@ async fn async_main() {
             proxy,
         } => {
             let defaults = Config {
-                format: OutputFormat::Markdown,
+                formats: FormatSet::markdown_only(),
+                only_main_content: true,
                 proxy,
                 delay_ms: 0,
                 timeout_ms: timeout,
@@ -462,7 +693,6 @@ async fn async_main() {
                 no_jail,
                 strict_sandbox,
                 allow_unsafe_replay: false,
-                discover_endpoints: false,
             };
             if let Err(e) = mcp::run_stdio(defaults).await {
                 eprintln!("draco mcp: {e}");
@@ -568,6 +798,9 @@ mod tests {
             data: Some(data),
             markdown: None,
             metadata: None,
+            html: None,
+            raw_html: None,
+            links: None,
             endpoints: None,
             timing: Timing::default(),
             trace: Vec::new(),
@@ -647,6 +880,9 @@ mod tests {
             data: None,
             markdown: Some("# Title\n\nBody text.".into()),
             metadata: Some(json!({ "title": "Title", "statusCode": 200 })),
+            html: None,
+            raw_html: None,
+            links: None,
             endpoints: None,
             timing: Timing::default(),
             trace: Vec::new(),
@@ -656,7 +892,7 @@ mod tests {
 
     #[test]
     fn markdown_format_prints_raw_markdown() {
-        let out = render_output(&markdown_result(), FormatArg::Markdown, false, false);
+        let out = render_output(&markdown_result(), FormatSet::markdown_only(), false, false);
         // Raw markdown string, newline-terminated, NOT JSON.
         assert_eq!(out, "# Title\n\nBody text.\n");
         assert!(!out.contains("\"status\""));
@@ -664,7 +900,7 @@ mod tests {
 
     #[test]
     fn markdown_format_with_json_flag_prints_envelope() {
-        let out = render_output(&markdown_result(), FormatArg::Markdown, true, false);
+        let out = render_output(&markdown_result(), FormatSet::markdown_only(), true, false);
         let json: Value = serde_json::from_str(out.trim()).expect("envelope is JSON");
         assert_eq!(json["status"], "success");
         assert_eq!(json["markdown"], "# Title\n\nBody text.");
@@ -673,8 +909,9 @@ mod tests {
 
     #[test]
     fn json_format_prints_envelope_not_markdown() {
-        // Even if markdown were present, json format prints the envelope.
-        let out = render_output(&markdown_result(), FormatArg::Json, false, false);
+        // Even if markdown were present, a json-only FormatSet prints the
+        // envelope.
+        let out = render_output(&markdown_result(), FormatSet::json_only(), false, false);
         let json: Value = serde_json::from_str(out.trim()).expect("envelope is JSON");
         assert_eq!(json["status"], "success");
     }
@@ -683,7 +920,12 @@ mod tests {
     fn both_format_prints_envelope() {
         let mut r = markdown_result();
         r.data = Some(json!({ "ok": true }));
-        let out = render_output(&r, FormatArg::Both, false, true);
+        let both = FormatSet {
+            markdown: true,
+            json: true,
+            ..FormatSet::none()
+        };
+        let out = render_output(&r, both, false, true);
         assert!(out.contains('\n'), "pretty envelope is multi-line");
         let json: Value = serde_json::from_str(out.trim()).expect("envelope is JSON");
         assert_eq!(json["data"]["ok"], true);
@@ -699,18 +941,234 @@ mod tests {
         r.markdown = None;
         r.metadata = None;
         r.source_tier = None;
-        let out = render_output(&r, FormatArg::Markdown, false, false);
+        let out = render_output(&r, FormatSet::markdown_only(), false, false);
         let json: Value = serde_json::from_str(out.trim()).expect("envelope is JSON");
         assert_eq!(json["status"], "needs_browser");
     }
 
+    // ---- FormatArg slice → FormatSet folding ----
+
     #[test]
-    fn format_arg_maps_to_output_format() {
+    fn empty_format_args_default_to_markdown_only() {
+        assert_eq!(formats_from_args(&[]), FormatSet::markdown_only());
+    }
+
+    #[test]
+    fn single_format_args_map_straight_through() {
         assert_eq!(
-            OutputFormat::from(FormatArg::Markdown),
-            OutputFormat::Markdown
+            formats_from_args(&[FormatArg::Markdown]),
+            FormatSet::markdown_only()
         );
-        assert_eq!(OutputFormat::from(FormatArg::Json), OutputFormat::Json);
-        assert_eq!(OutputFormat::from(FormatArg::Both), OutputFormat::Both);
+        assert_eq!(
+            formats_from_args(&[FormatArg::Json]),
+            FormatSet::json_only()
+        );
+        assert_eq!(
+            formats_from_args(&[FormatArg::Html]),
+            FormatSet {
+                html: true,
+                ..FormatSet::none()
+            }
+        );
+        assert_eq!(
+            formats_from_args(&[FormatArg::RawHtml]),
+            FormatSet {
+                raw_html: true,
+                ..FormatSet::none()
+            }
+        );
+        assert_eq!(
+            formats_from_args(&[FormatArg::Links]),
+            FormatSet {
+                links: true,
+                ..FormatSet::none()
+            }
+        );
+        assert_eq!(
+            formats_from_args(&[FormatArg::Endpoints]),
+            FormatSet {
+                endpoints: true,
+                ..FormatSet::none()
+            }
+        );
+    }
+
+    #[test]
+    fn both_format_arg_sets_markdown_and_json() {
+        assert_eq!(
+            formats_from_args(&[FormatArg::Both]),
+            FormatSet {
+                markdown: true,
+                json: true,
+                ..FormatSet::none()
+            }
+        );
+    }
+
+    #[test]
+    fn repeatable_format_args_union_into_one_set() {
+        // `--format markdown --format links` composes both flags.
+        let set = formats_from_args(&[FormatArg::Markdown, FormatArg::Links]);
+        assert_eq!(
+            set,
+            FormatSet {
+                markdown: true,
+                links: true,
+                ..FormatSet::none()
+            }
+        );
+    }
+
+    #[test]
+    fn both_composes_with_other_formats() {
+        // `--format both --format links` => markdown + json + links.
+        let set = formats_from_args(&[FormatArg::Both, FormatArg::Links]);
+        assert_eq!(
+            set,
+            FormatSet {
+                markdown: true,
+                json: true,
+                links: true,
+                ..FormatSet::none()
+            }
+        );
+    }
+
+    // ---- clap parsing: Scrape / Discover / Map ----
+
+    #[test]
+    fn scrape_parses_with_default_markdown_only_format() {
+        let cli = Cli::try_parse_from(["draco", "scrape", "https://example.com"])
+            .expect("scrape should parse");
+        match cli.command {
+            Command::Scrape { url, format, .. } => {
+                assert_eq!(url, "https://example.com");
+                assert!(format.is_empty(), "no --format given ⇒ empty Vec");
+                assert_eq!(formats_from_args(&format), FormatSet::markdown_only());
+            }
+            _ => panic!("expected Command::Scrape"),
+        }
+    }
+
+    #[test]
+    fn scrape_parses_repeatable_format_flag() {
+        let cli = Cli::try_parse_from([
+            "draco",
+            "scrape",
+            "https://example.com",
+            "--format",
+            "markdown",
+            "--format",
+            "links",
+        ])
+        .expect("repeatable --format should parse");
+        match cli.command {
+            Command::Scrape { format, .. } => {
+                assert_eq!(format, vec![FormatArg::Markdown, FormatArg::Links]);
+                assert_eq!(
+                    formats_from_args(&format),
+                    FormatSet {
+                        markdown: true,
+                        links: true,
+                        ..FormatSet::none()
+                    }
+                );
+            }
+            _ => panic!("expected Command::Scrape"),
+        }
+    }
+
+    #[test]
+    fn scrape_parses_raw_html_value_name_and_alias() {
+        for value in ["raw-html", "rawhtml"] {
+            let cli =
+                Cli::try_parse_from(["draco", "scrape", "https://example.com", "--format", value])
+                    .unwrap_or_else(|e| panic!("--format {value} should parse: {e}"));
+            match cli.command {
+                Command::Scrape { format, .. } => {
+                    assert_eq!(format, vec![FormatArg::RawHtml], "value {value}");
+                }
+                _ => panic!("expected Command::Scrape"),
+            }
+        }
+    }
+
+    #[test]
+    fn discover_command_parses() {
+        let cli = Cli::try_parse_from(["draco", "discover", "https://example.com", "--pretty"])
+            .expect("discover should parse");
+        match cli.command {
+            Command::Discover { url, pretty, .. } => {
+                assert_eq!(url, "https://example.com");
+                assert!(pretty);
+            }
+            _ => panic!("expected Command::Discover"),
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn map_command_parses_with_defaults() {
+        let cli =
+            Cli::try_parse_from(["draco", "map", "https://example.com"]).expect("map should parse");
+        match cli.command {
+            Command::Map {
+                url,
+                limit,
+                exclude_subdomains,
+                ignore_sitemap,
+                sitemap_only,
+                ..
+            } => {
+                assert_eq!(url, "https://example.com");
+                assert_eq!(limit, 5_000);
+                assert!(!exclude_subdomains, "subdomains included by default");
+                assert!(!ignore_sitemap);
+                assert!(!sitemap_only);
+            }
+            _ => panic!("expected Command::Map"),
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn map_command_parses_all_flags() {
+        let cli = Cli::try_parse_from([
+            "draco",
+            "map",
+            "https://example.com",
+            "--search",
+            "blog",
+            "--limit",
+            "10",
+            "--exclude-subdomains",
+            "--sitemap-only",
+            "--pretty",
+        ])
+        .expect("map should parse with flags");
+        match cli.command {
+            Command::Map {
+                search,
+                limit,
+                exclude_subdomains,
+                sitemap_only,
+                pretty,
+                ..
+            } => {
+                assert_eq!(search.as_deref(), Some("blog"));
+                assert_eq!(limit, 10);
+                assert!(exclude_subdomains);
+                assert!(sitemap_only);
+                assert!(pretty);
+            }
+            _ => panic!("expected Command::Map"),
+        }
+    }
+
+    #[test]
+    fn extract_subcommand_no_longer_exists() {
+        // Clean break: the old `extract` subcommand name was renamed to
+        // `scrape` with no deprecated alias.
+        assert!(Cli::try_parse_from(["draco", "extract", "https://example.com"]).is_err());
     }
 }

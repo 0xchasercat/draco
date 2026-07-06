@@ -18,7 +18,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
-use draco_core::{extract_with_pool, Config, OutputFormat};
+use draco_core::{extract_with_pool, Config, FormatSet};
 use draco_types::Status;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -61,8 +61,13 @@ pub(crate) async fn discover_handler(
     // discovery flag. The content dimension is Json so the winner is replayed
     // into `data` (discovery + replay).
     let config = Config {
-        format: OutputFormat::Json,
-        discover_endpoints: true,
+        // Discovery + replay: the ranked catalog plus the winner replayed into
+        // `data`. Endpoints forces the Tier 2 capture; json carries the winner.
+        formats: FormatSet {
+            json: true,
+            endpoints: true,
+            ..FormatSet::none()
+        },
         proxy: req.proxy.clone().or_else(|| state.defaults.proxy.clone()),
         timeout_ms: req.timeout.unwrap_or(state.defaults.timeout_ms),
         tier_max: req.tier_max.unwrap_or(2).max(2),

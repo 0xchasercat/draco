@@ -19,9 +19,16 @@
 //! - fragments stripped; dedupe against every URL ever enqueued;
 //! - `depth + 1 <= maxDepth` (seed is depth 0);
 //! - stop admitting once `total` reaches `limit`;
-//! - `includePaths` / `excludePaths` are case-sensitive substring matches on
-//!   the URL *path*; exclude wins over include; an empty `includePaths` means
-//!   "include everything"; the seed URL is always admitted.
+//! - `includePaths` / `excludePaths` are regex patterns (Rust `regex` syntax,
+//!   unanchored search — not full-match) tested against the URL *pathname*
+//!   only (e.g. `"blog/.*"` matches `/blog/post-1`; no leading slash is
+//!   needed since the match is a substring search, not an anchor). When
+//!   `regexOnFullURL` is true, the same patterns are tested against the full
+//!   URL string (scheme, host, path, query) instead. Exclude wins over
+//!   include; an empty `includePaths` means "include everything"; the seed
+//!   URL is always admitted. Patterns are compiled once when the crawl plan
+//!   is built — an invalid pattern in the request is rejected at `POST` time
+//!   with `400`, before any worker spawns.
 //!
 //! Failed pages count toward `completed` but contribute no `data` entry
 //! (Firecrawl omits failed pages). A job whose every page failed reports
@@ -44,7 +51,8 @@ use std::sync::{Arc, Mutex};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use draco_core::{extract_with_pool, Config, OutputFormat};
+use draco_core::{extract_with_pool, Config};
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use url::Url;
@@ -217,6 +225,10 @@ pub(crate) struct CrawlRequest {
     include_paths: Option<Vec<String>>,
     #[serde(default)]
     exclude_paths: Option<Vec<String>>,
+    /// When true, `includePaths`/`excludePaths` regexes match against the
+    /// full URL (scheme, host, path, query) instead of the pathname only.
+    #[serde(default, rename = "regexOnFullURL")]
+    regex_on_full_url: bool,
     #[serde(default)]
     allow_external_links: Option<bool>,
     #[serde(default)]
@@ -235,15 +247,30 @@ struct ScrapeOptions {
 
 /// Everything the BFS worker needs, resolved at admission time so the worker
 /// is a pure function of these bounds.
+///
+/// `include_paths`/`exclude_paths` are compiled once here (not per candidate
+/// URL) — see [`compile_path_patterns`].
 struct CrawlPlan {
     seed: Url,
     limit: usize,
     max_depth: usize,
-    include_paths: Vec<String>,
-    exclude_paths: Vec<String>,
+    include_paths: Vec<Regex>,
+    exclude_paths: Vec<Regex>,
+    regex_on_full_url: bool,
     allow_external: bool,
-    format: OutputFormat,
     config: Config,
+}
+
+/// Compile each `includePaths`/`excludePaths` entry as a regex. Firecrawl
+/// treats these as regex patterns, not literal substrings, so an invalid
+/// pattern is a client error — reported the same way other bad request
+/// params are (`400` with a message naming the offender), not a panic or a
+/// silently-empty filter.
+fn compile_path_patterns(patterns: &[String], field: &str) -> Result<Vec<Regex>, String> {
+    patterns
+        .iter()
+        .map(|p| Regex::new(p).map_err(|e| format!("invalid {field} pattern {p:?}: {e}")))
+        .collect()
 }
 
 pub(crate) async fn start_handler(
@@ -260,14 +287,34 @@ pub(crate) async fn start_handler(
         .as_ref()
         .map(|o| o.formats.clone())
         .unwrap_or_default();
-    let (format, discover) = match parse_formats(&formats) {
+    let parsed_formats = match parse_formats(&formats) {
         Ok(f) => f,
+        Err(rej) => {
+            let code = if rej.unsupported {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return (code, Json(error_body(&rej.message)));
+        }
+    };
+    let include_paths = match compile_path_patterns(
+        req.include_paths.as_deref().unwrap_or_default(),
+        "includePaths",
+    ) {
+        Ok(r) => r,
+        Err(msg) => return (StatusCode::BAD_REQUEST, Json(error_body(&msg))),
+    };
+    let exclude_paths = match compile_path_patterns(
+        req.exclude_paths.as_deref().unwrap_or_default(),
+        "excludePaths",
+    ) {
+        Ok(r) => r,
         Err(msg) => return (StatusCode::BAD_REQUEST, Json(error_body(&msg))),
     };
 
     let mut config = state.defaults.clone();
-    config.format = format;
-    config.discover_endpoints = discover;
+    config.formats = parsed_formats;
     if let Some(t) = req.timeout {
         config.timeout_ms = t;
     }
@@ -275,10 +322,10 @@ pub(crate) async fn start_handler(
         seed,
         limit: req.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT),
         max_depth: req.max_depth.unwrap_or(DEFAULT_MAX_DEPTH),
-        include_paths: req.include_paths.unwrap_or_default(),
-        exclude_paths: req.exclude_paths.unwrap_or_default(),
+        include_paths,
+        exclude_paths,
+        regex_on_full_url: req.regex_on_full_url,
         allow_external: req.allow_external_links.unwrap_or(false),
-        format,
         config,
     };
 
@@ -352,7 +399,7 @@ async fn run_crawl(state: Arc<AppState>, id: String, plan: CrawlPlan) {
                 break; // Gate closed: daemon shutting down.
             };
             let result = extract_with_pool(&page_url, &plan.config, &state.tier2_pool).await;
-            let (code, mut body) = to_firecrawl(&result, plan.format);
+            let (code, mut body) = to_firecrawl(&result);
             if code == StatusCode::OK {
                 Some((body["data"].take(), result.markdown))
             } else {
@@ -407,13 +454,21 @@ fn admit(candidate: &str, plan: &CrawlPlan) -> Option<String> {
     if !plan.allow_external && url.host_str() != plan.seed.host_str() {
         return None;
     }
-    let path = url.path();
-    if plan.exclude_paths.iter().any(|p| path.contains(p.as_str())) {
+    // Firecrawl matches includePaths/excludePaths as regexes against the
+    // pathname by default, or the full URL when `regexOnFullURL` is set.
+    // This is an unanchored search (not a full match), so a pattern like
+    // "blog/.*" matches pathname "/blog/post-1" with no leading slash needed.
+    let owned;
+    let subject: &str = if plan.regex_on_full_url {
+        owned = normalized(&url);
+        owned.as_str()
+    } else {
+        url.path()
+    };
+    if plan.exclude_paths.iter().any(|re| re.is_match(subject)) {
         return None;
     }
-    if !plan.include_paths.is_empty()
-        && !plan.include_paths.iter().any(|p| path.contains(p.as_str()))
-    {
+    if !plan.include_paths.is_empty() && !plan.include_paths.iter().any(|re| re.is_match(subject)) {
         return None;
     }
     Some(normalized(&url))
@@ -491,10 +546,16 @@ mod tests {
             max_depth: 2,
             include_paths: vec![],
             exclude_paths: vec![],
+            regex_on_full_url: false,
             allow_external: false,
-            format: OutputFormat::Markdown,
             config: Config::default(),
         }
+    }
+
+    /// Build a `Vec<Regex>` from pattern literals for test plans — mirrors
+    /// what `compile_path_patterns` does at request time.
+    fn patterns(pats: &[&str]) -> Vec<Regex> {
+        pats.iter().map(|p| Regex::new(p).unwrap()).collect()
     }
 
     #[test]
@@ -512,14 +573,67 @@ mod tests {
     }
 
     #[test]
-    fn admission_include_exclude_paths() {
+    fn admission_include_exclude_paths_are_regex() {
         let mut p = plan("https://s.example/");
-        p.include_paths = vec!["/blog".into()];
-        p.exclude_paths = vec!["/blog/drafts".into()];
+        p.include_paths = patterns(&["^/blog"]);
+        p.exclude_paths = patterns(&["^/blog/drafts"]);
         assert!(admit("https://s.example/blog/post", &p).is_some());
         assert_eq!(admit("https://s.example/shop/item", &p), None);
         // Exclude wins over include.
         assert_eq!(admit("https://s.example/blog/drafts/wip", &p), None);
+    }
+
+    /// Firecrawl patterns are typically written with no leading slash and are
+    /// matched unanchored against the pathname — "blog/.*" must match
+    /// "/blog/x" (the pattern sits as a substring of the pathname, not a
+    /// prefix requiring the leading "/").
+    #[test]
+    fn include_path_regex_matches_unanchored_without_leading_slash() {
+        let mut p = plan("https://s.example/");
+        p.include_paths = patterns(&["blog/.*"]);
+        assert!(admit("https://s.example/blog/x", &p).is_some());
+        // Also matches when the pattern sits deeper in the path — proves the
+        // search is unanchored, not just "no leading slash required".
+        assert!(admit("https://s.example/en/blog/x", &p).is_some());
+        assert_eq!(admit("https://s.example/shop/item", &p), None);
+    }
+
+    /// With `regexOnFullURL`, patterns run against the full URL string
+    /// (scheme + host + path + query), so a query-string-only pattern can
+    /// still admit or reject a candidate — something pathname-only matching
+    /// could never do.
+    #[test]
+    fn regex_on_full_url_matches_query_string() {
+        let mut p = plan("https://s.example/");
+        p.regex_on_full_url = true;
+        p.include_paths = patterns(&[r"[?&]lang=en(&|$)"]);
+        assert!(admit("https://s.example/blog/post?lang=en", &p).is_some());
+        assert_eq!(admit("https://s.example/blog/post?lang=fr", &p), None);
+        // Without regexOnFullURL the same pattern can never match (the
+        // pathname carries no query string), so this is a genuine behavior
+        // difference, not just a redundant assertion.
+        p.regex_on_full_url = false;
+        assert_eq!(admit("https://s.example/blog/post?lang=en", &p), None);
+    }
+
+    /// Exclude wins over include even under regex semantics and even when
+    /// both target the full URL.
+    #[test]
+    fn exclude_wins_over_include_full_url() {
+        let mut p = plan("https://s.example/");
+        p.regex_on_full_url = true;
+        p.include_paths = patterns(&["s\\.example/blog"]);
+        p.exclude_paths = patterns(&["draft=true"]);
+        assert!(admit("https://s.example/blog/post", &p).is_some());
+        assert_eq!(admit("https://s.example/blog/post?draft=true", &p), None);
+    }
+
+    #[test]
+    fn compile_path_patterns_rejects_invalid_regex_with_named_pattern() {
+        let err = compile_path_patterns(&["(unclosed".to_string()], "includePaths")
+            .expect_err("unbalanced group must not compile");
+        assert!(err.contains("includePaths"), "err: {err}");
+        assert!(err.contains("(unclosed"), "err: {err}");
     }
 
     // ---- handlers -----------------------------------------------------------
@@ -551,6 +665,8 @@ mod tests {
 
     #[tokio::test]
     async fn bad_format_rejected_before_spawning() {
+        // "rawHtml" is a supported format now; use an unrecognized token to
+        // exercise the pre-spawn 400 short-circuit.
         let app = crawl_router(test_state());
         let resp = app
             .oneshot(
@@ -561,7 +677,7 @@ mod tests {
                     .body(Body::from(
                         json!({
                             "url": "https://s.example/",
-                            "scrapeOptions": { "formats": ["rawHtml"] }
+                            "scrapeOptions": { "formats": ["bogus"] }
                         })
                         .to_string(),
                     ))
@@ -570,6 +686,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An invalid `includePaths`/`excludePaths` regex is rejected at `POST`
+    /// time with `400`, same as any other bad request param — never a panic,
+    /// and never silently spawning a worker with a broken filter.
+    #[tokio::test]
+    async fn invalid_regex_path_rejected_before_spawning() {
+        let app = crawl_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/crawl")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "url": "https://s.example/",
+                            "includePaths": ["(unclosed"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["success"], false);
+        let msg = body["error"].as_str().unwrap_or_default();
+        assert!(msg.contains("includePaths"), "error: {msg}");
+        assert!(msg.contains("(unclosed"), "error: {msg}");
     }
 
     #[tokio::test]
