@@ -1,6 +1,6 @@
 # Draco Roadmap — current handoff
 
-Status as of **v0.13.1** (2026-07-06). This is the canonical takeover document for the next agent. It supersedes older v0.10-era roadmap notes and matches the pushed repository state on `main` at tag `v0.13.1`.
+Status as of **v0.13.6** (2026-07-06). This is the canonical takeover document for the next agent. It supersedes older v0.10-era roadmap notes and matches the repository state on `main` at tag `v0.13.6`.
 
 Draco is a fast, stealth, native-Rust web scraper positioned as a lighter DOM-only alternative to Firecrawl / Browserbase. It is not a browser and must never fake browser-only outputs such as screenshots or actions.
 
@@ -104,6 +104,23 @@ Draco is a fast, stealth, native-Rust web scraper positioned as a lighter DOM-on
 - Fixed classic inline SvelteKit/Vite boot scripts by executing inline classic scripts under an absolute page-derived synthetic script URL instead of non-base `draco:page[i]`. This fixes relative dynamic imports such as `import("./_app/...")`.
 - Module graph prefetching now seeds from `<script src>`, `<link rel="modulepreload">`, `<link rel="preload" as="script">`, and inline-script string-literal imports.
 - Local Chaser/SvelteKit-shaped fixtures validated hardened discover capture. Full gates were green: 344 tests, 0 failed.
+
+### v0.13.2 – v0.13.5 — Next.js/webpack dynamic-chunk saga (bluff.com)
+
+- **v0.13.2**: the air-gapped isolate now *executes* dynamically appended `<script src>` chunks itself (glue hooks `appendChild`/`insertBefore`/`append`; `op_raze_resource` exposes the prefetched resource map) instead of firing a false `ChunkLoadError`. Prefetch follows webpack/Next chunk-loader references inside fetched bundles.
+- **v0.13.3**: broadened chunk prefetch to split id→basename / id→hash webpack maps (hash threshold ≥ 12 hex).
+- **v0.13.4**: replaced static-prefetch-only chunks with a **supervisor-mediated dynamic script loader** — `op_raze_load_script` rides new `LoadScript`/`Script` IPC frames; the supervisor fetches via draco-net; the isolate still never touches the network. Capture window clamped to 2 500 ms supervisor-side.
+- **v0.13.5**: browser-ish Performance API shim (no-op `getEntriesByType`/`mark`/`measure`/…, `PerformanceObserver` class) so telemetry/web-vitals chunks (e.g. Sentry) stop aborting hydration.
+
+### v0.13.6 — Tier 2 wall-time budgets + runtime diagnostics
+
+- **Why**: on live code-split sites the 2 500 ms capture clamp did not bound wall time — `prefetch_scripts` fetched up to 64 chunk candidates *sequentially* (30 s session timeout each) inside the `runtime.capture` step, and synchronous `LoadScript` services could not be preempted mid-JS-turn (observed: 24.7 s `runtime_ms` on bluff.com from macOS).
+- Prefetch is now a **wave-parallel BFS** (8 concurrent over the borrowed fetcher) with a 5 s wall budget and a 2.5 s per-subresource timeout clamp (politeness delay dropped for subresources). Recorded as its own `runtime.prefetch` trace step, so `runtime.capture` times the capture alone.
+- `LoadScript` servicing has a 4 s per-job wall budget (past it the supervisor answers `ok: false` immediately) and the same per-fetch clamp.
+- A markdown-only scrape that produced **empty** markdown (empty client-rendered shell) now prints the JSON envelope instead of a single blank line.
+- **`--runtime-log`** (CLI scrape+discover) / **`runtimeLog`** (daemon, MCP): surfaces the isolate's page-side diagnostics — glue-swallowed exceptions/rejections, `console.error`/`console.warn`, page-script throws — as `runtime.log` trace steps. New `op_raze_log`; lines are count/length-bounded child-side and ride as `Error`-level `Log` frames before the terminal `Result`. This is the tool for diagnosing *why* a page hydrates to 0 endpoints.
+- Fixture-verified (42-chunk delayed SPA + 8 s hung chunk, hardened jail): `runtime_ms` 16 680 → 3 878 ms; endpoint discovery intact.
+- Known follow-up: `cargo test --no-default-features` has pre-existing failures (tier2-gated helpers referenced by ungated tests) — the lean gate is build-only today.
 
 ## Current capability matrix
 
