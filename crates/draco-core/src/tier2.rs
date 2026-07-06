@@ -40,7 +40,7 @@
 //! *replay* is async — it goes back through the normal `PageFetcher`.
 
 use async_trait::async_trait;
-use draco_types::{DracoError, JailKind, RuntimeOutcome};
+use draco_types::{DiscoveredEndpoint, DracoError, JailKind, RuntimeOutcome};
 
 use crate::fetcher::PageFetcher;
 use crate::ranking::{best_candidate, best_replayable, Candidate};
@@ -217,6 +217,44 @@ where
         ))),
         Err(_) => Ok(None),
     }
+}
+
+/// Build the ranked endpoint catalog from a capture — the API-discovery surface.
+///
+/// Pure over the intercepted requests (no network): scores every captured
+/// `fetch`/XHR with [`score_request`], marks each `replayable` (clears the
+/// viability bar and is replay-safe, honoring `allow_unsafe`), and returns them
+/// sorted by descending score (best-guess data API first). This is exactly the
+/// information [`rank_and_replay`] uses to pick a winner, surfaced in full so a
+/// caller can see — and choose to replay — every JSON endpoint behind a
+/// client-rendered page.
+pub(crate) fn discover_endpoints(
+    capture: &CaptureResult,
+    target_url: &str,
+    allow_unsafe: bool,
+) -> Vec<DiscoveredEndpoint> {
+    use crate::ranking::{is_safe_method, score_request, MIN_VIABLE_SCORE};
+
+    let mut out: Vec<DiscoveredEndpoint> = capture
+        .candidates
+        .iter()
+        .map(|c| {
+            let score = score_request(c, Some(target_url));
+            let replayable =
+                score >= MIN_VIABLE_SCORE && (is_safe_method(&c.method) || allow_unsafe);
+            DiscoveredEndpoint {
+                method: c.method.clone(),
+                url: c.url.clone(),
+                via: c.via,
+                score,
+                replayable,
+                headers: c.headers.clone(),
+            }
+        })
+        .collect();
+    // Best-guess data API first; stable so equal scores keep capture order.
+    out.sort_by_key(|e| std::cmp::Reverse(e.score));
+    out
 }
 
 /// Capture seam used when the crate is built **without** the `tier2` feature:
@@ -938,6 +976,42 @@ mod tests {
             sandbox_level: None,
             rendered_html: None,
         }
+    }
+
+    #[test]
+    fn discover_endpoints_ranks_and_flags_replayable() {
+        use draco_types::InterceptVia;
+        let target = "https://shop.example/";
+        // A real data API (accept: json, api path), an analytics beacon, and a
+        // static asset — the ranker should order and flag them accordingly.
+        let capture = capture_of(vec![
+            cand(
+                "https://shop.example/api/products",
+                true,
+                InterceptVia::Fetch,
+            ),
+            cand(
+                "https://analytics.example/collect",
+                false,
+                InterceptVia::Xhr,
+            ),
+        ]);
+        let eps = discover_endpoints(&capture, target, false);
+        assert_eq!(eps.len(), 2);
+        // Highest score first — the JSON API leads.
+        assert_eq!(eps[0].url, "https://shop.example/api/products");
+        assert!(eps[0].score >= eps[1].score, "not sorted by score desc");
+        // The viable same-origin JSON GET is replayable; the low-scored
+        // cross-origin beacon is not.
+        assert!(eps[0].replayable, "data API should be replayable: {eps:?}");
+        assert!(
+            !eps[1].replayable,
+            "analytics beacon should not be replayable: {eps:?}"
+        );
+        // Fields carried faithfully for a would-be replay.
+        assert_eq!(eps[0].method, "GET");
+        assert_eq!(eps[0].via, InterceptVia::Fetch);
+        assert!(eps[0].headers.iter().any(|(k, _)| k == "accept"));
     }
 
     #[test]

@@ -103,10 +103,40 @@ pub struct ExtractionResult {
     /// Populated alongside `markdown`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+    /// The ranked catalog of JSON/XHR API endpoints the page's own JavaScript
+    /// called, discovered during the Tier 2 capture (the `endpoints` format /
+    /// `/v1/discover`). `Some` only when discovery was requested and the isolate
+    /// ran; elided from the wire otherwise so existing consumers are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoints: Option<Vec<DiscoveredEndpoint>>,
     pub timing: Timing,
     pub trace: Vec<TraceStep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<DracoError>,
+}
+
+/// One API endpoint discovered by the Tier 2 isolate — a `fetch`/XHR the page's
+/// JavaScript issued, surfaced with its ranking so a caller can see (and choose
+/// to replay) the JSON APIs behind a client-rendered page. Serialized camelCase
+/// to match the Firecrawl-style wire.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredEndpoint {
+    /// HTTP method the page used (`GET`, `POST`, …).
+    pub method: String,
+    /// Absolute request URL.
+    pub url: String,
+    /// Transport the page used to issue it.
+    pub via: InterceptVia,
+    /// Draco's replay-desirability score (higher = more likely the real data
+    /// API); see `draco_core::score_request`.
+    pub score: i32,
+    /// Whether Draco would replay this endpoint: score clears the viability bar
+    /// and the method is replay-safe (or unsafe replay was explicitly allowed).
+    pub replayable: bool,
+    /// Request headers the page sent, in order (fingerprint-relevant for a
+    /// faithful replay).
+    pub headers: Vec<(String, String)>,
 }
 
 // ===================================================================
@@ -341,6 +371,7 @@ mod tests {
             data: Some(json!({ "price": 42, "title": "Widget" })),
             markdown: Some("# Widget\n\nA great widget.".into()),
             metadata: Some(json!({ "title": "Widget", "statusCode": 200 })),
+            endpoints: None,
             timing: Timing {
                 network_ms: 210,
                 parse_ms: 4,
@@ -433,6 +464,7 @@ mod tests {
             data: None,
             markdown: None,
             metadata: None,
+            endpoints: None,
             timing: Timing::default(),
             trace: vec![],
             error: None,

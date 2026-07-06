@@ -53,6 +53,9 @@ enum FormatArg {
     Json,
     /// Both Markdown + metadata AND the JSON-API extraction.
     Both,
+    /// Discover the JSON/XHR API endpoints the page's JavaScript calls, ranked,
+    /// and replay the best one — populates `endpoints` (and `data`).
+    Endpoints,
 }
 
 impl From<FormatArg> for OutputFormat {
@@ -61,6 +64,9 @@ impl From<FormatArg> for OutputFormat {
             FormatArg::Markdown => OutputFormat::Markdown,
             FormatArg::Json => OutputFormat::Json,
             FormatArg::Both => OutputFormat::Both,
+            // Discovery replays the winner into `data`, so its content dimension
+            // is the JSON path; the ranked catalog rides `endpoints` on top.
+            FormatArg::Endpoints => OutputFormat::Json,
         }
     }
 }
@@ -374,6 +380,7 @@ async fn async_main() {
                 no_jail,
                 strict_sandbox,
                 allow_unsafe_replay,
+                discover_endpoints: matches!(format, FormatArg::Endpoints),
             };
             let mut result = extract(&url, &config).await;
             if let Some(expr) = extract_expr.as_deref() {
@@ -410,6 +417,7 @@ async fn async_main() {
                 no_jail,
                 strict_sandbox,
                 allow_unsafe_replay: false,
+                discover_endpoints: false,
             };
             // Pool size 0 → auto: the available parallelism (CPU count), a sane
             // cap on concurrent isolates. Fall back to 4 if it can't be probed.
@@ -454,6 +462,7 @@ async fn async_main() {
                 no_jail,
                 strict_sandbox,
                 allow_unsafe_replay: false,
+                discover_endpoints: false,
             };
             if let Err(e) = mcp::run_stdio(defaults).await {
                 eprintln!("draco mcp: {e}");
@@ -559,6 +568,7 @@ mod tests {
             data: Some(data),
             markdown: None,
             metadata: None,
+            endpoints: None,
             timing: Timing::default(),
             trace: Vec::new(),
             error: None,
@@ -637,6 +647,7 @@ mod tests {
             data: None,
             markdown: Some("# Title\n\nBody text.".into()),
             metadata: Some(json!({ "title": "Title", "statusCode": 200 })),
+            endpoints: None,
             timing: Timing::default(),
             trace: Vec::new(),
             error: None,
