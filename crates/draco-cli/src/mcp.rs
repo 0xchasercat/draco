@@ -35,7 +35,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
-use draco_core::{extract, Config, OutputFormat};
+use draco_core::{extract, extract_with_pool, Config, OutputFormat, Tier2Pool};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Semaphore;
@@ -65,7 +65,9 @@ pub(crate) async fn run_stdio(defaults: Config) -> Result<(), String> {
             continue;
         }
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(msg) => handle_message(&msg, &defaults, None).await,
+            // stdio is a single-client session: no daemon gate, and no warm pool
+            // (one-shot `extract` per call is fine for interactive use).
+            Ok(msg) => handle_message(&msg, &defaults, None, None).await,
             Err(e) => Some(parse_error(&e)),
         };
         if let Some(resp) = response {
@@ -94,7 +96,14 @@ pub(crate) async fn http_handler(
         Ok(m) => m,
         Err(e) => return (StatusCode::OK, Json(parse_error(&e))),
     };
-    match handle_message(&msg, &state.defaults, Some(&state.gate)).await {
+    match handle_message(
+        &msg,
+        &state.defaults,
+        Some(&state.gate),
+        Some(&state.tier2_pool),
+    )
+    .await
+    {
         Some(resp) => (StatusCode::OK, Json(resp)),
         // Notifications (and other id-less messages) get no JSON-RPC response.
         None => (StatusCode::ACCEPTED, Json(json!({}))),
@@ -109,7 +118,12 @@ pub(crate) async fn http_handler(
 /// notifications (which never get responses, including unknown ones). `gate`
 /// bounds tool-call extractions on the daemon; stdio passes `None` (a single
 /// stdio client processed sequentially needs no extra bound).
-async fn handle_message(msg: &Value, defaults: &Config, gate: Option<&Semaphore>) -> Option<Value> {
+async fn handle_message(
+    msg: &Value,
+    defaults: &Config,
+    gate: Option<&Semaphore>,
+    pool: Option<&Tier2Pool>,
+) -> Option<Value> {
     let id = msg.get("id").filter(|v| !v.is_null()).cloned();
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
@@ -124,7 +138,7 @@ async fn handle_message(msg: &Value, defaults: &Config, gate: Option<&Semaphore>
         "initialize" => Ok(initialize_result(&params)),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": [scrape_tool_descriptor()] })),
-        "tools/call" => call_tool(&params, defaults, gate).await,
+        "tools/call" => call_tool(&params, defaults, gate, pool).await,
         _ => Err((-32601, format!("method not found: {method}"))),
     };
 
@@ -231,6 +245,7 @@ async fn call_tool(
     params: &Value,
     defaults: &Config,
     gate: Option<&Semaphore>,
+    pool: Option<&Tier2Pool>,
 ) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     if name != "draco_scrape" {
@@ -281,7 +296,12 @@ async fn call_tool(
         },
         None => None,
     };
-    let result = extract(url, &config).await;
+    // Prefer the daemon's warm isolate pool when present (HTTP transport);
+    // stdio has none and uses a one-shot capture.
+    let result = match pool {
+        Some(p) => extract_with_pool(url, &config, p).await,
+        None => extract(url, &config).await,
+    };
     drop(permit);
 
     let (code, body) = to_firecrawl(&result, format);
@@ -345,7 +365,8 @@ mod tests {
     }
 
     async fn dispatch(msg: Value) -> Option<Value> {
-        handle_message(&msg, &defaults(), None).await
+        // No gate, no pool: exercises the one-shot `extract` path.
+        handle_message(&msg, &defaults(), None, None).await
     }
 
     // ---- initialize ---------------------------------------------------------
@@ -434,6 +455,7 @@ mod tests {
         let state = Arc::new(AppState {
             defaults: defaults(),
             gate: Semaphore::new(2),
+            tier2_pool: draco_core::Tier2Pool::new(1, 100, true, false),
             crawl: Default::default(),
         });
         Router::new()

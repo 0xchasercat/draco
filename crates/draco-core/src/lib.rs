@@ -48,6 +48,10 @@ mod tier2;
 pub use challenge::{detect_challenge, ChallengeKind};
 pub use fetcher::{NetFetcher, PageFetcher};
 pub use machine::{clamp_tier_max, session_opts, ProdStatic, StaticEngine, TIER_CEILING};
+/// The warm Tier 2 worker pool for the daemon (real under `tier2`, a
+/// finalizes-`Unsupported` stub in the lean build). Paired with
+/// [`extract_with_pool`].
+pub use tier2::Tier2Pool;
 
 /// Re-export the jailed-child entry so the CLI's `__jail` re-exec hook can call
 /// it without depending on `draco-jail` directly. Only present with `tier2` on;
@@ -137,6 +141,20 @@ impl Default for Config {
 /// tier sequencing lives in [`machine`].
 pub async fn extract(url: &str, config: &Config) -> ExtractionResult {
     machine::run(url, config).await
+}
+
+/// Like [`extract`], but routes the Tier 2 capture through a warm
+/// [`Tier2Pool`] instead of spawning a fresh jailed child per scrape. Intended
+/// for the long-lived daemon, where the pool amortizes the process + sandbox
+/// setup across requests; the CLI keeps using [`extract`]. Same guarantees:
+/// never panics, never returns `Err` — every outcome is in the result.
+///
+/// Each capture still runs in a fresh isolate inside a reused worker process, so
+/// there is no cross-scrape state bleed (see [`Tier2Pool`]). A request whose
+/// sandbox posture differs from the pool's transparently falls back to a
+/// one-shot spawn.
+pub async fn extract_with_pool(url: &str, config: &Config, pool: &Tier2Pool) -> ExtractionResult {
+    machine::run_with_pool(url, config, pool).await
 }
 
 #[cfg(test)]

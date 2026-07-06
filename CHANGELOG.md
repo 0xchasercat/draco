@@ -3,6 +3,35 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.9.0] — 2026-07-06
+
+### Added
+- **Warm Tier 2 isolate pool for the daemon.** `draco serve` now keeps a set of
+  jailed capture workers alive and idle between scrapes, so each Tier 2 request
+  skips the per-scrape fork+exec + sandbox arming (unprivileged userns / netns /
+  seccomp-BPF / Landlock) + first snapshot cost instead of paying it every time.
+  - Each job still runs in a **fresh snapshot-restored isolate** inside a reused
+    worker process (the jailed child now loops over `Hydrate` jobs rather than
+    exiting after one), so there is **no cross-scrape state, cookie, or DOM
+    bleed** — only the expensive process + sandbox are reused, never the isolate.
+  - Workers are recycled after `--isolate-max-jobs` captures (default 100, leak
+    hygiene) and dropped (never reused) on any IPC error; the pool retires idle
+    workers on graceful shutdown.
+  - New flags: `--isolate-pool-size` (default `0` = auto, ≈ CPU count, which
+    also caps concurrent isolates) and `--isolate-max-jobs`. A request whose
+    sandbox posture (`noJail` / strict) differs from the pool's transparently
+    falls back to a one-shot spawn.
+  - `/v1/scrape`, `/v1/crawl`, and `POST /mcp` route through the pool; the CLI
+    (`draco extract`) and stdio MCP keep the one-shot path.
+  - New `draco-core` API: `extract_with_pool` + the `Tier2Pool` type (a
+    finalizes-`Unsupported` stub in the lean, non-`tier2` build).
+
+  Measured note: in the `--no-jail` sandbox the warm win is modest (~15%, only
+  fork+exec + V8 platform init amortized); the larger payoff is on bare-metal
+  jailed hosts where the pool also amortizes the userns/netns/seccomp/Landlock
+  arming that dominates a cold jailed spawn. Each job still pays its own snapshot
+  restore + capture window (the price of a guaranteed-fresh isolate).
+
 ## [0.8.1] — 2026-07-06
 
 ### Changed
