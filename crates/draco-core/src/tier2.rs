@@ -89,6 +89,7 @@ pub(crate) trait Tier2Capture: Send + Sync {
         html: &[u8],
         resources: &[ScriptResource],
         config: &Config,
+        opts: &draco_net::SessionOpts,
     ) -> Result<CaptureResult, DracoError>;
 }
 
@@ -272,6 +273,7 @@ impl Tier2Capture for DisabledCapture {
         _html: &[u8],
         _resources: &[ScriptResource],
         _config: &Config,
+        _opts: &draco_net::SessionOpts,
     ) -> Result<CaptureResult, DracoError> {
         Err(jail_error(
             JailKind::Spawn,
@@ -291,7 +293,12 @@ const MAX_INTERCEPTS: u32 = 64;
 /// Derive the quiesce window from the capture window: ~1/6th, clamped to a
 /// sensible `[150, 500]` ms band so a short capture window still gets a chance to
 /// idle-detect while a long one does not wait excessively.
-#[cfg(feature = "tier2")]
+const MAX_SUPERVISOR_CAPTURE_WINDOW_MS: u64 = 2_500;
+
+fn effective_capture_window_ms(requested: u64) -> u64 {
+    requested.min(MAX_SUPERVISOR_CAPTURE_WINDOW_MS)
+}
+
 fn default_quiesce_ms(capture_window_ms: u64) -> u64 {
     (capture_window_ms / 6).clamp(150, 500)
 }
@@ -342,8 +349,8 @@ mod prod {
     use draco_types::{DracoError, JailKind, JailToSupervisor, RuntimeOutcome, SupervisorToJail};
 
     use super::{
-        default_quiesce_ms, jail_error, CaptureResult, Config, ScriptResource, Tier2Capture,
-        MAX_INTERCEPTS,
+        default_quiesce_ms, effective_capture_window_ms, jail_error, CaptureResult, Config,
+        ScriptResource, Tier2Capture, MAX_INTERCEPTS,
     };
     use crate::ranking::Candidate;
 
@@ -358,20 +365,24 @@ mod prod {
             html: &[u8],
             resources: &[ScriptResource],
             config: &Config,
+            opts: &draco_net::SessionOpts,
         ) -> Result<CaptureResult, DracoError> {
             // The spawn + blocking IPC exchange runs off the async worker pool.
             let url = url.to_string();
             let html = html.to_vec();
             let resources = resources.to_vec();
             let config = config.clone();
-            tokio::task::spawn_blocking(move || capture_blocking(&url, &html, &resources, &config))
-                .await
-                .map_err(|e| {
-                    jail_error(
-                        JailKind::Spawn,
-                        format!("capture task panicked/cancelled: {e}"),
-                    )
-                })?
+            let opts = opts.clone();
+            tokio::task::spawn_blocking(move || {
+                capture_blocking(&url, &html, &resources, &config, &opts)
+            })
+            .await
+            .map_err(|e| {
+                jail_error(
+                    JailKind::Spawn,
+                    format!("capture task panicked/cancelled: {e}"),
+                )
+            })?
         }
     }
 
@@ -385,9 +396,10 @@ mod prod {
         html: &[u8],
         resources: &[ScriptResource],
         config: &Config,
+        opts: &draco_net::SessionOpts,
     ) -> Result<CaptureResult, DracoError> {
         let mut worker = Worker::spawn(config.no_jail, config.strict_sandbox)?;
-        let result = worker.run_job(url, html, resources, config);
+        let result = worker.run_job(url, html, resources, config, opts);
         // Always shut the one-shot worker down, whether the job succeeded or not,
         // so we never leak a child or a zombie.
         worker.shutdown();
@@ -458,6 +470,7 @@ mod prod {
             html: &[u8],
             resources: &[ScriptResource],
             config: &Config,
+            opts: &draco_net::SessionOpts,
         ) -> Result<CaptureResult, DracoError> {
             let ipc = self.handle.ipc_stream();
 
@@ -474,10 +487,11 @@ mod prod {
             }
 
             // 2. Send Hydrate with the page HTML as the frame body.
+            let capture_window_ms = effective_capture_window_ms(config.capture_window_ms);
             let hydrate = SupervisorToJail::Hydrate {
                 url: url.to_string(),
-                capture_window_ms: config.capture_window_ms,
-                quiesce_ms: default_quiesce_ms(config.capture_window_ms),
+                capture_window_ms,
+                quiesce_ms: default_quiesce_ms(capture_window_ms),
                 max_intercepts: MAX_INTERCEPTS,
                 stub_response_json: "{}".to_string(),
             };
@@ -521,6 +535,13 @@ mod prod {
                             via,
                         });
                         bodies.push(if has_body { Some(f.body) } else { None });
+                    }
+                    JailToSupervisor::LoadScript { id, url } => {
+                        let body = fetch_dynamic_script(&url, opts).unwrap_or_default();
+                        let ok = !body.is_empty();
+                        let reply = SupervisorToJail::Script { id, ok, url };
+                        frame::write_supervisor_frame(ipc, &reply, &body)
+                            .map_err(|e| map_frame_err(e, "sending Script"))?;
                     }
                     JailToSupervisor::Result { outcome, .. } => {
                         // The Result frame's body carries the hydrated DOM the
@@ -638,12 +659,13 @@ mod prod {
             html: &[u8],
             resources: &[ScriptResource],
             config: &Config,
+            opts: &draco_net::SessionOpts,
         ) -> Result<CaptureResult, DracoError> {
             let mut worker = match self.idle.lock().unwrap().pop() {
                 Some(w) => w,
                 None => Worker::spawn(self.no_jail, self.strict_sandbox)?,
             };
-            match worker.run_job(url, html, resources, config) {
+            match worker.run_job(url, html, resources, config, opts) {
                 Ok(result) => {
                     self.return_or_recycle(worker);
                     Ok(result)
@@ -682,6 +704,7 @@ mod prod {
             html: &[u8],
             resources: &[ScriptResource],
             config: &Config,
+            opts: &draco_net::SessionOpts,
         ) -> Result<CaptureResult, DracoError> {
             // A request that overrides the pool's sandbox posture can't use a
             // pooled worker (workers are spawned with a fixed posture) — fall back
@@ -689,7 +712,9 @@ mod prod {
             if config.no_jail != self.inner.no_jail
                 || config.strict_sandbox != self.inner.strict_sandbox
             {
-                return ProdTier2Capture.capture(url, html, resources, config).await;
+                return ProdTier2Capture
+                    .capture(url, html, resources, config, opts)
+                    .await;
             }
 
             let inner = self.inner.clone();
@@ -697,14 +722,17 @@ mod prod {
             let html = html.to_vec();
             let resources = resources.to_vec();
             let config = config.clone();
-            tokio::task::spawn_blocking(move || inner.run_pooled(&url, &html, &resources, &config))
-                .await
-                .map_err(|e| {
-                    jail_error(
-                        JailKind::Spawn,
-                        format!("pooled capture task panicked/cancelled: {e}"),
-                    )
-                })?
+            let opts = opts.clone();
+            tokio::task::spawn_blocking(move || {
+                inner.run_pooled(&url, &html, &resources, &config, &opts)
+            })
+            .await
+            .map_err(|e| {
+                jail_error(
+                    JailKind::Spawn,
+                    format!("pooled capture task panicked/cancelled: {e}"),
+                )
+            })?
         }
     }
 
@@ -806,6 +834,18 @@ mod prod {
     #[cfg(not(target_os = "linux"))]
     fn reap_pid(_pid: i32) {
         // Non-Linux degraded spawn manages child lifetime itself.
+    }
+
+    fn fetch_dynamic_script(url: &str, opts: &draco_net::SessionOpts) -> Option<Vec<u8>> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .enable_io()
+            .build()
+            .ok()?;
+        let resp = rt.block_on(draco_net::fetch_target(url, opts)).ok()?;
+        (200..300)
+            .contains(&resp.meta.status)
+            .then(|| resp.body.to_vec())
     }
 
     /// Map a frame-codec error to the most specific [`DracoError::Jail`].
@@ -974,6 +1014,7 @@ impl Tier2Capture for Tier2Pool {
         _html: &[u8],
         _resources: &[ScriptResource],
         _config: &Config,
+        _opts: &draco_net::SessionOpts,
     ) -> Result<CaptureResult, DracoError> {
         Err(jail_error(
             JailKind::Spawn,
@@ -1050,11 +1091,13 @@ mod tests {
     }
 
     #[test]
-    fn quiesce_is_clamped() {
-        // Only meaningful with the prod seam compiled, but the helper is
+    fn quiesce_and_capture_window_are_clamped() {
+        // Only meaningful with the prod seam compiled, but the helpers are
         // tier2-gated, so guard the assertion behind the same cfg.
         #[cfg(feature = "tier2")]
         {
+            assert_eq!(effective_capture_window_ms(2_000), 2_000);
+            assert_eq!(effective_capture_window_ms(60_000), 2_500);
             assert_eq!(default_quiesce_ms(0), 150);
             assert_eq!(default_quiesce_ms(600), 150); // 100 → floored at 150
             assert_eq!(default_quiesce_ms(1_800), 300); // 300

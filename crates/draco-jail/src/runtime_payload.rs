@@ -45,8 +45,10 @@ use std::collections::HashMap;
 use std::os::fd::FromRawFd;
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
-use draco_runtime::{CaptureConfig, CaptureReport, CapturedRequest};
+use draco_runtime::{CaptureConfig, CaptureReport, CapturedRequest, ScriptLoader};
 use draco_types::{JailToSupervisor, LogLevel, SupervisorToJail};
 
 use crate::frame::{self, FrameError};
@@ -160,6 +162,11 @@ pub fn run_capture_loop(
             SupervisorToJail::Resource { url } => {
                 resources.insert(url, msg.body);
             }
+            SupervisorToJail::Script { .. } => {
+                // Script responses are only expected while the runtime is actively
+                // servicing an op_raze_load_script request. Seeing one between jobs
+                // is protocol noise; ignore rather than poisoning the worker.
+            }
             SupervisorToJail::Hydrate {
                 url,
                 capture_window_ms,
@@ -180,7 +187,8 @@ pub fn run_capture_loop(
                 // capture() builds its OWN current-thread tokio runtime and a
                 // fresh snapshot-restored isolate per call (V8 flags latched once
                 // behind a `Once`). We are plain sync here — do NOT wrap it.
-                let report = capture(&url, &html, &cfg, std::mem::take(&mut resources));
+                let loader = make_script_loader(&stream)?;
+                let report = capture(&url, &html, &cfg, std::mem::take(&mut resources), loader);
                 emit_report(&mut stream, report)?;
                 // Job done. Loop for the next one; the resource map was consumed
                 // by `capture` (via `take`), so the next job starts with a clean
@@ -191,7 +199,37 @@ pub fn run_capture_loop(
     }
 }
 
-/// Indirection over [`draco_runtime::run_capture_with_resources`] so the wiring
+fn make_script_loader(stream: &UnixStream) -> Result<Option<Arc<ScriptLoader>>, PayloadError> {
+    let loader_stream = stream.try_clone().map_err(FrameError::Io)?;
+    let loader_stream = Arc::new(Mutex::new(loader_stream));
+    let seq = Arc::new(AtomicU32::new(1));
+    Ok(Some(Arc::new(move |url: &str| -> Option<Vec<u8>> {
+        let id = seq.fetch_add(1, Ordering::Relaxed);
+        let mut stream = loader_stream.lock().ok()?;
+        let req = JailToSupervisor::LoadScript {
+            id,
+            url: url.to_string(),
+        };
+        frame::write_jail_frame(&mut *stream, &req, &[]).ok()?;
+        loop {
+            let resp = frame::read_supervisor_frame(&mut *stream).ok()?;
+            match resp.header {
+                SupervisorToJail::Script { id: got, ok, .. } if got == id => {
+                    return ok.then_some(resp.body);
+                }
+                // Ignore unmatched script responses; the protocol is synchronous in
+                // production, so this is defensive only.
+                SupervisorToJail::Script { .. } => continue,
+                SupervisorToJail::Shutdown => return None,
+                SupervisorToJail::Resource { .. } | SupervisorToJail::Hydrate { .. } => {
+                    return None
+                }
+            }
+        }
+    })))
+}
+
+/// Indirection over [`draco_runtime::run_capture_with_resources_and_loader`] so the wiring
 /// tests can inject a canned [`CaptureReport`] instead of booting a real V8
 /// isolate (which is exercised by draco-runtime's own integration tests and the
 /// `#[ignore]`d full-jail smoke test). Production always calls the real engine.
@@ -201,8 +239,9 @@ fn capture(
     html: &str,
     cfg: &CaptureConfig,
     resources: HashMap<String, Vec<u8>>,
+    script_loader: Option<Arc<ScriptLoader>>,
 ) -> CaptureReport {
-    draco_runtime::run_capture_with_resources(url, html, cfg, resources)
+    draco_runtime::run_capture_with_resources_and_loader(url, html, cfg, resources, script_loader)
 }
 
 /// Test seam: return the [`CaptureReport`] queued by the current test.
@@ -212,6 +251,7 @@ fn capture(
     _html: &str,
     _cfg: &CaptureConfig,
     _resources: HashMap<String, Vec<u8>>,
+    _script_loader: Option<Arc<ScriptLoader>>,
 ) -> CaptureReport {
     tests::CANNED
         .lock()

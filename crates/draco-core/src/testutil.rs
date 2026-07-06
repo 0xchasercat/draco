@@ -334,6 +334,7 @@ impl Tier2Capture for MockCapture {
         _html: &[u8],
         _resources: &[crate::tier2::ScriptResource],
         _config: &crate::Config,
+        _opts: &draco_net::SessionOpts,
     ) -> Result<CaptureResult, DracoError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.result.clone()

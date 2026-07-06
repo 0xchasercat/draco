@@ -53,7 +53,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -125,6 +125,11 @@ pub struct CaptureReport {
     pub rendered_html: Option<String>,
 }
 
+/// Synchronous supervisor-backed script loader used for dynamically appended
+/// script chunks. The runtime stays network-free; production implementations route
+/// this through jail IPC to draco-core/draco-net.
+pub type ScriptLoader = dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static;
+
 /// Boot an isolate, evaluate `html`'s inline scripts under `url`, run the capture
 /// window, and return everything the page tried to fetch.
 ///
@@ -146,6 +151,18 @@ pub fn run_capture_with_resources(
     cfg: &CaptureConfig,
     resources: HashMap<String, Vec<u8>>,
 ) -> CaptureReport {
+    run_capture_with_resources_and_loader(url, html, cfg, resources, None)
+}
+
+/// As [`run_capture_with_resources`], but with a supervisor-backed dynamic script
+/// loader for chunk URLs not present in the initial resource map.
+pub fn run_capture_with_resources_and_loader(
+    url: &str,
+    html: &str,
+    cfg: &CaptureConfig,
+    resources: HashMap<String, Vec<u8>>,
+    script_loader: Option<Arc<ScriptLoader>>,
+) -> CaptureReport {
     ensure_v8_flags();
 
     // Current-thread tokio runtime, time driver only (see module docs).
@@ -165,7 +182,9 @@ pub fn run_capture_with_resources(
         }
     };
 
-    rt.block_on(async move { run_capture_inner_with_resources(url, html, cfg, resources).await })
+    rt.block_on(async move {
+        run_capture_inner_with_resources(url, html, cfg, resources, script_loader).await
+    })
 }
 
 /// Thin legacy entry retained from the stub. Not used by the jail directly (Slice
@@ -194,6 +213,9 @@ struct CaptureState {
     /// the page-side glue so dynamic `<script src>` chunk loaders can execute
     /// already-fetched chunks without giving the isolate network access.
     resources: Rc<RefCell<HashMap<String, Vec<u8>>>>,
+    /// Optional supervisor-backed loader for dynamic chunks not present in the
+    /// initial resource map.
+    script_loader: Option<Arc<ScriptLoader>>,
     /// The hydrated DOM serialized after the capture window (via `op_raze_dom`),
     /// for the render-then-Markdown escalation. `None` until serialization runs.
     rendered_html: Option<String>,
@@ -276,6 +298,21 @@ fn op_raze_resource(state: &mut OpState, #[string] url: String) -> Option<String
     out
 }
 
+/// Load a dynamic script chunk on demand through the supervisor-backed loader. The
+/// isolate still has no network access: production routes this op through IPC to
+/// the supervisor, which fetches with draco-net and returns source bytes.
+#[deno_core::op2]
+#[string]
+fn op_raze_load_script(state: &mut OpState, #[string] url: String) -> Option<String> {
+    let cap = state.borrow::<Rc<RefCell<CaptureState>>>().clone();
+    let loader = cap.borrow().script_loader.clone();
+    let bytes = loader.and_then(|load| load(&url))?;
+    // Cache successful on-demand loads so repeated chunk requests don't re-fetch.
+    let resources = cap.borrow().resources.clone();
+    resources.borrow_mut().insert(url, bytes.clone());
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// Receive the hydrated DOM serialized by the page side
 /// (`document.documentElement.outerHTML`) and stash it in [`CaptureState`] for the
 /// render-then-Markdown escalation. Called once, after the capture window closes.
@@ -329,7 +366,14 @@ fn op_resolve_url(#[string] base: String, #[string] rel: String) -> String {
 
 deno_core::extension!(
     draco_runtime_ext,
-    ops = [op_raze_fetch, op_sleep, op_resolve_url, op_raze_resource, op_raze_dom],
+    ops = [
+        op_raze_fetch,
+        op_sleep,
+        op_resolve_url,
+        op_raze_resource,
+        op_raze_load_script,
+        op_raze_dom,
+    ],
     options = { cap: Rc<RefCell<CaptureState>> },
     state = |state, options| {
         state.put::<Rc<RefCell<CaptureState>>>(options.cap);
@@ -416,6 +460,7 @@ async fn run_capture_inner_with_resources(
     html: &str,
     cfg: &CaptureConfig,
     resources: HashMap<String, Vec<u8>>,
+    script_loader: Option<Arc<ScriptLoader>>,
 ) -> CaptureReport {
     let stub_body = normalize_stub_body(&cfg.stub_response_json);
 
@@ -430,6 +475,7 @@ async fn run_capture_inner_with_resources(
         max_intercepts: cfg.max_intercepts,
         stub_body: stub_body.clone(),
         resources: modules.clone(),
+        script_loader,
         rendered_html: None,
     }));
 
@@ -1186,6 +1232,36 @@ mod tests {
         );
         assert_eq!(report.requests.len(), 1, "{report:?}");
         assert_eq!(report.requests[0].url, "https://example.com/api/from-chunk");
+    }
+
+    #[test]
+    fn appended_script_chunk_can_load_through_supervisor_callback() {
+        let html = r#"<script>
+            const s = document.createElement("script");
+            s.src = "/_next/static/chunks/on-demand.js";
+            document.head.appendChild(s);
+        </script>"#;
+        let loader: Arc<ScriptLoader> = Arc::new(|url| {
+            (url == "https://example.com/_next/static/chunks/on-demand.js")
+                .then(|| br#"fetch("/api/from-loader");"#.to_vec())
+        });
+        let report = run_capture_with_resources_and_loader(
+            "https://example.com/",
+            html,
+            &CaptureConfig {
+                capture_window_ms: 500,
+                quiesce_ms: 20,
+                max_intercepts: 8,
+                stub_response_json: "{}".to_string(),
+            },
+            HashMap::new(),
+            Some(loader),
+        );
+        assert_eq!(report.requests.len(), 1, "{report:?}");
+        assert_eq!(
+            report.requests[0].url,
+            "https://example.com/api/from-loader"
+        );
     }
 
     #[test]
