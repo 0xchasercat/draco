@@ -202,6 +202,14 @@ struct ScrapeRequest {
     ignore_robots: Option<bool>,
     #[serde(default)]
     proxy: Option<String>,
+    /// CSS selectors to keep (Firecrawl `includeTags`) / drop (`excludeTags`).
+    #[serde(default)]
+    include_tags: Option<Vec<String>>,
+    #[serde(default)]
+    exclude_tags: Option<Vec<String>>,
+    /// Extra request headers forwarded to the fetch (Firecrawl `headers`).
+    #[serde(default)]
+    headers: Option<std::collections::HashMap<String, String>>,
 }
 
 async fn scrape(
@@ -231,6 +239,13 @@ async fn scrape(
         only_main_content: req
             .only_main_content
             .unwrap_or(state.defaults.only_main_content),
+        include_tags: req.include_tags.clone().unwrap_or_default(),
+        exclude_tags: req.exclude_tags.clone().unwrap_or_default(),
+        headers: req
+            .headers
+            .clone()
+            .map(|m| m.into_iter().collect())
+            .unwrap_or_default(),
         proxy: req.proxy.clone().or_else(|| state.defaults.proxy.clone()),
         timeout_ms: req.timeout.unwrap_or(state.defaults.timeout_ms),
         tier_max: req.tier_max.unwrap_or(state.defaults.tier_max),

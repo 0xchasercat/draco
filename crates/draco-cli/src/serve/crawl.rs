@@ -243,6 +243,12 @@ pub(crate) struct CrawlRequest {
 struct ScrapeOptions {
     #[serde(default)]
     formats: Vec<String>,
+    #[serde(default)]
+    include_tags: Option<Vec<String>>,
+    #[serde(default)]
+    exclude_tags: Option<Vec<String>>,
+    #[serde(default)]
+    headers: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Everything the BFS worker needs, resolved at admission time so the worker
@@ -315,6 +321,18 @@ pub(crate) async fn start_handler(
 
     let mut config = state.defaults.clone();
     config.formats = parsed_formats;
+    // Per-page content shaping from the nested scrapeOptions (Firecrawl parity).
+    if let Some(opts) = req.scrape_options.as_ref() {
+        if let Some(inc) = &opts.include_tags {
+            config.include_tags = inc.clone();
+        }
+        if let Some(exc) = &opts.exclude_tags {
+            config.exclude_tags = exc.clone();
+        }
+        if let Some(h) = &opts.headers {
+            config.headers = h.clone().into_iter().collect();
+        }
+    }
     if let Some(t) = req.timeout {
         config.timeout_ms = t;
     }
