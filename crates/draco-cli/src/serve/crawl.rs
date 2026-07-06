@@ -51,7 +51,7 @@ use std::sync::{Arc, Mutex};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use draco_core::{extract_with_pool, Config, OutputFormat};
+use draco_core::{extract_with_pool, Config};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -258,7 +258,6 @@ struct CrawlPlan {
     exclude_paths: Vec<Regex>,
     regex_on_full_url: bool,
     allow_external: bool,
-    format: OutputFormat,
     config: Config,
 }
 
@@ -288,9 +287,16 @@ pub(crate) async fn start_handler(
         .as_ref()
         .map(|o| o.formats.clone())
         .unwrap_or_default();
-    let (format, discover) = match parse_formats(&formats) {
+    let parsed_formats = match parse_formats(&formats) {
         Ok(f) => f,
-        Err(msg) => return (StatusCode::BAD_REQUEST, Json(error_body(&msg))),
+        Err(rej) => {
+            let code = if rej.unsupported {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return (code, Json(error_body(&rej.message)));
+        }
     };
     let include_paths = match compile_path_patterns(
         req.include_paths.as_deref().unwrap_or_default(),
@@ -308,8 +314,7 @@ pub(crate) async fn start_handler(
     };
 
     let mut config = state.defaults.clone();
-    config.format = format;
-    config.discover_endpoints = discover;
+    config.formats = parsed_formats;
     if let Some(t) = req.timeout {
         config.timeout_ms = t;
     }
@@ -321,7 +326,6 @@ pub(crate) async fn start_handler(
         exclude_paths,
         regex_on_full_url: req.regex_on_full_url,
         allow_external: req.allow_external_links.unwrap_or(false),
-        format,
         config,
     };
 
@@ -395,7 +399,7 @@ async fn run_crawl(state: Arc<AppState>, id: String, plan: CrawlPlan) {
                 break; // Gate closed: daemon shutting down.
             };
             let result = extract_with_pool(&page_url, &plan.config, &state.tier2_pool).await;
-            let (code, mut body) = to_firecrawl(&result, plan.format);
+            let (code, mut body) = to_firecrawl(&result);
             if code == StatusCode::OK {
                 Some((body["data"].take(), result.markdown))
             } else {

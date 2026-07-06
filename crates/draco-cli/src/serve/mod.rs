@@ -34,7 +34,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use draco_core::{extract_with_pool, Config, OutputFormat, Tier2Pool};
+use draco_core::{extract_with_pool, Config, FormatSet, Tier2Pool};
 use draco_types::{DracoError, ExtractionResult, Status};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -192,9 +192,16 @@ async fn scrape(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ScrapeRequest>,
 ) -> (StatusCode, Json<Value>) {
-    let (format, discover) = match parse_formats(&req.formats) {
+    let formats = match parse_formats(&req.formats) {
         Ok(f) => f,
-        Err(msg) => return (StatusCode::BAD_REQUEST, Json(error_body(&msg))),
+        Err(rej) => {
+            let code = if rej.unsupported {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return (code, Json(error_body(&rej.message)));
+        }
     };
     if req.url.trim().is_empty() {
         return (
@@ -204,8 +211,7 @@ async fn scrape(
     }
 
     let config = Config {
-        format,
-        discover_endpoints: discover,
+        formats,
         proxy: req.proxy.clone().or_else(|| state.defaults.proxy.clone()),
         timeout_ms: req.timeout.unwrap_or(state.defaults.timeout_ms),
         tier_max: req.tier_max.unwrap_or(state.defaults.tier_max),
@@ -233,7 +239,7 @@ async fn scrape(
         );
     };
     let result = extract_with_pool(&req.url, &config, &state.tier2_pool).await;
-    let (code, body) = to_firecrawl(&result, format);
+    let (code, body) = to_firecrawl(&result);
     (code, Json(body))
 }
 
@@ -241,49 +247,75 @@ async fn scrape(
 // Mapping
 // ===================================================================
 
-/// Parse Firecrawl `formats` into Draco's [`OutputFormat`]. Empty defaults to
-/// Markdown (Firecrawl's default). Recognized-but-unsupported formats fail
-/// loudly — a client asking for `rawHtml` should not get a silently different
-/// payload.
-pub(crate) fn parse_formats(formats: &[String]) -> Result<(OutputFormat, bool), String> {
-    let (mut markdown, mut json, mut endpoints) = (false, false, false);
+/// A rejected `formats` entry, carrying whether it was *unknown* (HTTP 400 — we
+/// don't recognize the token) or *unsupported* (HTTP 422 — recognized, but a
+/// DOM-only engine can't satisfy it, e.g. `screenshot`).
+pub(crate) struct FormatReject {
+    /// `true` → recognized but this engine can't produce it (map to 422);
+    /// `false` → unknown token (map to 400).
+    pub unsupported: bool,
+    pub message: String,
+}
+
+impl FormatReject {
+    fn unsupported(message: String) -> Self {
+        Self {
+            unsupported: true,
+            message,
+        }
+    }
+    fn unknown(message: String) -> Self {
+        Self {
+            unsupported: false,
+            message,
+        }
+    }
+}
+
+/// Parse Firecrawl `formats` into a Draco [`FormatSet`]. Empty defaults to
+/// `markdown` (Firecrawl's default). Supported: `markdown`, `html`, `rawHtml`,
+/// `links`, `json`, `endpoints`. Browser-only formats (`screenshot`,
+/// `screenshot@fullPage`, `actions`) and not-yet-implemented ones (`extract`,
+/// `changeTracking`, `summary`, `branding`, `product`, `menu`) are rejected as
+/// *unsupported* (422 — understood, but a DOM-only engine can't satisfy them);
+/// anything else is *unknown* (400). A client asking for `screenshot` should get
+/// a clear "needs a browser", not a silently different payload.
+pub(crate) fn parse_formats(formats: &[String]) -> Result<FormatSet, FormatReject> {
+    let mut set = FormatSet::none();
     for f in formats {
         match f.as_str() {
-            "markdown" => markdown = true,
-            "json" => json = true,
+            "markdown" => set.markdown = true,
+            "html" => set.html = true,
+            "rawHtml" => set.raw_html = true,
+            "links" => set.links = true,
+            "json" => set.json = true,
             // Discovery: the ranked catalog of API endpoints the page calls.
             // Composes with the content formats and rides `data.endpoints`.
-            "endpoints" => endpoints = true,
-            "html"
-            | "rawHtml"
-            | "links"
-            | "screenshot"
-            | "screenshot@fullPage"
-            | "extract"
-            | "changeTracking"
-            | "summary" => {
-                return Err(format!(
-                    "format {f:?} is not supported yet — supported formats: \
-                     \"markdown\", \"json\", \"endpoints\""
-                ));
+            "endpoints" => set.endpoints = true,
+            "screenshot" | "screenshot@fullPage" | "actions" => {
+                return Err(FormatReject::unsupported(format!(
+                    "format {f:?} needs a real browser — Draco is a DOM-only engine \
+                     and cannot capture screenshots or drive page actions"
+                )));
+            }
+            "extract" | "changeTracking" | "summary" | "branding" | "product" | "menu" => {
+                return Err(FormatReject::unsupported(format!(
+                    "format {f:?} is not supported by this engine"
+                )));
             }
             other => {
-                return Err(format!(
-                    "unknown format {other:?} — supported formats: \
-                     \"markdown\", \"json\", \"endpoints\""
-                ));
+                return Err(FormatReject::unknown(format!(
+                    "unknown format {other:?} — supported formats: \"markdown\", \
+                     \"html\", \"rawHtml\", \"links\", \"json\", \"endpoints\""
+                )));
             }
         }
     }
-    // Discovery replays the winner into `data` (discovery + replay), so its
-    // content dimension is the JSON path unless Markdown was also asked for.
-    let format = match (markdown, json || endpoints) {
-        (true, true) => OutputFormat::Both,
-        (false, true) => OutputFormat::Json,
-        // No formats given, or just "markdown".
-        _ => OutputFormat::Markdown,
-    };
-    Ok((format, endpoints))
+    // Empty `formats` → Firecrawl's default of markdown.
+    if formats.is_empty() {
+        set.markdown = true;
+    }
+    Ok(set)
 }
 
 /// Firecrawl error envelope.
@@ -292,7 +324,12 @@ pub(crate) fn error_body(message: &str) -> Value {
 }
 
 /// Map a terminal [`ExtractionResult`] to (HTTP status, Firecrawl body).
-pub(crate) fn to_firecrawl(result: &ExtractionResult, format: OutputFormat) -> (StatusCode, Value) {
+///
+/// Each output rides on its presence in the result: the machine only populates
+/// `markdown`/`html`/`rawHtml`/`links`/`data`/`endpoints` for formats the request
+/// actually asked for, so emitting whatever is `Some` reproduces the requested
+/// `formats` exactly — no separate format argument needed.
+pub(crate) fn to_firecrawl(result: &ExtractionResult) -> (StatusCode, Value) {
     let draco_ext = json!({
         "sourceTier": result.source_tier,
         "timing": result.timing,
@@ -304,10 +341,20 @@ pub(crate) fn to_firecrawl(result: &ExtractionResult, format: OutputFormat) -> (
         if let Some(md) = &result.markdown {
             data.insert("markdown".into(), Value::String(md.clone()));
         }
-        if matches!(format, OutputFormat::Json | OutputFormat::Both) {
-            if let Some(d) = &result.data {
-                data.insert("json".into(), d.clone());
-            }
+        if let Some(h) = &result.html {
+            data.insert("html".into(), Value::String(h.clone()));
+        }
+        if let Some(rh) = &result.raw_html {
+            data.insert("rawHtml".into(), Value::String(rh.clone()));
+        }
+        if let Some(links) = &result.links {
+            data.insert(
+                "links".into(),
+                serde_json::to_value(links).unwrap_or(Value::Null),
+            );
+        }
+        if let Some(d) = &result.data {
+            data.insert("json".into(), d.clone());
         }
         // The discovered API-endpoint catalog (the `endpoints` format), when
         // discovery ran. Rides `data.endpoints` alongside the content formats.
