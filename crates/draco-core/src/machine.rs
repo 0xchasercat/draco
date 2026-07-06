@@ -1145,13 +1145,8 @@ async fn try_render_markdown<F, T>(
     // Merge the shell's real <head> (title, OG, canonical, <base>) with the
     // hydrated <body>, then re-run the identical Firecrawl-parity content engine.
     let merged = draco_static::content::merge_rendered_document(body, rendered);
-    let rescraped = draco_static::content::scrape(
-        &merged,
-        url,
-        status,
-        content_type,
-        config.only_main_content,
-    );
+    let rescraped =
+        draco_static::content::scrape(&merged, url, status, content_type, config.only_main_content);
 
     let prev_len = run.markdown.as_deref().map(nonws_len).unwrap_or(0);
     let new_len = nonws_len(&rescraped.markdown);
