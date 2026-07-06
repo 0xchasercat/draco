@@ -1183,6 +1183,8 @@ fn extract_chunk_candidates(src: &str) -> Vec<String> {
         )
         .unwrap()
     });
+    static NUMERIC_STRING_PAIR_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r#"(\d+)\s*:\s*["']([^"']+?)["']"#).unwrap());
 
     let mut out = Vec::new();
     for caps in DIRECT_CHUNK_RE.captures_iter(src) {
@@ -1199,9 +1201,54 @@ fn extract_chunk_candidates(src: &str) -> Vec<String> {
         };
         out.push(format!("./{name}.{hash}.js"));
     }
+
+    // Common Next/Webpack shape: one function maps chunk id -> chunk basename and
+    // another maps chunk id -> content hash, then the runtime concatenates them.
+    // Example observed in the wild: id 7871 => name `7722f4ca`, hash
+    // `78bc63657a3a3377`, requested as `/_next/static/chunks/7722f4ca.78bc...js`.
+    let mut by_id: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for caps in NUMERIC_STRING_PAIR_RE.captures_iter(src) {
+        let Some(id) = caps.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        let Some(value) = caps.get(2).map(|m| m.as_str()) else {
+            continue;
+        };
+        if value.ends_with(".js") || value.contains('/') || value.len() < 4 {
+            continue;
+        }
+        by_id.entry(id).or_default().push(value);
+    }
+    for values in by_id.values() {
+        for (i, a) in values.iter().enumerate() {
+            for b in values.iter().skip(i + 1) {
+                if looks_like_chunk_part(a) && looks_like_hash_part(b) {
+                    out.push(format!("./{a}.{b}.js"));
+                }
+                if looks_like_chunk_part(b) && looks_like_hash_part(a) {
+                    out.push(format!("./{b}.{a}.js"));
+                }
+            }
+        }
+    }
     out.sort();
     out.dedup();
     out
+}
+
+#[cfg(feature = "tier2")]
+fn looks_like_chunk_part(value: &str) -> bool {
+    // Chunk basenames are often short hex-ish ids, numeric ids, or human-readable
+    // route names. Exclude long content hashes to avoid producing hash.hash.js.
+    !looks_like_hash_part(value) && value.len() <= 80
+}
+
+#[cfg(feature = "tier2")]
+fn looks_like_hash_part(value: &str) -> bool {
+    // Next/Webpack chunk basenames can themselves be short hex strings (for
+    // example `7722f4ca`), while content hashes tend to be longer. Keep the
+    // threshold above short basenames so name+hash maps still combine.
+    value.len() >= 12 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Extract ES-module import/export specifiers from JS source via the **Oxc**
@@ -1722,6 +1769,7 @@ mod tests {
         let src = r#"
             var a = "/_next/static/chunks/direct.abc123.js";
             f.u = function(e) { return ({7871:"7722f4ca"}[e] || e) + ".78bc63657a3a3377.js"; }
+            f.u2 = function(e) { return ({7871:"7722f4ca"}[e] || e) + "." + ({7871:"78bc63657a3a3377"}[e] || "x") + ".js"; }
         "#;
         let got = extract_chunk_candidates(src);
         assert!(
@@ -1731,6 +1779,13 @@ mod tests {
         assert!(
             got.contains(&"./7722f4ca.78bc63657a3a3377.js".to_string()),
             "{got:?}"
+        );
+        assert_eq!(
+            got.iter()
+                .filter(|v| v.as_str() == "./7722f4ca.78bc63657a3a3377.js")
+                .count(),
+            1,
+            "deduped candidate list: {got:?}"
         );
     }
 
