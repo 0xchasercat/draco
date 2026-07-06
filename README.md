@@ -147,6 +147,16 @@ Concurrency is bounded (`--max-concurrency`, default 8); excess requests queue.
 Warm-process SPA hydration answers in ~150 ms end-to-end on the local benchmark
 fixture (fetch → hydrate → serialize → Markdown).
 
+**Warm isolate pool.** Tier 2 scrapes are served by a pool of jailed capture
+workers kept alive between requests (`--isolate-pool-size`, default `0` = auto ≈
+CPU count; also caps concurrent isolates), so a scrape skips the per-request
+fork + sandbox-arming (userns/netns/seccomp/Landlock) + first-snapshot cost.
+Each job still runs in a **fresh isolate** inside a reused worker — no
+cross-scrape state, cookie, or DOM bleed — and workers recycle after
+`--isolate-max-jobs` captures (default 100). A request that overrides the pool's
+sandbox posture falls back to a one-shot spawn. `draco extract` (one shot) is
+unaffected.
+
 Beyond scraping, the daemon speaks two more Firecrawl endpoints:
 
 - **`POST /v1/map`** — fast site URL discovery: merges `/sitemap.xml` (sitemap

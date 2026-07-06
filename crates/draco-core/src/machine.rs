@@ -253,6 +253,18 @@ pub(crate) async fn run(url: &str, config: &Config) -> ExtractionResult {
     run_ladder(url, config, &NetFetcher, &ProdStatic, &capture).await
 }
 
+/// Run the ladder using a warm [`Tier2Pool`](crate::Tier2Pool) as the Tier 2
+/// capture seam instead of spawning a fresh child per scrape. This is what the
+/// daemon ([`crate::extract_with_pool`]) calls; the network + static seams are
+/// the same production adapters as [`run`].
+pub(crate) async fn run_with_pool(
+    url: &str,
+    config: &Config,
+    pool: &crate::tier2::Tier2Pool,
+) -> ExtractionResult {
+    run_ladder(url, config, &NetFetcher, &ProdStatic, pool).await
+}
+
 /// The escalation ladder, generic over its three effect seams (network, static
 /// extraction, Tier 2 capture) so it can be exercised offline. See module docs.
 ///
