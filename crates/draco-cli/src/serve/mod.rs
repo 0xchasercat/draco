@@ -43,10 +43,15 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
+/// `POST /v1/batch/scrape` + `GET|DELETE /v1/batch/scrape/{id}` — async
+/// scrape-a-list-of-URLs jobs.
+pub(crate) mod batch;
 /// `POST /v1/crawl` + `GET|DELETE /v1/crawl/{id}` — async whole-site crawl jobs.
 pub(crate) mod crawl;
 /// `POST /v1/discover` — JSON/XHR API endpoint discovery + winner replay.
 pub(crate) mod discover;
+/// Shared async-job registry (`JobStore`) for crawl + batch scrape.
+pub(crate) mod jobs;
 /// `POST /v1/map` — fast site URL discovery (sitemap + on-page links).
 pub(crate) mod map;
 
@@ -76,7 +81,9 @@ pub(crate) struct AppState {
     /// capture inside the pool.
     pub(crate) tier2_pool: Tier2Pool,
     /// In-memory registry of async crawl jobs (`/v1/crawl`).
-    pub(crate) crawl: crawl::JobStore,
+    pub(crate) crawl: jobs::JobStore,
+    /// In-memory registry of async batch-scrape jobs (`/v1/batch/scrape`).
+    pub(crate) batch: jobs::JobStore,
 }
 
 // ===================================================================
@@ -98,7 +105,8 @@ pub async fn serve(opts: ServeOptions) -> Result<(), String> {
         defaults: opts.defaults,
         gate: Semaphore::new(opts.max_concurrency.max(1)),
         tier2_pool,
-        crawl: crawl::JobStore::default(),
+        crawl: jobs::JobStore::default(),
+        batch: jobs::JobStore::default(),
     });
     let addr = format!("{}:{}", opts.host, opts.port);
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -131,6 +139,13 @@ fn router(state: Arc<AppState>) -> Router {
             "/v1/crawl/{id}",
             get(crawl::status_handler).delete(crawl::cancel_handler),
         )
+        .route("/v1/crawl/{id}/errors", get(crawl::errors_handler))
+        .route("/v1/batch/scrape", post(batch::start_handler))
+        .route(
+            "/v1/batch/scrape/{id}",
+            get(batch::status_handler).delete(batch::cancel_handler),
+        )
+        .route("/v1/batch/scrape/{id}/errors", get(batch::errors_handler))
         .route("/mcp", post(crate::mcp::http_handler))
         .with_state(state)
 }
@@ -361,6 +376,17 @@ pub(crate) fn error_body(message: &str) -> Value {
     json!({ "success": false, "error": message })
 }
 
+/// Pagination query for async-job status endpoints (`?skip=&limit=`), shared by
+/// `/v1/crawl/{id}` and `/v1/batch/scrape/{id}`. Both default to "from the
+/// start, everything (up to the 10 MiB page cap)".
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct PageQuery {
+    #[serde(default)]
+    pub(crate) skip: Option<usize>,
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+}
+
 /// Map a terminal [`ExtractionResult`] to (HTTP status, Firecrawl body).
 ///
 /// Each output rides on its presence in the result: the machine only populates
@@ -470,7 +496,8 @@ mod tests {
             defaults,
             gate: Semaphore::new(2),
             tier2_pool: Tier2Pool::new(1, 100, true, false),
-            crawl: crawl::JobStore::default(),
+            crawl: jobs::JobStore::default(),
+            batch: jobs::JobStore::default(),
         })
     }
 
