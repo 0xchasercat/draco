@@ -211,9 +211,19 @@ fn scrape_tool_descriptor() -> Value {
                 },
                 "formats": {
                     "type": "array",
-                    "items": { "type": "string", "enum": ["markdown", "json"] },
-                    "description": "Output formats; defaults to [\"markdown\"]. \"json\" is \
-                                    the tiered JSON-API extraction."
+                    "items": { "type": "string", "enum": ["markdown", "html", "rawHtml", "links", "json", "endpoints"] },
+                    "description": "Output formats; defaults to [\"markdown\"]. \"html\" is \
+                                    cleaned main-content HTML, \"rawHtml\" the unmodified fetch, \
+                                    \"links\" every absolutized link, \"json\" the tiered JSON-API \
+                                    extraction, \"endpoints\" the ranked API-endpoint catalog."
+                },
+                "onlyMainContent": {
+                    "type": "boolean",
+                    "description": "Strip nav/header/footer/ads to the main content (default true)."
+                },
+                "waitFor": {
+                    "type": "integer",
+                    "description": "Alias for captureWindowMs: ms to let the page settle (Tier 2)."
                 },
                 "tierMax": {
                     "type": "integer",
@@ -322,6 +332,12 @@ async fn call_tool(
     }
     if let Some(w) = args.get("captureWindowMs").and_then(Value::as_u64) {
         config.capture_window_ms = w;
+    } else if let Some(w) = args.get("waitFor").and_then(Value::as_u64) {
+        // Firecrawl-style alias; explicit captureWindowMs (above) wins.
+        config.capture_window_ms = w;
+    }
+    if let Some(only_main) = args.get("onlyMainContent").and_then(Value::as_bool) {
+        config.only_main_content = only_main;
     }
     if let Some(t) = args.get("timeout").and_then(Value::as_u64) {
         config.timeout_ms = t;

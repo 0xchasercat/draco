@@ -6,7 +6,7 @@ a browser-faithful TLS/JA4 fingerprint to reach pages that block ordinary client
 No Node, no headless-Chrome fleet, no per-request browser boot.
 
 ```sh
-draco extract https://example.com          # → clean Markdown on stdout
+draco scrape https://example.com          # → clean Markdown on stdout
 ```
 
 For a standard HTML page that's a single fingerprinted fetch + parse — typically
@@ -45,13 +45,13 @@ Build prerequisites (for wreq's BoringSSL + bindgen; and V8, only for the option
 
 ```sh
 # Default: URL → Markdown on stdout (great for piping)
-draco extract https://example.com > page.md
+draco scrape https://example.com > page.md
 
 # Full envelope (markdown + metadata + trace) as JSON
-draco extract https://example.com --json --pretty
+draco scrape https://example.com --json --pretty
 
 # Stealth + politeness
-draco extract https://example.com --proxy socks5://127.0.0.1:9050 --delay 500
+draco scrape https://example.com --proxy socks5://127.0.0.1:9050 --delay 500
 ```
 
 Exit codes: `0` success · `1` error · `2` unsupported · `3` needs_browser.
@@ -70,13 +70,14 @@ tier that yields data:
    oracle*, not a renderer.
 
 ```sh
-draco extract https://app.example.com --format json --pretty       # data[]
-draco extract https://app.example.com --format json --extract '$.props.pageProps'
-draco extract https://app.example.com --format both                # markdown + data
+draco scrape https://app.example.com --format json --pretty       # data[]
+draco scrape https://app.example.com --format json --extract '$.props.pageProps'
+draco scrape https://app.example.com --format both                # markdown + data
 ```
 
-Flags: `--format <markdown|json|both>` (default `markdown`), `--json`, `--extract
-<JSONPATH>`, `--tier-max <0|1|2>`, `--proxy`, `--delay <ms>`, `--timeout <ms>`,
+Flags: `--format <markdown|html|raw-html|links|json|endpoints|both>` (repeatable;
+default `markdown`; `both` = `markdown`+`json`), `--json`, `--extract
+<JSONPATH>`, `--no-main-content`, `--wait-for <ms>`, `--tier-max <0|1|2>`, `--proxy`, `--delay <ms>`, `--timeout <ms>`,
 `--capture-window-ms <ms>`, `--ignore-robots`, `--no-jail`, `--strict-sandbox`,
 `--allow-unsafe-replay`, `--pretty`.
 
@@ -92,8 +93,8 @@ Markdown from a client-rendered page with no headless browser — the trace show
 `runtime.render` step and `source_tier: runtime_interception`.
 
 ```sh
-draco extract https://spa.example.com            # thin shell → hydrated Markdown
-draco extract https://spa.example.com --tier-max 1   # opt out: static shell only
+draco scrape https://spa.example.com            # thin shell → hydrated Markdown
+draco scrape https://spa.example.com --tier-max 1   # opt out: static shell only
 ```
 
 This also covers **skeleton screens**: a page that ships lots of chrome but whose
@@ -154,7 +155,7 @@ fork + sandbox-arming (userns/netns/seccomp/Landlock) + first-snapshot cost.
 Each job still runs in a **fresh isolate** inside a reused worker — no
 cross-scrape state, cookie, or DOM bleed — and workers recycle after
 `--isolate-max-jobs` captures (default 100). A request that overrides the pool's
-sandbox posture falls back to a one-shot spawn. `draco extract` (one shot) is
+sandbox posture falls back to a one-shot spawn. `draco scrape` (one shot) is
 unaffected.
 
 Beyond scraping, the daemon speaks two more Firecrawl endpoints:
@@ -184,7 +185,7 @@ Tier 2 isolate already intercepts every `fetch`/XHR to pick a replay winner —
 the APIs behind a SPA:
 
 ```sh
-draco extract https://shop.example --format endpoints --pretty   # catalog + replayed winner
+draco scrape https://shop.example --format endpoints --pretty   # catalog + replayed winner
 ```
 ```sh
 curl -X POST localhost:3002/v1/discover -H 'content-type: application/json' \
