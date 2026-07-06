@@ -36,4 +36,7 @@ base64 = "0.22"
 
 [dev-dependencies]
 # Drive the async surface in unit tests (offline only; live tests are #[ignore]).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+# Localhost fixture server for the pooling / cookie-isolation integration tests
+# (already in the workspace lock via draco-cli — no new external download).
+axum = "0.8"
