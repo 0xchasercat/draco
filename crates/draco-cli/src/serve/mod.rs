@@ -54,6 +54,8 @@ pub(crate) mod discover;
 pub(crate) mod jobs;
 /// `POST /v1/map` — fast site URL discovery (sitemap + on-page links).
 pub(crate) mod map;
+/// Firecrawl-compatible webhook delivery for crawl + batch jobs.
+pub(crate) mod webhook;
 
 // ===================================================================
 // Options & state

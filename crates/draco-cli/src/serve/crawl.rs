@@ -96,6 +96,9 @@ pub(crate) struct CrawlRequest {
     /// Per-page total timeout in ms.
     #[serde(default)]
     timeout: Option<u64>,
+    /// Optional webhook (bare URL string or object) for lifecycle events.
+    #[serde(default)]
+    webhook: Option<super::webhook::WebhookSpec>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -208,7 +211,8 @@ pub(crate) async fn start_handler(
     };
 
     let id = state.crawl.create_seeded();
-    tokio::spawn(run_crawl(state.clone(), id.clone(), plan));
+    let sink = super::webhook::WebhookSink::new(req.webhook, id.clone(), "crawl");
+    tokio::spawn(run_crawl(state.clone(), id.clone(), plan, sink));
 
     // The status URL is relative: the daemon can't reliably know the external
     // host/scheme clients reach it by (reverse proxies, port maps), and a
@@ -284,7 +288,15 @@ enum PageOutcome {
 /// The BFS worker: scrape pages breadth-first from the seed, harvesting new
 /// frontier URLs from each page's Markdown, until the frontier drains, the
 /// page budget is spent, or the job is cancelled.
-async fn run_crawl(state: Arc<AppState>, id: String, plan: CrawlPlan) {
+async fn run_crawl(
+    state: Arc<AppState>,
+    id: String,
+    plan: CrawlPlan,
+    sink: super::webhook::WebhookSink,
+) {
+    use super::webhook::WebhookEvent;
+    sink.emit(WebhookEvent::Started, json!([]));
+
     let mut frontier: VecDeque<(String, usize)> = VecDeque::new();
     let mut admitted: HashSet<String> = HashSet::new();
     let seed = normalized(&plan.seed);
@@ -323,6 +335,7 @@ async fn run_crawl(state: Arc<AppState>, id: String, plan: CrawlPlan) {
 
         match outcome {
             PageOutcome::Ok(data, markdown) => {
+                sink.emit(WebhookEvent::Page, json!([data.clone()]));
                 state.crawl.record_page(&id, Some(data));
                 // Frontier growth from this page's Markdown links (children
                 // sit at depth + 1, which must stay within max_depth).
@@ -355,7 +368,12 @@ async fn run_crawl(state: Arc<AppState>, id: String, plan: CrawlPlan) {
             }
         }
     }
-    state.crawl.finish(&id);
+    // Terminal event: completed / failed. Cancelled (or unknown) fires neither.
+    match state.crawl.finish(&id) {
+        Some(super::jobs::JobStatus::Completed) => sink.emit(WebhookEvent::Completed, json!([])),
+        Some(super::jobs::JobStatus::Failed) => sink.emit(WebhookEvent::Failed, json!([])),
+        _ => {}
+    }
 }
 
 /// Fragment-stripped canonical string form used for dedupe and scraping.
