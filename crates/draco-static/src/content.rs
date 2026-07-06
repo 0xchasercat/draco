@@ -397,6 +397,60 @@ fn preprocess_dom(html: &str, url: &str, only_main_content: bool) -> String {
     body_inner_html(&document)
 }
 
+/// Cleaned, absolutized HTML of the page — the `html` scrape format.
+///
+/// This is exactly the DOM pre-processing that feeds the Markdown transform
+/// (scripts/styles/chrome stripped, responsive images collapsed, `a[href]`/
+/// `img[src]` absolutized), serialized back to HTML instead of converted to
+/// Markdown. With `only_main_content` the boilerplate regions are dropped to the
+/// article body; otherwise the whole cleaned document is returned.
+pub fn clean_html(html: &str, url: &str, only_main_content: bool) -> String {
+    preprocess_dom(html, url, only_main_content)
+}
+
+/// Every absolutized `<a href>` on the page, de-duplicated in document order —
+/// the `links` scrape format. Hrefs are resolved against `<base href>` (or the
+/// page URL); `javascript:`/`mailto:`/`tel:` and empty/fragment-only hrefs are
+/// skipped. Never panics: an unparseable href is simply dropped.
+pub fn extract_links(html: &str, url: &str) -> Vec<String> {
+    let document = Html::parse_document(html);
+    let base = base_href(&document, url);
+    let base_url = base.as_deref().and_then(|b| url::Url::parse(b).ok());
+    let Ok(sel) = Selector::parse("a[href]") else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for el in document.select(&sel) {
+        let Some(href) = el.value().attr("href") else {
+            continue;
+        };
+        let href = href.trim();
+        if href.is_empty() || href.starts_with('#') {
+            continue;
+        }
+        let lower = href.to_ascii_lowercase();
+        if lower.starts_with("javascript:")
+            || lower.starts_with("mailto:")
+            || lower.starts_with("tel:")
+        {
+            continue;
+        }
+        // Absolutize against the base when possible; keep already-absolute URLs.
+        let resolved = match &base_url {
+            Some(b) => b.join(href).map(|u| u.to_string()).unwrap_or_default(),
+            None => href.to_string(),
+        };
+        if resolved.is_empty() {
+            continue;
+        }
+        if seen.insert(resolved.clone()) {
+            out.push(resolved);
+        }
+    }
+    out
+}
+
 /// Detach every element matching any selector in `selectors`.
 fn detach_matching(document: &mut Html, selectors: &[&str]) {
     let mut ids = Vec::new();
