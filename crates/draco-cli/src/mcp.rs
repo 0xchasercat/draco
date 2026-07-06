@@ -137,7 +137,9 @@ async fn handle_message(
     let outcome: Result<Value, (i64, String)> = match method {
         "initialize" => Ok(initialize_result(&params)),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": [scrape_tool_descriptor()] })),
+        "tools/list" => {
+            Ok(json!({ "tools": [scrape_tool_descriptor(), discover_tool_descriptor()] }))
+        }
         "tools/call" => call_tool(&params, defaults, gate, pool).await,
         _ => Err((-32601, format!("method not found: {method}"))),
     };
@@ -238,6 +240,36 @@ fn scrape_tool_descriptor() -> Value {
     })
 }
 
+/// Descriptor for the `draco_discover` tool: surface the JSON/XHR API endpoints
+/// a client-rendered page's own JavaScript calls, ranked, and replay the best
+/// one — for callers who want the page's data API rather than its rendered text.
+fn discover_tool_descriptor() -> Value {
+    json!({
+        "name": "draco_discover",
+        "title": "Discover API endpoints",
+        "description": "Discover the JSON/XHR API endpoints a page's JavaScript calls, ranked \
+                        by how likely each is the real data API, and replay the best one. \
+                        Returns the endpoint catalog (method, url, score, replayable, headers) \
+                        plus the replayed winner's JSON. Use this to find and pull the API \
+                        behind a client-rendered page instead of scraping its rendered text.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "The http(s) URL to inspect." },
+                "tierMax": { "type": "integer", "minimum": 2, "maximum": 2,
+                             "description": "Must allow Tier 2 (the isolate); discovery needs it." },
+                "captureWindowMs": { "type": "integer", "description": "Tier 2 capture-window duration in ms." },
+                "timeout": { "type": "integer", "description": "Total request timeout in ms." },
+                "ignoreRobots": { "type": "boolean", "description": "Bypass robots.txt." },
+                "allowUnsafeReplay": { "type": "boolean",
+                                       "description": "Mark non-idempotent (e.g. POST-mutation) endpoints replayable." }
+            },
+            "required": ["url"]
+        },
+        "annotations": { "readOnlyHint": true, "openWorldHint": true }
+    })
+}
+
 /// `tools/call` dispatch. Protocol-level misuse (unknown tool, missing/invalid
 /// params) is a JSON-RPC error; a scrape that *ran and failed* is a tool
 /// result with `isError: true`.
@@ -248,7 +280,10 @@ async fn call_tool(
     pool: Option<&Tier2Pool>,
 ) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    if name != "draco_scrape" {
+    // Two tools share the same execution path; `draco_discover` just forces
+    // endpoint discovery and headlines the catalog in its result.
+    let is_discover = name == "draco_discover";
+    if name != "draco_scrape" && !is_discover {
         return Err((-32602, format!("unknown tool: {name:?}")));
     }
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -269,10 +304,16 @@ async fn call_tool(
                 .collect()
         })
         .unwrap_or_default();
-    let format = parse_formats(&formats).map_err(|msg| (-32602, msg))?;
+    let (format, discover) = parse_formats(&formats).map_err(|msg| (-32602, msg))?;
 
     let mut config = defaults.clone();
     config.format = format;
+    // `draco_discover` always discovers (and replays the winner into `data`),
+    // regardless of the `formats` argument.
+    config.discover_endpoints = discover || is_discover;
+    if is_discover {
+        config.format = OutputFormat::Json;
+    }
     if let Some(t) = args.get("tierMax").and_then(Value::as_u64) {
         config.tier_max = t.min(u8::MAX as u64) as u8;
     }
@@ -284,6 +325,9 @@ async fn call_tool(
     }
     if let Some(true) = args.get("ignoreRobots").and_then(Value::as_bool) {
         config.respect_robots = false;
+    }
+    if let Some(true) = args.get("allowUnsafeReplay").and_then(Value::as_bool) {
+        config.allow_unsafe_replay = true;
     }
 
     // Bound daemon-side tool calls with the shared gate (never closed in
@@ -312,9 +356,15 @@ async fn call_tool(
 
     // Content assembly: agents want prose first — the markdown string itself is
     // the primary content item; the JSON-API payload (when requested) rides as
-    // a second pretty-printed item.
+    // a second pretty-printed item. For discovery, the endpoint catalog leads.
     let data = &body["data"];
     let mut content = Vec::new();
+    if is_discover {
+        let endpoints = data.get("endpoints").cloned().unwrap_or(json!([]));
+        let pretty =
+            serde_json::to_string_pretty(&endpoints).unwrap_or_else(|_| endpoints.to_string());
+        content.push(json!({ "type": "text", "text": pretty }));
+    }
     if let Some(md) = data["markdown"].as_str() {
         content.push(json!({ "type": "text", "text": md }));
     }
@@ -396,15 +446,19 @@ mod tests {
     // ---- tools/list ---------------------------------------------------------
 
     #[tokio::test]
-    async fn tools_list_has_one_tool_requiring_url() {
+    async fn tools_list_advertises_scrape_and_discover() {
         let resp = dispatch(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
             .unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "draco_scrape");
-        assert_eq!(tools[0]["inputSchema"]["required"], json!(["url"]));
-        assert_eq!(tools[0]["annotations"]["readOnlyHint"], true);
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"draco_scrape"), "tools: {names:?}");
+        assert!(names.contains(&"draco_discover"), "tools: {names:?}");
+        // Both require a url and are read-only.
+        for t in tools {
+            assert_eq!(t["inputSchema"]["required"], json!(["url"]), "{t}");
+            assert_eq!(t["annotations"]["readOnlyHint"], true, "{t}");
+        }
     }
 
     // ---- protocol errors ----------------------------------------------------

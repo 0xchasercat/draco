@@ -114,6 +114,11 @@ pub struct Config {
     /// falls through to `Unsupported` (see [`ranking::best_replayable`]). Set via
     /// the CLI `--allow-unsafe-replay` flag when the side effect is intended.
     pub allow_unsafe_replay: bool,
+    /// Attach the ranked catalog of API endpoints the page's JS called (the
+    /// `endpoints` format / `/v1/discover`). Forces the Tier 2 capture so the
+    /// `fetch`/XHR calls can be observed; the catalog rides `ExtractionResult::
+    /// endpoints`. Off by default. Set via the CLI `--format endpoints`.
+    pub discover_endpoints: bool,
 }
 
 impl Default for Config {
@@ -129,6 +134,7 @@ impl Default for Config {
             no_jail: false,
             strict_sandbox: false,
             allow_unsafe_replay: false,
+            discover_endpoints: false,
         }
     }
 }

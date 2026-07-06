@@ -158,6 +158,9 @@ struct Run {
     /// plain fetch+parse, or [`SourceTier::RuntimeInterception`] once the
     /// render-then-Markdown escalation hydrated a thin shell and re-scraped it.
     md_tier: SourceTier,
+    /// The discovered API-endpoint catalog, staged by the discovery branch when
+    /// `config.discover_endpoints` is set; `None` otherwise.
+    endpoints: Option<Vec<draco_types::DiscoveredEndpoint>>,
 }
 
 /// Which timing bucket a step's elapsed time is charged to.
@@ -183,6 +186,7 @@ impl Run {
             markdown: None,
             metadata: None,
             md_tier: SourceTier::Static,
+            endpoints: None,
         }
     }
 
@@ -227,6 +231,7 @@ impl Run {
             data,
             markdown: self.markdown,
             metadata: self.metadata,
+            endpoints: self.endpoints,
             timing: self.timing,
             trace: self.trace,
             error,
@@ -417,13 +422,41 @@ where
             .await;
         }
 
-        if config.format == OutputFormat::Markdown {
+        if config.format == OutputFormat::Markdown && !config.discover_endpoints {
             // Terminal for the default path (Static, or RuntimeInterception if
-            // the render escalation upgraded the Markdown).
+            // the render escalation upgraded the Markdown). When discovery is
+            // also requested we fall through to the discovery branch below,
+            // carrying the staged Markdown into the final result.
             let tier = run.md_tier;
             return run.finish(Status::Success, Some(tier), None, None);
         }
         // `Both`: continue into the JSON ladder, carrying markdown+metadata.
+    }
+
+    // ---- API discovery (the `endpoints` format / `/v1/discover`) ----------
+    // Discovery needs the Tier 2 isolate to observe the page's `fetch`/XHR, so
+    // it runs its own capture here — *before* the Tier 0/1 JSON ladder, whose
+    // cheap-tier early returns would otherwise preempt it. Terminal: it attaches
+    // the ranked endpoint catalog (and, for `json`/`both`, the replayed winner
+    // as `data`) plus any staged Markdown.
+    if config.discover_endpoints {
+        if tier_max >= 2 {
+            return try_discover(&mut run, url, &body, config, &opts, fetcher, capture).await;
+        }
+        // Discovery is meaningless without the isolate; the caller capped the
+        // ladder below Tier 2. Say so and finish with whatever content ran.
+        run.record(
+            SourceTier::RuntimeInterception,
+            "runtime.discover",
+            StepOutcome::Skipped,
+            0,
+            Bucket::None,
+            Some(format!(
+                "endpoint discovery needs tier_max>=2 (tier_max={tier_max})"
+            )),
+        );
+        let tier = run.md_tier;
+        return run.finish(Status::Success, Some(tier), None, None);
     }
 
     // ---- Tier 0: static embedded state ---------------------------------
@@ -516,7 +549,13 @@ where
 /// `runtime.replay` (replaying the winner). Isolate wall time is charged to the
 /// [`Bucket::Runtime`] timing bucket.
 #[cfg(feature = "tier2")]
-async fn try_tier2<F, T>(
+/// Prefetch script subresources, run the Tier 2 capture, and record the
+/// `runtime.spawn` / `runtime.sandbox` / `runtime.capture` trace steps. Shared
+/// by the JSON-replay path ([`try_tier2`]) and the discovery path
+/// ([`try_discover`]). On a jail/IPC failure returns `Err(terminal Error
+/// result)` for the caller to return as-is; otherwise the [`CaptureResult`].
+#[cfg(feature = "tier2")]
+async fn run_tier2_capture<F, T>(
     run: &mut Run,
     url: &str,
     body: &str,
@@ -524,16 +563,14 @@ async fn try_tier2<F, T>(
     opts: &SessionOpts,
     fetcher: &F,
     capture: &T,
-) -> Option<ExtractionResult>
+) -> Result<crate::tier2::CaptureResult, ExtractionResult>
 where
     F: PageFetcher + ?Sized,
     T: Tier2Capture + ?Sized,
 {
-    use crate::tier2::{no_replay_reason, rank_and_replay};
-
-    // --- Prefetch script subresources, then spawn + capture ----------------
-    // The air-gapped isolate can't fetch, so the supervisor pre-fetches the page's
-    // scripts (external `<script src>`, module graph) and hands them to the child.
+    // The air-gapped isolate can't fetch, so the supervisor pre-fetches the
+    // page's scripts (external `<script src>`, module graph) and hands them to
+    // the child.
     let t_cap = Instant::now();
     let resources = prefetch_scripts(url, body, opts, fetcher).await;
     let capture_result = match capture
@@ -553,7 +590,7 @@ where
                 Some(error_summary(&e)),
             );
             let owned = run.take_for_finish();
-            return Some(owned.finish(Status::Error, None, None, Some(e)));
+            return Err(owned.finish(Status::Error, None, None, Some(e)));
         }
     };
     let cap_ms = t_cap.elapsed().as_millis() as u64;
@@ -594,6 +631,125 @@ where
             capture_result.candidates.len()
         )),
     );
+    Ok(capture_result)
+}
+
+/// API-discovery branch (`endpoints` format / `/v1/discover`): capture the
+/// page's `fetch`/XHR, attach the ranked endpoint catalog to the result, and —
+/// for the `json`/`both` content formats — also replay the winner as `data`
+/// (discovery *and* replay). Terminal: always finishes `Success` with the
+/// catalog (plus any staged Markdown), even when nothing was replayable, since
+/// the discovery listing itself is the product.
+#[cfg(feature = "tier2")]
+async fn try_discover<F, T>(
+    run: &mut Run,
+    url: &str,
+    body: &str,
+    config: &Config,
+    opts: &SessionOpts,
+    fetcher: &F,
+    capture: &T,
+) -> ExtractionResult
+where
+    F: PageFetcher + ?Sized,
+    T: Tier2Capture + ?Sized,
+{
+    use crate::tier2::{discover_endpoints, rank_and_replay};
+
+    let capture_result =
+        match run_tier2_capture(run, url, body, config, opts, fetcher, capture).await {
+            Ok(c) => c,
+            Err(term) => return term,
+        };
+
+    // The ranked catalog — the discovery product.
+    let endpoints = discover_endpoints(&capture_result, url, config.allow_unsafe_replay);
+    let n = endpoints.len();
+    let replayable = endpoints.iter().filter(|e| e.replayable).count();
+    run.endpoints = Some(endpoints);
+    run.record(
+        SourceTier::RuntimeInterception,
+        "runtime.discover",
+        StepOutcome::Matched,
+        0,
+        Bucket::None,
+        Some(format!("{n} endpoint(s), {replayable} replayable")),
+    );
+
+    // For json/both, also replay the winner so `data` carries the API payload
+    // (discovery + replay). Pure `endpoints`/markdown discovery skips the hop.
+    let data = if matches!(config.format, OutputFormat::Json | OutputFormat::Both) {
+        let t_rank = Instant::now();
+        match rank_and_replay(
+            &capture_result,
+            url,
+            opts,
+            fetcher,
+            config.allow_unsafe_replay,
+        )
+        .await
+        {
+            Ok(Some((data, detail))) => {
+                run.record(
+                    SourceTier::RuntimeInterception,
+                    "runtime.replay",
+                    StepOutcome::Matched,
+                    t_rank.elapsed().as_millis() as u64,
+                    Bucket::Network,
+                    Some(detail),
+                );
+                Some(data)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                // A transport failure on the *bonus* replay must not sink the
+                // discovery result — record it and still return the catalog.
+                run.record(
+                    SourceTier::RuntimeInterception,
+                    "runtime.replay",
+                    StepOutcome::Failed,
+                    t_rank.elapsed().as_millis() as u64,
+                    Bucket::Network,
+                    Some(error_summary(&e)),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let owned = run.take_for_finish();
+    owned.finish(
+        Status::Success,
+        Some(SourceTier::RuntimeInterception),
+        data,
+        None,
+    )
+}
+
+async fn try_tier2<F, T>(
+    run: &mut Run,
+    url: &str,
+    body: &str,
+    config: &Config,
+    opts: &SessionOpts,
+    fetcher: &F,
+    capture: &T,
+) -> Option<ExtractionResult>
+where
+    F: PageFetcher + ?Sized,
+    T: Tier2Capture + ?Sized,
+{
+    use crate::tier2::{no_replay_reason, rank_and_replay};
+
+    // Prefetch subresources, spawn/reuse the isolate, capture — shared with the
+    // discovery path.
+    let capture_result =
+        match run_tier2_capture(run, url, body, config, opts, fetcher, capture).await {
+            Ok(c) => c,
+            Err(term) => return Some(term),
+        };
 
     // --- Rank + replay the winner -----------------------------------------
     // Mutation-safety (see `ranking::best_replayable`) is applied here at replay
@@ -696,6 +852,38 @@ where
         Some("built without tier2: runtime interception not compiled in".to_string()),
     );
     None
+}
+
+/// Discovery branch for the **lean** build (no `tier2` feature): there is no
+/// isolate to observe the page's `fetch`/XHR, so record a "built without tier2"
+/// note and finish `Success` with no endpoint catalog (plus any staged
+/// Markdown). Signature mirrors the tier2 version so the call site is
+/// feature-agnostic.
+#[cfg(not(feature = "tier2"))]
+async fn try_discover<F, T>(
+    run: &mut Run,
+    _url: &str,
+    _body: &str,
+    _config: &Config,
+    _opts: &SessionOpts,
+    _fetcher: &F,
+    _capture: &T,
+) -> ExtractionResult
+where
+    F: PageFetcher + ?Sized,
+    T: Tier2Capture + ?Sized,
+{
+    run.record(
+        SourceTier::RuntimeInterception,
+        "runtime.discover",
+        StepOutcome::Skipped,
+        0,
+        Bucket::None,
+        Some("built without tier2: endpoint discovery not compiled in".to_string()),
+    );
+    let tier = run.md_tier;
+    run.take_for_finish()
+        .finish(Status::Success, Some(tier), None, None)
 }
 
 /// Non-whitespace character count — the metric the thin-shell / render-gain
@@ -1152,6 +1340,7 @@ impl Run {
             markdown: self.markdown.take(),
             metadata: self.metadata.take(),
             md_tier: self.md_tier,
+            endpoints: self.endpoints.take(),
         }
     }
 }
@@ -1679,6 +1868,63 @@ mod tests {
         assert_eq!(fetcher.replay_calls(), 0, "junk must not be replayed");
         let rank = r.trace.iter().find(|t| t.action == "runtime.rank").unwrap();
         assert_eq!(rank.outcome, StepOutcome::Missed);
+    }
+
+    #[tokio::test]
+    async fn discovery_attaches_ranked_endpoint_catalog() {
+        // With discover_endpoints set, the run captures the page's fetch/XHR and
+        // attaches the ranked catalog — regardless of whether any winner is
+        // replayable — via the dedicated discovery branch (before Tier 0/1).
+        let fetcher = MockFetcher::ok_html(200, "<html>spa</html>");
+        let statics = MockStatic::miss_no_build_id();
+        let capture = MockCapture::with_candidates(vec![
+            Candidate::get("https://x.com/api/items?page=1", InterceptVia::Fetch),
+            Candidate::get(
+                "https://www.google-analytics.com/collect",
+                InterceptVia::Xhr,
+            ),
+        ]);
+        let config = Config {
+            format: OutputFormat::Json,
+            tier_max: 2,
+            discover_endpoints: true,
+            ..Config::default()
+        };
+        let r = run_ladder("https://x.com/p", &config, &fetcher, &statics, &capture).await;
+
+        assert_eq!(r.status, Status::Success);
+        assert_eq!(r.source_tier, Some(SourceTier::RuntimeInterception));
+        let eps = r.endpoints.expect("catalog attached");
+        assert_eq!(eps.len(), 2);
+        // Ranked: the same-origin JSON API outranks the analytics beacon.
+        assert_eq!(eps[0].url, "https://x.com/api/items?page=1");
+        assert!(eps[0].score >= eps[1].score);
+        assert!(eps[0].replayable && !eps[1].replayable);
+        // The discovery step is recorded in the trace.
+        assert!(r.trace.iter().any(|t| t.action == "runtime.discover"));
+    }
+
+    #[tokio::test]
+    async fn discovery_capped_below_tier2_is_noted_without_catalog() {
+        // Discovery needs the isolate; when the ladder is capped below Tier 2 it
+        // records a skip and returns no catalog rather than pretending.
+        let fetcher = MockFetcher::ok_html(200, "<html>spa</html>");
+        let statics = MockStatic::miss_no_build_id();
+        let capture = MockCapture::empty();
+        let config = Config {
+            format: OutputFormat::Json,
+            tier_max: 1,
+            discover_endpoints: true,
+            ..Config::default()
+        };
+        let r = run_ladder("https://x.com/p", &config, &fetcher, &statics, &capture).await;
+        assert!(r.endpoints.is_none(), "no catalog when capped below tier 2");
+        let step = r
+            .trace
+            .iter()
+            .find(|t| t.action == "runtime.discover")
+            .unwrap();
+        assert_eq!(step.outcome, StepOutcome::Skipped);
     }
 
     #[tokio::test]
