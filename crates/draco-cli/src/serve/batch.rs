@@ -236,6 +236,11 @@ async fn run_batch(state: Arc<AppState>, id: String, urls: Vec<String>, config: 
                 return;
             }
             let result = extract_with_pool(&url, &config, &state.tier2_pool).await;
+            if super::is_robots_blocked(&result) {
+                state.batch.record_robots_blocked(&id, &url);
+                state.batch.record_page(&id, None);
+                return;
+            }
             let (code, mut body) = to_firecrawl(&result);
             if code == StatusCode::OK {
                 state.batch.record_page(&id, Some(body["data"].take()));
