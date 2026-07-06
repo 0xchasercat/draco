@@ -123,6 +123,13 @@ pub struct CaptureReport {
     /// `None` when serialization was not attempted or produced nothing usable
     /// (e.g. the isolate failed to boot, or the page left an empty body).
     pub rendered_html: Option<String>,
+    /// Bounded page-side diagnostics: glue-swallowed exceptions/rejections,
+    /// `console.error`/`console.warn` lines, and page-script throws. The raw
+    /// material for debugging *why* a page failed to hydrate (e.g. a missing
+    /// browser API aborting a framework boot) without a browser devtools.
+    /// Count- and length-capped in [`CaptureState::push_log`]; the supervisor
+    /// surfaces them as `runtime.log` trace steps when asked to.
+    pub logs: Vec<String>,
 }
 
 /// Synchronous supervisor-backed script loader used for dynamically appended
@@ -178,6 +185,7 @@ pub fn run_capture_with_resources_and_loader(
                 outcome: RuntimeOutcome::Threw,
                 requests: Vec::new(),
                 rendered_html: None,
+                logs: vec![format!("boot: failed to build tokio runtime: {e}")],
             };
         }
     };
@@ -219,6 +227,32 @@ struct CaptureState {
     /// The hydrated DOM serialized after the capture window (via `op_raze_dom`),
     /// for the render-then-Markdown escalation. `None` until serialization runs.
     rendered_html: Option<String>,
+    /// Page-side diagnostic lines (see [`CaptureReport::logs`]). Fed by
+    /// `op_raze_log` (glue) and the Rust-side script-throw sites; bounded by
+    /// [`CaptureState::push_log`].
+    logs: Vec<String>,
+}
+
+/// Hard bounds on collected diagnostic log lines, so a pathological page (e.g. a
+/// `console.error` in a render loop) cannot balloon the report or the IPC frames
+/// that carry it.
+const MAX_RUNTIME_LOGS: usize = 32;
+const MAX_LOG_CHARS: usize = 1_024;
+
+impl CaptureState {
+    /// Append one diagnostic line, enforcing the count cap and truncating overlong
+    /// lines on a char boundary. Silently drops lines past the cap — the first
+    /// failures are the diagnostic signal; a flood repeats them.
+    fn push_log(&mut self, line: &str) {
+        if self.logs.len() >= MAX_RUNTIME_LOGS {
+            return;
+        }
+        let mut s: String = line.chars().take(MAX_LOG_CHARS).collect();
+        if s.len() < line.len() {
+            s.push('…');
+        }
+        self.logs.push(s);
+    }
 }
 
 /// JSON shape `op_raze_fetch` receives from the interceptor JS.
@@ -313,6 +347,15 @@ fn op_raze_load_script(state: &mut OpState, #[string] url: String) -> Option<Str
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// Record one page-side diagnostic line (glue-swallowed exception/rejection,
+/// `console.error`/`console.warn`, dynamic-chunk throw). Count- and length-bounded
+/// by [`CaptureState::push_log`], so page JS cannot balloon the report.
+#[deno_core::op2(fast)]
+fn op_raze_log(state: &mut OpState, #[string] line: String) {
+    let cap = state.borrow::<Rc<RefCell<CaptureState>>>().clone();
+    cap.borrow_mut().push_log(&line);
+}
+
 /// Receive the hydrated DOM serialized by the page side
 /// (`document.documentElement.outerHTML`) and stash it in [`CaptureState`] for the
 /// render-then-Markdown escalation. Called once, after the capture window closes.
@@ -373,6 +416,7 @@ deno_core::extension!(
         op_raze_resource,
         op_raze_load_script,
         op_raze_dom,
+        op_raze_log,
     ],
     options = { cap: Rc<RefCell<CaptureState>> },
     state = |state, options| {
@@ -477,6 +521,7 @@ async fn run_capture_inner_with_resources(
         resources: modules.clone(),
         script_loader,
         rendered_html: None,
+        logs: Vec::new(),
     }));
 
     // Restore the DOM-engine snapshot and register the ops for this isolate.
@@ -553,10 +598,16 @@ async fn run_capture_inner_with_resources(
                         .insert(spec_url.as_str().to_string(), source.into_bytes());
                     if let Err(e) = eval_module(&mut runtime, &spec_url).await {
                         threw_in_page = true;
-                        eprintln!("draco-runtime: module script {i} threw: {e}");
+                        let line = format!("module script {i} threw: {e}");
+                        eprintln!("draco-runtime: {line}");
+                        cap.borrow_mut().push_log(&line);
                     }
                 }
-                Err(e) => eprintln!("draco-runtime: bad module specifier for script {i}: {e}"),
+                Err(e) => {
+                    let line = format!("bad module specifier for script {i}: {e}");
+                    eprintln!("draco-runtime: {line}");
+                    cap.borrow_mut().push_log(&line);
+                }
             }
         } else {
             // Use an absolute script name so dynamic `import("./chunk.js")` inside
@@ -570,7 +621,9 @@ async fn run_capture_inner_with_resources(
             };
             if let Err(e) = runtime.execute_script(name, source) {
                 threw_in_page = true;
-                eprintln!("draco-runtime: page script {i} threw: {e}");
+                let line = format!("page script {i} threw: {e}");
+                eprintln!("draco-runtime: {line}");
+                cap.borrow_mut().push_log(&line);
             }
         }
     }
@@ -591,6 +644,7 @@ async fn run_capture_inner_with_resources(
         outcome,
         requests: cs.requests.clone(),
         rendered_html: cs.rendered_html.clone(),
+        logs: cs.logs.clone(),
     }
 }
 
@@ -672,7 +726,9 @@ async fn drive_capture_window(
             }
             Poll::Ready(Err(e)) => {
                 // A top-level / unhandled error propagated out of the loop.
-                eprintln!("draco-runtime: event loop error: {e}");
+                let line = format!("event loop error: {e}");
+                eprintln!("draco-runtime: {line}");
+                cap.borrow_mut().push_log(&line);
                 loop_threw = true;
                 break;
             }
@@ -757,15 +813,17 @@ fn finish(
 ) -> CaptureReport {
     if let Some(d) = detail {
         eprintln!("draco-runtime: {outcome:?}: {d}");
+        cap.borrow_mut().push_log(&format!("boot: {d}"));
     }
-    let requests = cap.borrow().requests.clone();
+    let cs = cap.borrow();
     // `finish` is only reached on a pre-hydration boot failure (URL inject /
     // polyfill / interceptor threw), so there is no meaningful hydrated DOM to
     // serialize.
     CaptureReport {
         outcome,
-        requests,
+        requests: cs.requests.clone(),
         rendered_html: None,
+        logs: cs.logs.clone(),
     }
 }
 
@@ -1232,6 +1290,42 @@ mod tests {
         );
         assert_eq!(report.requests.len(), 1, "{report:?}");
         assert_eq!(report.requests[0].url, "https://example.com/api/from-chunk");
+    }
+
+    #[test]
+    fn page_diagnostics_land_in_report_logs() {
+        // console.error goes through the glue's console hook (op_raze_log);
+        // the sync throw is caught by the Rust script driver. Both must land
+        // in `report.logs` — the raw material for `runtime.log` trace steps.
+        let html = r#"<script>
+            console.error("hydration", "failed:", { code: 42 });
+            throw new Error("boot exploded");
+        </script>"#;
+        let report = run_capture(
+            "https://example.com/",
+            html,
+            &CaptureConfig {
+                capture_window_ms: 300,
+                quiesce_ms: 20,
+                max_intercepts: 8,
+                stub_response_json: "{}".to_string(),
+            },
+        );
+        assert!(
+            report.logs.iter().any(|l| l.starts_with("[console.error]")
+                && l.contains("hydration failed:")
+                && l.contains("42")),
+            "console.error line missing: {:?}",
+            report.logs
+        );
+        assert!(
+            report
+                .logs
+                .iter()
+                .any(|l| l.contains("threw") && l.contains("boot exploded")),
+            "page-script throw missing: {:?}",
+            report.logs
+        );
     }
 
     #[test]

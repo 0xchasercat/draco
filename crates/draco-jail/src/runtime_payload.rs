@@ -261,10 +261,16 @@ fn capture(
 }
 
 /// Serialize a [`CaptureReport`] onto the wire: one `Intercept` per captured
-/// request (its optional body rides the frame body), then a terminal `Result`.
+/// request (its optional body rides the frame body), one diagnostic `Log` per
+/// runtime log line, then a terminal `Result`.
 ///
 /// `seq` is the 0-based capture index; header order within each request is
 /// preserved verbatim by `run_capture`, and we do not reorder it.
+///
+/// The runtime's page-side diagnostics (`CaptureReport::logs` — swallowed
+/// exceptions, console.error lines, script throws) ride as `Error`-level `Log`
+/// frames ahead of the `Result`, so the supervisor can surface *why* a page
+/// failed to hydrate. Already count/length-bounded by the runtime.
 ///
 /// The terminal `Result` frame's **body** carries the hydrated DOM serialized by
 /// the runtime (`CaptureReport::rendered_html`), when present — this is the raw
@@ -274,6 +280,7 @@ fn capture(
 fn emit_report(stream: &mut UnixStream, report: CaptureReport) -> Result<(), PayloadError> {
     let intercept_count = report.requests.len() as u32;
     let rendered_html = report.rendered_html;
+    let logs = report.logs;
 
     for (seq, req) in report.requests.into_iter().enumerate() {
         let CapturedRequest {
@@ -296,6 +303,17 @@ fn emit_report(stream: &mut UnixStream, report: CaptureReport) -> Result<(), Pay
                 via,
             },
             &frame_body,
+        )?;
+    }
+
+    for msg in logs {
+        frame::write_jail_frame(
+            stream,
+            &JailToSupervisor::Log {
+                level: LogLevel::Error,
+                msg,
+            },
+            &[],
         )?;
     }
 
@@ -360,6 +378,7 @@ mod tests {
                 cap("https://x.com/api/b", InterceptVia::Xhr, Some("{\"q\":1}")),
             ],
             rendered_html: None,
+            logs: Vec::new(),
         });
 
         let (sup, child) = UnixStream::pair().unwrap();
@@ -441,6 +460,72 @@ mod tests {
         child_handle.join().unwrap().unwrap();
     }
 
+    /// Runtime diagnostics (`CaptureReport::logs`) ride as `Error`-level `Log`
+    /// frames between the Intercepts and the terminal `Result`, so the
+    /// supervisor can surface *why* a page failed to hydrate.
+    #[test]
+    fn runtime_logs_ride_as_error_log_frames_before_result() {
+        let _guard = CAPTURE_TEST_LOCK.lock().unwrap();
+        set_canned(CaptureReport {
+            outcome: RuntimeOutcome::NoIntercepts,
+            requests: vec![],
+            rendered_html: None,
+            logs: vec![
+                "[exception] TypeError: x is not a function".to_string(),
+                "[console.error] hydration failed".to_string(),
+            ],
+        });
+
+        let (sup, child) = UnixStream::pair().unwrap();
+        let child_handle = thread::spawn(move || run_capture_loop(child, None));
+        let mut sup = sup;
+
+        let ready = read_jail_frame(&mut sup).unwrap();
+        assert!(matches!(ready.header, JailToSupervisor::Ready { .. }));
+
+        write_supervisor_frame(
+            &mut sup,
+            &SupervisorToJail::Hydrate {
+                url: "https://x.com".into(),
+                capture_window_ms: 500,
+                quiesce_ms: 50,
+                max_intercepts: 8,
+                stub_response_json: "{}".into(),
+            },
+            b"<html></html>",
+        )
+        .unwrap();
+
+        // Two Error-level Log frames, in report order, then the Result.
+        for expected in [
+            "[exception] TypeError: x is not a function",
+            "[console.error] hydration failed",
+        ] {
+            let log = read_jail_frame(&mut sup).unwrap();
+            match log.header {
+                JailToSupervisor::Log { level, msg } => {
+                    assert_eq!(level, LogLevel::Error);
+                    assert_eq!(msg, expected);
+                }
+                other => panic!("expected Log, got {other:?}"),
+            }
+        }
+        let result = read_jail_frame(&mut sup).unwrap();
+        assert!(
+            matches!(
+                result.header,
+                JailToSupervisor::Result {
+                    outcome: RuntimeOutcome::NoIntercepts,
+                    ..
+                }
+            ),
+            "expected terminal Result after the Log frames"
+        );
+
+        drop(sup);
+        child_handle.join().unwrap().unwrap();
+    }
+
     /// The warm-worker contract: one `Ready`, then the worker services **many**
     /// `Hydrate` jobs over its lifetime (each with its own terminal `Result`),
     /// and the per-job `Resource` map does not leak between jobs. Closing the
@@ -454,16 +539,19 @@ mod tests {
                 outcome: RuntimeOutcome::Quiesced,
                 requests: vec![cap("https://x.com/api/1", InterceptVia::Fetch, None)],
                 rendered_html: None,
+                logs: Vec::new(),
             },
             CaptureReport {
                 outcome: RuntimeOutcome::NoIntercepts,
                 requests: vec![],
                 rendered_html: Some("<html><body>job 2</body></html>".into()),
+                logs: Vec::new(),
             },
             CaptureReport {
                 outcome: RuntimeOutcome::Quiesced,
                 requests: vec![cap("https://x.com/api/3", InterceptVia::Xhr, Some("{}"))],
                 rendered_html: None,
+                logs: Vec::new(),
             },
         ]);
 
@@ -532,6 +620,7 @@ mod tests {
             outcome: RuntimeOutcome::Quiesced,
             requests: vec![],
             rendered_html: Some(dom.to_string()),
+            logs: Vec::new(),
         });
 
         let (sup, child) = UnixStream::pair().unwrap();
@@ -578,6 +667,7 @@ mod tests {
             outcome: RuntimeOutcome::NoIntercepts,
             requests: vec![],
             rendered_html: None,
+            logs: Vec::new(),
         });
 
         let (sup, child) = UnixStream::pair().unwrap();
@@ -634,6 +724,7 @@ mod tests {
             outcome: RuntimeOutcome::NoIntercepts,
             requests: vec![],
             rendered_html: None,
+            logs: Vec::new(),
         });
 
         let (sup, child) = UnixStream::pair().unwrap();

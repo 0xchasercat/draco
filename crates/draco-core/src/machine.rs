@@ -627,9 +627,10 @@ where
 {
     // The air-gapped isolate can't fetch, so the supervisor pre-fetches the
     // page's scripts (external `<script src>`, module graph) and hands them to
-    // the child.
+    // the child. Recorded as its own `runtime.prefetch` step, so the capture
+    // timing below is the capture alone.
+    let resources = prefetch_scripts_traced(run, url, body, opts, fetcher).await;
     let t_cap = Instant::now();
-    let resources = prefetch_scripts(url, body, opts, fetcher).await;
     let capture_result = match capture
         .capture(url, body.as_bytes(), &resources, config, opts)
         .await
@@ -688,7 +689,30 @@ where
             capture_result.candidates.len()
         )),
     );
+    record_runtime_logs(run, &capture_result.logs, config);
     Ok(capture_result)
+}
+
+/// Surface the child's page-side diagnostics (glue-swallowed exceptions,
+/// `console.error` lines, script throws) as `runtime.log` trace steps — the
+/// answer to "*why* did this page hydrate to nothing?" without a browser
+/// devtools. Opt-in via [`Config::runtime_log`] so routine traces stay lean;
+/// the lines are already count/length-bounded child-side.
+#[cfg(feature = "tier2")]
+fn record_runtime_logs(run: &mut Run, logs: &[String], config: &Config) {
+    if !config.runtime_log {
+        return;
+    }
+    for msg in logs {
+        run.record(
+            SourceTier::RuntimeInterception,
+            "runtime.log",
+            StepOutcome::Matched,
+            0,
+            Bucket::None,
+            Some(msg.clone()),
+        );
+    }
 }
 
 /// API-discovery branch (`endpoints` format / `/v1/discover`): capture the
@@ -973,7 +997,44 @@ async fn prefetch_scripts<F>(
 where
     F: PageFetcher + ?Sized,
 {
+    prefetch_scripts_with_budget(page_url, html, opts, fetcher, PREFETCH_WALL_BUDGET_MS).await
+}
+
+/// How many subresource fetches one prefetch wave issues concurrently. Browsers
+/// burst a page's script graph over 6–8 pooled connections; matching that keeps
+/// the graph walk both fast and unremarkable to the origin.
+#[cfg(feature = "tier2")]
+const PREFETCH_CONCURRENCY: usize = 8;
+
+/// Total wall budget for the prefetch walk. A code-split Next.js site can
+/// reference 64+ chunks; fetched one-by-one that multiplied into tens of
+/// seconds of `runtime.capture` time. Past the budget the walk stops with
+/// whatever it has — the on-demand `LoadScript` path (itself budgeted) picks up
+/// stragglers the page actually asks for.
+#[cfg(feature = "tier2")]
+const PREFETCH_WALL_BUDGET_MS: u64 = 5_000;
+
+/// Wave-parallel, budgeted BFS over the page's script graph: seed from
+/// `<script src>` / preload hints / inline import specifiers, fetch up to
+/// [`PREFETCH_CONCURRENCY`] resources concurrently over the *borrowed* fetcher
+/// (`join_all` — no `'static`/spawn requirement), scan each body for module
+/// imports and webpack/Next chunk references, and feed discoveries into the
+/// next wave. File-count, total-byte, and wall-clock caps all bound the walk;
+/// per-fetch timeout and politeness posture come from
+/// [`crate::tier2::subresource_opts`].
+#[cfg(feature = "tier2")]
+async fn prefetch_scripts_with_budget<F>(
+    page_url: &str,
+    html: &str,
+    opts: &SessionOpts,
+    fetcher: &F,
+    wall_budget_ms: u64,
+) -> Vec<crate::tier2::ScriptResource>
+where
+    F: PageFetcher + ?Sized,
+{
     use crate::tier2::ScriptResource;
+    use futures_util::future::join_all;
     use std::collections::{HashSet, VecDeque};
 
     const MAX_FILES: usize = 64;
@@ -982,6 +1043,9 @@ where
     let Ok(base) = url::Url::parse(page_url) else {
         return Vec::new();
     };
+
+    // Subresource fetch posture: clamped per-fetch timeout, no politeness delay.
+    let sub_opts = crate::tier2::subresource_opts(opts);
 
     let mut queue: VecDeque<String> = VecDeque::new();
     let mut visited: HashSet<String> = HashSet::new();
@@ -999,48 +1063,99 @@ where
         }
     }
 
-    while let Some(u) = queue.pop_front() {
-        if out.len() >= MAX_FILES || total >= MAX_TOTAL_BYTES {
+    let started = Instant::now();
+    'waves: while !queue.is_empty() {
+        if out.len() >= MAX_FILES
+            || total >= MAX_TOTAL_BYTES
+            || started.elapsed().as_millis() as u64 >= wall_budget_ms
+        {
             break;
         }
-        if !visited.insert(u.clone()) {
-            continue;
-        }
-        let resp = match fetcher.fetch(&u, opts).await {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        if !(200..300).contains(&resp.meta.status) {
-            continue;
-        }
-        let bytes = resp.body.to_vec();
-        total = total.saturating_add(bytes.len());
 
-        // Crawl this module's imports and webpack/Next chunk-loader references
-        // (resolved against its own URL).
-        if let Ok(mod_url) = url::Url::parse(&u) {
-            let src = String::from_utf8_lossy(&bytes);
-            for spec in extract_module_imports(&src)
-                .into_iter()
-                .chain(extract_chunk_candidates(&src))
-            {
-                if let Ok(child) = mod_url.join(&spec) {
-                    if (child.scheme() == "http" || child.scheme() == "https")
-                        && !visited.contains(child.as_str())
-                    {
-                        queue.push_back(child.to_string());
+        // Assemble the next wave of unvisited URLs.
+        let mut wave: Vec<String> = Vec::new();
+        while wave.len() < PREFETCH_CONCURRENCY.min(MAX_FILES - out.len()) {
+            let Some(u) = queue.pop_front() else { break };
+            if visited.insert(u.clone()) {
+                wave.push(u);
+            }
+        }
+        if wave.is_empty() {
+            // Everything left in the queue had been visited already.
+            break;
+        }
+
+        let responses = join_all(wave.iter().map(|u| fetcher.fetch(u, &sub_opts))).await;
+        for (u, resp) in wave.into_iter().zip(responses) {
+            let Ok(resp) = resp else { continue };
+            if !(200..300).contains(&resp.meta.status) {
+                continue;
+            }
+            let bytes = resp.body.to_vec();
+            total = total.saturating_add(bytes.len());
+
+            // Crawl this module's imports and webpack/Next chunk-loader
+            // references (resolved against its own URL).
+            if let Ok(mod_url) = url::Url::parse(&u) {
+                let src = String::from_utf8_lossy(&bytes);
+                for spec in extract_module_imports(&src)
+                    .into_iter()
+                    .chain(extract_chunk_candidates(&src))
+                {
+                    if let Ok(child) = mod_url.join(&spec) {
+                        if (child.scheme() == "http" || child.scheme() == "https")
+                            && !visited.contains(child.as_str())
+                        {
+                            queue.push_back(child.to_string());
+                        }
                     }
                 }
             }
-        }
 
-        out.push(ScriptResource {
-            url: u,
-            source: bytes,
-        });
+            out.push(ScriptResource {
+                url: u,
+                source: bytes,
+            });
+            if out.len() >= MAX_FILES || total >= MAX_TOTAL_BYTES {
+                break 'waves;
+            }
+        }
     }
 
     out
+}
+
+/// Run the supervisor prefetch and record it as its own `runtime.prefetch`
+/// trace step (Runtime bucket), so `runtime.capture` timing stays honest:
+/// network time spent gathering the page's script graph is visible and
+/// attributable, never silently folded into the capture step.
+#[cfg(feature = "tier2")]
+async fn prefetch_scripts_traced<F>(
+    run: &mut Run,
+    url: &str,
+    html: &str,
+    opts: &SessionOpts,
+    fetcher: &F,
+) -> Vec<crate::tier2::ScriptResource>
+where
+    F: PageFetcher + ?Sized,
+{
+    let t = Instant::now();
+    let resources = prefetch_scripts(url, html, opts, fetcher).await;
+    let bytes: usize = resources.iter().map(|r| r.source.len()).sum();
+    run.record(
+        SourceTier::RuntimeInterception,
+        "runtime.prefetch",
+        StepOutcome::Matched,
+        t.elapsed().as_millis() as u64,
+        Bucket::Runtime,
+        Some(format!(
+            "{} script(s), {} KiB",
+            resources.len(),
+            bytes / 1024
+        )),
+    );
+    resources
 }
 
 /// Extract initial JavaScript resource URLs from HTML, in document order.
@@ -1319,8 +1434,10 @@ async fn try_render_markdown<F, T>(
     F: PageFetcher + ?Sized,
     T: Tier2Capture + ?Sized,
 {
+    // Prefetch is its own `runtime.prefetch` step; the render step below then
+    // times the capture alone.
+    let resources = prefetch_scripts_traced(run, url, body, opts, fetcher).await;
     let t_cap = Instant::now();
-    let resources = prefetch_scripts(url, body, opts, fetcher).await;
     let capture_result = match capture
         .capture(url, body.as_bytes(), &resources, config, opts)
         .await
@@ -1353,6 +1470,9 @@ async fn try_render_markdown<F, T>(
             Some(level.to_string()),
         );
     }
+    // Page-side diagnostics (opt-in) — recorded before the render decision so
+    // they surface even when hydration produced no usable DOM.
+    record_runtime_logs(run, &capture_result.logs, config);
 
     let Some(rendered) = capture_result.rendered_html.as_deref() else {
         run.record(
@@ -1830,6 +1950,67 @@ mod tests {
             !got.iter().any(|s| s == "computedSpecifier"),
             "computed import matched: {got:?}"
         );
+    }
+
+    #[cfg(feature = "tier2")]
+    #[tokio::test]
+    async fn prefetch_wall_budget_zero_fetches_nothing() {
+        // The wall budget is checked before every wave; a zero budget must stop
+        // the walk before the first fetch (the deterministic degenerate case of
+        // "a slow CDN can only cost the budget, never tens of seconds").
+        let html =
+            r#"<html><head><script src="/static/app.js"></script></head><body></body></html>"#;
+        let fetcher = MockFetcher::ok_html(200, "console.log('bundle');");
+        let opts = SessionOpts::default();
+        let res =
+            prefetch_scripts_with_budget("https://shop.example.com/p", html, &opts, &fetcher, 0)
+                .await;
+        assert!(
+            res.is_empty(),
+            "zero budget must stop before the first wave: {res:?}"
+        );
+    }
+
+    #[cfg(feature = "tier2")]
+    #[tokio::test]
+    async fn runtime_logs_attach_to_trace_only_when_opted_in() {
+        // The capture reports page-side diagnostics; they surface as
+        // `runtime.log` trace steps only under `runtime_log: true`, and the
+        // prefetch is recorded as its own `runtime.prefetch` step either way.
+        for (enabled, expected) in [(false, 0usize), (true, 2usize)] {
+            let fetcher = MockFetcher::ok_html(200, "<html>rsc</html>");
+            let statics = MockStatic::miss_no_build_id();
+            let capture = MockCapture::with_logs(vec![
+                "[console.error] hydration failed".to_string(),
+                "[exception] TypeError: boom".to_string(),
+            ]);
+            let config = Config {
+                runtime_log: enabled,
+                ..cfg(2)
+            };
+            let r = run_ladder("https://x.com/p", &config, &fetcher, &statics, &capture).await;
+            let logs: Vec<&TraceStep> = r
+                .trace
+                .iter()
+                .filter(|t| t.action == "runtime.log")
+                .collect();
+            assert_eq!(logs.len(), expected, "enabled={enabled}: {:?}", r.trace);
+            if enabled {
+                assert_eq!(
+                    logs[0].detail.as_deref(),
+                    Some("[console.error] hydration failed")
+                );
+                assert_eq!(
+                    logs[1].detail.as_deref(),
+                    Some("[exception] TypeError: boom")
+                );
+            }
+            assert!(
+                r.trace.iter().any(|t| t.action == "runtime.prefetch"),
+                "prefetch step missing (enabled={enabled}): {:?}",
+                r.trace
+            );
+        }
     }
 
     #[tokio::test]

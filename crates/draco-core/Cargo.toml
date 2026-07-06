@@ -27,6 +27,7 @@ tier2 = [
     "dep:oxc_parser",
     "dep:oxc_allocator",
     "dep:oxc_span",
+    "dep:futures-util",
 ]
 
 # The dependency graph is frozen here even though the skeleton does not yet call
@@ -55,6 +56,10 @@ tokio = { workspace = true, optional = true }
 # import specifiers from fetched JS (Oxc parse-once AST) so the supervisor can
 # pre-fetch the script subresources for the isolate.
 regex = { version = "1", optional = true }
+# tier2-only: `join_all` runs each prefetch wave's fetches concurrently over the
+# *borrowed* PageFetcher (no `'static`/spawn requirement). Already in the tree
+# transitively; default-features off keeps the compile cost negligible.
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["alloc"] }
 oxc_parser = { version = "0.138.0", optional = true }
 oxc_allocator = { version = "0.138.0", optional = true }
 oxc_span = { version = "0.138.0", optional = true }

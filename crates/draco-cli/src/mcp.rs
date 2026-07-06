@@ -256,6 +256,11 @@ fn scrape_tool_descriptor() -> Value {
                 "ignoreRobots": {
                     "type": "boolean",
                     "description": "Bypass robots.txt."
+                },
+                "runtimeLog": {
+                    "type": "boolean",
+                    "description": "Surface Tier 2 page-side diagnostics (swallowed exceptions, \
+                                    console.error lines) as runtime.log trace steps."
                 }
             },
             "required": ["url"]
@@ -286,7 +291,10 @@ fn discover_tool_descriptor() -> Value {
                 "timeout": { "type": "integer", "description": "Total request timeout in ms." },
                 "ignoreRobots": { "type": "boolean", "description": "Bypass robots.txt." },
                 "allowUnsafeReplay": { "type": "boolean",
-                                       "description": "Mark non-idempotent (e.g. POST-mutation) endpoints replayable." }
+                                       "description": "Mark non-idempotent (e.g. POST-mutation) endpoints replayable." },
+                "runtimeLog": { "type": "boolean",
+                                "description": "Surface Tier 2 page-side diagnostics (swallowed exceptions, \
+                                                console.error lines) as runtime.log trace steps." }
             },
             "required": ["url"]
         },
@@ -379,6 +387,9 @@ async fn call_tool(
     }
     if let Some(true) = args.get("allowUnsafeReplay").and_then(Value::as_bool) {
         config.allow_unsafe_replay = true;
+    }
+    if let Some(true) = args.get("runtimeLog").and_then(Value::as_bool) {
+        config.runtime_log = true;
     }
 
     // Bound daemon-side tool calls with the shared gate (never closed in

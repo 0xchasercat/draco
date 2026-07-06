@@ -279,6 +279,10 @@
   //    exceptions instead of letting deno_core dispatch them fatally.
   let swallowed = 0;
   const logSwallowed = (kind, e) => {
+    // Always record into the capture report (op_raze_log enforces count/length
+    // bounds) — this is how hydration failures become visible to the supervisor
+    // (`runtime.log` trace steps) without a browser devtools.
+    try { ops.op_raze_log("[" + kind + "] " + (e && (e.stack || e.message) || e)); } catch (_) {}
     if (swallowed++ >= 5) return;
     try { Deno.core.print("[glue] swallowed " + kind + ": " + (e && e.stack || e) + "\n"); } catch (_) {}
   };
@@ -290,6 +294,33 @@
       Deno.core.setReportExceptionCallback((err) => { logSwallowed("exception", err); });
     }
   } catch (_) { /* hooks unavailable — per-script try/catch in Rust still isolates sync throws */ }
+
+  // Route console.error/console.warn into the capture report too — frameworks
+  // narrate their hydration failures there (React hydration errors, webpack
+  // chunk loaders, Next.js hints), and those lines are often the only clue to
+  // *why* a page produced no intercepts. Original console behavior preserved;
+  // op_raze_log bounds count/length so a console flood cannot balloon anything.
+  const hookConsole = (c) => {
+    if (!c) return;
+    for (const level of ["error", "warn"]) {
+      const orig = typeof c[level] === "function" ? c[level].bind(c) : null;
+      try {
+        c[level] = function (...args) {
+          try {
+            const line = args.map((a) => {
+              if (typeof a === "string") return a;
+              if (a && a.stack) return String(a.stack);
+              try { return JSON.stringify(a); } catch (_) { return String(a); }
+            }).join(" ");
+            ops.op_raze_log("[console." + level + "] " + line);
+          } catch (_) {}
+          if (orig) { try { orig(...args); } catch (_) {} }
+        };
+      } catch (_) {}
+    }
+  };
+  try { hookConsole(g.console); } catch (_) {}
+  try { if (w.console && w.console !== g.console) hookConsole(w.console); } catch (_) {}
 
   // 6. Per-inline-script `document.currentScript`. When WE evaluate page scripts
   //    (rather than happy-dom's own runner) currentScript is null; analytics/tag
