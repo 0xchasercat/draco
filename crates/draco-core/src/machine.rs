@@ -955,12 +955,14 @@ fn nonws_len(s: &str) -> usize {
 /// can run external `<script src>` and resolve `import`/`import()` for
 /// `type="module"` apps without ever touching the network itself.
 ///
-/// Seeds from every `<script src>` in the HTML, then BFS-crawls the ES-module
-/// graph (static + dynamic import specifiers) via `draco-net`, resolving each
-/// against its importer. Bounded by a file count and total-byte cap so a
-/// pathological graph can't blow up. Bare/unresolvable specifiers (npm bare
-/// names, `data:` URLs) and non-2xx fetches are skipped. Best-effort: any fetch
-/// error just omits that resource (the isolate degrades gracefully).
+/// Seeds from every `<script src>`, JS preload hint (`modulepreload`, and
+/// `preload as=script`), and string-literal import specifier in inline scripts in
+/// the HTML, then BFS-crawls the ES-module graph (static + dynamic import
+/// specifiers) via `draco-net`, resolving each against its importer. Bounded by a
+/// file count and total-byte cap so a pathological graph can't blow up.
+/// Bare/unresolvable specifiers (npm bare names, `data:` URLs) and non-2xx
+/// fetches are skipped. Best-effort: any fetch error just omits that resource
+/// (the isolate degrades gracefully).
 #[cfg(feature = "tier2")]
 async fn prefetch_scripts<F>(
     page_url: &str,
@@ -986,7 +988,10 @@ where
     let mut out: Vec<ScriptResource> = Vec::new();
     let mut total = 0usize;
 
-    for src in scan_script_srcs(html) {
+    for src in scan_script_seed_urls(html)
+        .into_iter()
+        .chain(scan_inline_import_seed_urls(html))
+    {
         if let Ok(u) = base.join(&src) {
             if u.scheme() == "http" || u.scheme() == "https" {
                 queue.push_back(u.to_string());
@@ -1034,17 +1039,128 @@ where
     out
 }
 
-/// Extract every `<script … src="…">` URL from HTML, in document order.
+/// Extract initial JavaScript resource URLs from HTML, in document order.
+///
+/// Includes both executable `<script src>` tags and preload hints that commonly
+/// seed module graphs in SvelteKit/Vite output (`rel="modulepreload"` and
+/// `rel="preload" as="script"`).
 #[cfg(feature = "tier2")]
-fn scan_script_srcs(html: &str) -> Vec<String> {
+fn scan_script_seed_urls(html: &str) -> Vec<String> {
     use std::sync::LazyLock;
-    static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r#"(?is)<script\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']"#).unwrap()
-    });
-    RE.captures_iter(html)
-        .filter_map(|c| c.get(1).map(|m| m.as_str().trim().to_string()))
-        .filter(|s| !s.is_empty())
-        .collect()
+    static TAG_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r#"(?is)<(?:script|link)\b[^>]*>"#).unwrap());
+    let mut out = Vec::new();
+    for tag in TAG_RE.find_iter(html).map(|m| m.as_str()) {
+        let lower = tag.to_ascii_lowercase();
+        let is_script = lower.starts_with("<script");
+        let is_link = lower.starts_with("<link");
+        if is_script {
+            if let Some(src) = html_attr_value(tag, "src") {
+                push_nonempty(&mut out, src);
+            }
+        } else if is_link {
+            let rel = html_attr_value(tag, "rel")
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let as_attr = html_attr_value(tag, "as")
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let is_js_hint = rel.split_whitespace().any(|p| p == "modulepreload")
+                || (rel.split_whitespace().any(|p| p == "preload") && as_attr == "script");
+            if is_js_hint {
+                if let Some(href) = html_attr_value(tag, "href") {
+                    push_nonempty(&mut out, href);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(feature = "tier2")]
+fn push_nonempty(out: &mut Vec<String>, value: String) {
+    let value = value.trim();
+    if !value.is_empty() {
+        out.push(value.to_string());
+    }
+}
+
+#[cfg(feature = "tier2")]
+fn scan_inline_import_seed_urls(html: &str) -> Vec<String> {
+    use std::sync::LazyLock;
+    static SCRIPT_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r#"(?is)<script\b[^>]*>(.*?)</script\s*>"#).unwrap());
+    let mut out = Vec::new();
+    for caps in SCRIPT_RE.captures_iter(html) {
+        let open_tag = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
+        // External scripts are already seeded by `scan_script_seed_urls`; JSON-ish
+        // script bodies are not executable and should not be parsed as JS.
+        if html_attr_value(open_tag, "src").is_some() {
+            continue;
+        }
+        if let Some(ty) = html_attr_value(open_tag, "type") {
+            let ty = ty.trim().to_ascii_lowercase();
+            if !(ty.is_empty()
+                || ty == "module"
+                || ty == "text/javascript"
+                || ty == "application/javascript"
+                || ty == "text/ecmascript"
+                || ty == "application/ecmascript")
+            {
+                continue;
+            }
+        }
+        if let Some(body) = caps.get(1).map(|m| m.as_str()) {
+            out.extend(extract_module_imports(body));
+        }
+    }
+    out
+}
+
+#[cfg(feature = "tier2")]
+fn html_attr_value(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let mut search_from = 0;
+    loop {
+        let rel = lower[search_from..].find(name)?;
+        let at = search_from + rel;
+        let prev_ok = at == 0
+            || lower.as_bytes()[at - 1].is_ascii_whitespace()
+            || lower.as_bytes()[at - 1] == b'<';
+        let after = at + name.len();
+        let mut j = after;
+        while matches!(tag.as_bytes().get(j), Some(c) if c.is_ascii_whitespace()) {
+            j += 1;
+        }
+        if prev_ok && tag.as_bytes().get(j) == Some(&b'=') {
+            j += 1;
+            while matches!(tag.as_bytes().get(j), Some(c) if c.is_ascii_whitespace()) {
+                j += 1;
+            }
+            let val = match tag.as_bytes().get(j) {
+                Some(&b'"') => {
+                    let start = j + 1;
+                    let end = tag[start..].find('"').map(|e| start + e)?;
+                    tag[start..end].to_string()
+                }
+                Some(&b'\'') => {
+                    let start = j + 1;
+                    let end = tag[start..].find('\'').map(|e| start + e)?;
+                    tag[start..end].to_string()
+                }
+                _ => {
+                    let start = j;
+                    let end = tag[start..]
+                        .find(|c: char| c.is_ascii_whitespace() || c == '>')
+                        .map(|e| start + e)
+                        .unwrap_or(tag.len());
+                    tag[start..end].to_string()
+                }
+            };
+            return Some(val);
+        }
+        search_from = at + name.len();
+    }
 }
 
 /// Extract ES-module import/export specifiers from JS source via the **Oxc**
@@ -1515,15 +1631,49 @@ mod tests {
     // ---- ES-module subresource prefetch ------------------------------
 
     #[test]
-    fn scan_script_srcs_finds_external_scripts_only() {
+    fn scan_script_seed_urls_finds_scripts_and_js_preloads() {
         let html = r#"<html><head>
+            <link rel="stylesheet" href="/style.css">
+            <link rel="modulepreload" href="./_app/entry/start.js">
+            <link rel="preload" as="script" href='/preloaded.js'>
+            <link rel="preload" as="style" href="/ignored.css">
             <script src="/a.js"></script>
             <script type="module" src="https://cdn.example/b.mjs"></script>
             <script>inline(); // no src</script>
             <script src='c.js' defer></script>
           </head></html>"#;
-        let srcs = scan_script_srcs(html);
-        assert_eq!(srcs, vec!["/a.js", "https://cdn.example/b.mjs", "c.js"]);
+        let srcs = scan_script_seed_urls(html);
+        assert_eq!(
+            srcs,
+            vec![
+                "./_app/entry/start.js",
+                "/preloaded.js",
+                "/a.js",
+                "https://cdn.example/b.mjs",
+                "c.js"
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_inline_import_seed_urls_finds_sveltekit_boot_imports() {
+        let html = r#"<html><body><script>
+            Promise.all([
+                import("./_app/immutable/entry/start.js"),
+                import('./_app/immutable/entry/app.js')
+            ]).then(([kit, app]) => kit.start(app));
+        </script>
+        <script type="application/json">{"import":"./ignored.js"}</script>
+        </body></html>"#;
+        let mut got = scan_inline_import_seed_urls(html);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "./_app/immutable/entry/app.js".to_string(),
+                "./_app/immutable/entry/start.js".to_string()
+            ]
+        );
     }
 
     #[test]

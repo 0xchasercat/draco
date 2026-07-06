@@ -494,9 +494,13 @@ mod prod {
                 let f = match frame::read_jail_frame(ipc) {
                     Ok(f) => f,
                     Err(FrameError::Eof) => {
+                        let status = self
+                            .handle
+                            .try_reap_status()
+                            .unwrap_or_else(|| "status unavailable".to_string());
                         return Err(jail_error(
                             JailKind::Protocol,
-                            "child closed IPC before sending a Result",
+                            format!("child closed IPC before sending a Result ({status})"),
                         ));
                     }
                     Err(e) => return Err(map_frame_err(e, "collecting intercepts")),
@@ -731,6 +735,19 @@ mod prod {
                 Handle::Unjailed(h) => h.finish(),
             }
         }
+
+        #[cfg(target_os = "linux")]
+        fn try_reap_status(&mut self) -> Option<String> {
+            match self {
+                Handle::Jailed(h) => reap_pid_status(h.pid()),
+                Handle::Unjailed(_) => None,
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        fn try_reap_status(&mut self) -> Option<String> {
+            None
+        }
     }
 
     /// Spawn the child with an explicit sandbox posture. Default: the
@@ -760,11 +777,29 @@ mod prod {
     /// Best-effort reap of a child pid so a completed jail run leaves no zombie.
     #[cfg(target_os = "linux")]
     fn reap_pid(pid: i32) {
+        let _ = reap_pid_status(pid);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reap_pid_status(pid: i32) -> Option<String> {
         // SAFETY: waitpid on our own child pid; the child exits promptly after
         // emitting its Result and seeing Shutdown/EOF.
         unsafe {
             let mut status: libc::c_int = 0;
-            libc::waitpid(pid, &mut status, 0);
+            let r = libc::waitpid(pid, &mut status, 0);
+            if r < 0 {
+                return Some(format!(
+                    "waitpid failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if libc::WIFSIGNALED(status) {
+                return Some(format!("child signaled {}", libc::WTERMSIG(status)));
+            }
+            if libc::WIFEXITED(status) {
+                return Some(format!("child exited {}", libc::WEXITSTATUS(status)));
+            }
+            Some(format!("wait status 0x{status:x}"))
         }
     }
 

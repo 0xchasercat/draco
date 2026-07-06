@@ -3,6 +3,23 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.13.1] — 2026-07-06
+
+### Fixed
+- **`draco discover` hardened Linux jail boot** no longer dies before returning a
+  result. The default seccomp denylist now allows `clone3` (modern libc may use it
+  for ordinary thread creation) while still blocking `execve`/`execveat`, and the
+  child address-space limit now permits current deno_core/V8 Oilpan virtual cage
+  reservations. The W^X `mprotect(PROT_EXEC)` guard remains in place.
+- **Classic inline SvelteKit/Vite boot scripts** now resolve dynamic
+  `import("./chunk.js")` against the page URL instead of a synthetic non-base
+  `draco:` script name. This fixes the `invalid URL: relative URL with a
+  cannot-be-a-base base` rejection observed on macOS and lets the module graph run.
+- **Module graph prefetching** now seeds from JS preload hints (`modulepreload` and
+  `preload as=script`) and inline-script string-literal imports, not only
+  `<script src>`, so SvelteKit-style entry modules are available to the air-gapped
+  runtime.
+
 ## [0.13.0] — 2026-07-06
 
 ### Added

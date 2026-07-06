@@ -40,12 +40,13 @@ mod seccomp;
 // ---------------------------------------------------------------------------
 
 /// Address-space cap for the child. A jitless V8 isolate reserves large *virtual*
-/// regions for its managed heap and cage even though resident memory stays small,
-/// so `RLIMIT_AS` must be generous or `mmap` reservations fail at boot. 4 GiB
-/// comfortably fits a single default-heap isolate; tune on bare metal alongside
-/// the seccomp allowlist. (The supervisor's wall-clock `capture_window_ms` and
-/// `RLIMIT_CPU` bound runaway compute independently.)
-const RLIMIT_AS_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// regions for its managed heap/cage and the snapshot-restored DOM runtime even
+/// though resident memory stays small, so `RLIMIT_AS` must be generous or `mmap`
+/// reservations fail at boot. 64 GiB fits current deno_core/V8 Oilpan cage
+/// reservations while still bounding pathological address-space growth. The
+/// supervisor's wall-clock `capture_window_ms` and `RLIMIT_CPU` bound runaway
+/// compute independently.
+const RLIMIT_AS_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 /// Max open file descriptors. The child needs stdio + fd 3 + a handful for the
 /// runtime; 64 is comfortable and still tight.
 const RLIMIT_NOFILE_MAX: u64 = 64;
