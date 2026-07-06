@@ -260,13 +260,14 @@ pub(crate) async fn start_handler(
         .as_ref()
         .map(|o| o.formats.clone())
         .unwrap_or_default();
-    let format = match parse_formats(&formats) {
+    let (format, discover) = match parse_formats(&formats) {
         Ok(f) => f,
         Err(msg) => return (StatusCode::BAD_REQUEST, Json(error_body(&msg))),
     };
 
     let mut config = state.defaults.clone();
     config.format = format;
+    config.discover_endpoints = discover;
     if let Some(t) = req.timeout {
         config.timeout_ms = t;
     }

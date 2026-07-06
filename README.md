@@ -176,6 +176,29 @@ Beyond scraping, the daemon speaks two more Firecrawl endpoints:
   `{ status, total, completed, data: [ per-page results ] }`; `DELETE` cancels.
   Jobs are in-memory and share the daemon's concurrency budget.
 
+### API discovery/replay (`endpoints` / `POST /v1/discover`)
+
+Client-rendered pages load their content from their own JSON APIs. Draco's
+Tier 2 isolate already intercepts every `fetch`/XHR to pick a replay winner —
+**discovery** surfaces the *full ranked catalog* so you can see (and replay)
+the APIs behind a SPA:
+
+```sh
+draco extract https://shop.example --format endpoints --pretty   # catalog + replayed winner
+```
+```sh
+curl -X POST localhost:3002/v1/discover -H 'content-type: application/json' \
+  -d '{"url": "https://shop.example"}'
+# → { "success": true, "endpoints": [ { "method","url","via","score","replayable","headers" }, … ],
+#     "data": <replayed winner JSON | null> }
+```
+
+Each endpoint carries a `score` (higher = more likely the real data API) and a
+`replayable` flag (clears the viability bar and is replay-safe). Ranked
+best-first; the analytics beacons and static assets sort to the bottom. On
+`/v1/scrape`, `formats: ["endpoints"]` returns the catalog under
+`data.endpoints` and composes with `markdown`/`json`.
+
 ### MCP server (`draco mcp` / `POST /mcp`)
 
 Draco's scraping is available as **Model Context Protocol tools** for agent
@@ -191,8 +214,13 @@ draco mcp                        # stdio transport (newline-delimited JSON-RPC)
 
 The same server is bound on the daemon at `POST /mcp` (minimal Streamable-HTTP
 subset: single-message POST → single JSON response, `202` for notifications).
-One tool today: `draco_scrape` (`url`, `formats: ["markdown"|"json"]`,
-`tierMax`, `captureWindowMs`, `timeout`, `ignoreRobots`) — annotated read-only.
+Two tools, both annotated read-only:
+- `draco_scrape` (`url`, `formats: ["markdown"|"json"|"endpoints"]`, `tierMax`,
+  `captureWindowMs`, `timeout`, `ignoreRobots`) — scrape to Markdown/JSON.
+- `draco_discover` (`url`, `tierMax`, `captureWindowMs`, `timeout`,
+  `ignoreRobots`, `allowUnsafeReplay`) — the ranked API-endpoint catalog + the
+  replayed winner, for agents that want a page's data API.
+
 Tool-level failures come back as `isError` results the model can react to;
 protocol misuse is a proper JSON-RPC error.
 
