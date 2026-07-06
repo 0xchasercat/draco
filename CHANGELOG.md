@@ -3,6 +3,34 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.8.1] — 2026-07-06
+
+### Changed
+- **`draco-net` now shares one pooled HTTP client process-wide instead of
+  building a fresh client per fetch.** Previously every `fetch_target` /
+  `replay` call constructed a new `wreq::Client` — discarding the keep-alive /
+  HTTP-2 connection pool and recompiling the BoringSSL connector + emulation
+  profile on every request (measured ~263 µs of pure build cost per fetch, plus
+  a fresh TCP+TLS handshake since no connection could be reused). The client is
+  now built once per proxy and cached (`Client` is `Arc`-backed, so clones
+  share the pool), giving connection reuse across requests in the `draco serve`
+  daemon **and** across the several same-host fetches within one extraction
+  (page + script subresources + replay). Warm client acquisition drops to
+  ~667 ns (~395× cheaper), before counting the saved TLS handshakes.
+- **Cookie isolation is preserved exactly.** A shared client must not let one
+  call's cookies bleed into another, so the cookie jar moved from the client to
+  a fresh per-call `Jar` attached via wreq's per-request `cookie_provider`; the
+  total request timeout likewise moved to a per-request setting (so the shared
+  client isn't fragmented by timeout). Cookies still flow across a redirect
+  chain within a single call but never leak between calls — covered by new
+  integration tests (`cookies_do_not_leak_between_calls`,
+  `cookie_flows_across_redirect_within_one_call`).
+
+  Note: this is a latency/efficiency fix that helps the daemon most. It does
+  not change the daemon-vs-CLI gap under concurrent load, which is CPU
+  contention between simultaneous Tier-2 hydrations (a warm isolate pool /
+  `--max-concurrency` tuning is the lever there).
+
 ## [0.8.0] — 2026-07-06
 
 ### Added
