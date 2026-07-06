@@ -192,6 +192,10 @@ pub enum NetKind {
     TooManyRedirects,
     Proxy,
     Body,
+    /// The URL was disallowed by the site's `robots.txt` (and `respect_robots`
+    /// was on). Distinct from `Status` so callers can report it as "skipped by
+    /// robots" rather than a transport/HTTP failure.
+    Robots,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

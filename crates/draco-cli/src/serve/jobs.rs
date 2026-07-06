@@ -55,13 +55,15 @@ impl JobStatus {
 /// One job's observable state. `total` counts units of work (crawl: URLs
 /// admitted to the frontier, bounded by `limit`; batch: the URL count, known
 /// upfront); `completed` counts finished units; `data` holds successful page
-/// payloads in completion order; `errors` backs the `/errors` endpoint.
+/// payloads in completion order; `errors`/`robots_blocked` back the `/errors`
+/// endpoint.
 struct Job {
     status: JobStatus,
     total: usize,
     completed: usize,
     data: Vec<Value>,
     errors: Vec<Value>,
+    robots_blocked: Vec<String>,
     created: SystemTime,
 }
 
@@ -73,6 +75,7 @@ impl Job {
             completed: 0,
             data: Vec::new(),
             errors: Vec::new(),
+            robots_blocked: Vec::new(),
             created: SystemTime::now(),
         }
     }
@@ -173,16 +176,15 @@ impl JobStore {
         }))
     }
 
-    /// The `/errors` body: per-URL failures. `robotsBlocked` is always empty —
-    /// draco-net honors `robots.txt` inside the fetch and surfaces a disallowed
-    /// URL as an ordinary fetch failure (in `errors`), with no separate signal to
-    /// split out; the key is present for Firecrawl shape parity.
+    /// The `/errors` body: per-URL failures plus URLs skipped by `robots.txt`
+    /// (draco-net signals a robots deny as `NetKind::Robots`, which the worker
+    /// routes here via [`JobStore::record_robots_blocked`] rather than `errors`).
     pub(crate) fn errors_snapshot(&self, id: &str) -> Option<Value> {
         let jobs = self.jobs.lock().unwrap();
         let job = jobs.get(id)?;
         Some(json!({
             "errors": job.errors,
-            "robotsBlocked": [],
+            "robotsBlocked": job.robots_blocked,
         }))
     }
 
@@ -229,6 +231,16 @@ impl JobStore {
         let mut jobs = self.jobs.lock().unwrap();
         if let Some(job) = jobs.get_mut(id) {
             job.errors.push(json!({ "url": url, "error": error }));
+        }
+    }
+
+    /// Record a URL skipped due to `robots.txt` (surfaced under `robotsBlocked`
+    /// by the `/errors` endpoint). Pairs with [`JobStore::record_page`]`(None)`
+    /// so the unit still counts as processed.
+    pub(crate) fn record_robots_blocked(&self, id: &str, url: &str) {
+        let mut jobs = self.jobs.lock().unwrap();
+        if let Some(job) = jobs.get_mut(id) {
+            job.robots_blocked.push(url.to_string());
         }
     }
 
@@ -292,15 +304,15 @@ mod tests {
     }
 
     #[test]
-    fn errors_snapshot_carries_failures() {
+    fn errors_snapshot_carries_failures_and_robots() {
         let store = JobStore::default();
         let id = store.create_with_total(2);
         store.record_error(&id, "https://x.test/a", "boom");
+        store.record_robots_blocked(&id, "https://x.test/b");
         let e = store.errors_snapshot(&id).unwrap();
         assert_eq!(e["errors"][0]["url"], "https://x.test/a");
         assert_eq!(e["errors"][0]["error"], "boom");
-        // robotsBlocked is present but always empty (robots-blocks fold into errors).
-        assert_eq!(e["robotsBlocked"], serde_json::json!([]));
+        assert_eq!(e["robotsBlocked"][0], "https://x.test/b");
     }
 
     #[test]
