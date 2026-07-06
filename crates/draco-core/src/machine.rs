@@ -38,7 +38,7 @@ use draco_types::{
 use crate::challenge::detect_challenge;
 use crate::fetcher::{NetFetcher, PageFetcher};
 use crate::tier2::Tier2Capture;
-use crate::{Config, OutputFormat};
+use crate::Config;
 
 // ---------------------------------------------------------------------------
 // Tier ceilings (spec §11 `tier_max`)
@@ -154,12 +154,18 @@ struct Run {
     markdown: Option<String>,
     /// Flat page metadata, staged alongside [`Run::markdown`].
     metadata: Option<serde_json::Value>,
+    /// Cleaned main-content HTML (`html` format); staged when requested.
+    html: Option<String>,
+    /// Unmodified fetched HTML (`rawHtml` format); staged when requested.
+    raw_html: Option<String>,
+    /// Absolutized `<a href>` list (`links` format); staged when requested.
+    links: Option<Vec<String>>,
     /// The tier the staged Markdown came from: [`SourceTier::Static`] for a
     /// plain fetch+parse, or [`SourceTier::RuntimeInterception`] once the
     /// render-then-Markdown escalation hydrated a thin shell and re-scraped it.
     md_tier: SourceTier,
     /// The discovered API-endpoint catalog, staged by the discovery branch when
-    /// `config.discover_endpoints` is set; `None` otherwise.
+    /// `config.formats.endpoints` is set; `None` otherwise.
     endpoints: Option<Vec<draco_types::DiscoveredEndpoint>>,
 }
 
@@ -185,6 +191,9 @@ impl Run {
             timing: Timing::default(),
             markdown: None,
             metadata: None,
+            html: None,
+            raw_html: None,
+            links: None,
             md_tier: SourceTier::Static,
             endpoints: None,
         }
@@ -231,6 +240,9 @@ impl Run {
             data,
             markdown: self.markdown,
             metadata: self.metadata,
+            html: self.html,
+            raw_html: self.raw_html,
+            links: self.links,
             endpoints: self.endpoints,
             timing: self.timing,
             trace: self.trace,
@@ -351,10 +363,16 @@ where
     // never touching V8/the jail (~300ms). For `Both` we stage the Markdown +
     // metadata onto the run and fall through to the JSON ladder below. For
     // `Json` the scrape is skipped entirely.
-    if matches!(config.format, OutputFormat::Markdown | OutputFormat::Both) {
+    if config.formats.wants_static_content() {
         let t_md = Instant::now();
         let content_type = content_type_of(&resp.meta.headers);
-        let scraped = statics.scrape(&body, url, resp.meta.status, &content_type, true);
+        let scraped = statics.scrape(
+            &body,
+            url,
+            resp.meta.status,
+            &content_type,
+            config.only_main_content,
+        );
         let md_ms = t_md.elapsed().as_millis() as u64;
 
         // A page needs the render pass when its static extraction is either
@@ -398,6 +416,24 @@ where
         run.markdown = Some(scraped.markdown);
         run.metadata = Some(scraped.metadata);
 
+        // Sibling HTML-derived formats, staged from the fetched shell. `rawHtml`
+        // is the unmodified fetch (pre-render by definition); `html`/`links` are
+        // derived from this static body here and refreshed from the hydrated DOM
+        // below if the render escalation wins.
+        if config.formats.raw_html {
+            run.raw_html = Some(body.clone());
+        }
+        if config.formats.html {
+            run.html = Some(draco_static::content::clean_html(
+                &body,
+                url,
+                config.only_main_content,
+            ));
+        }
+        if config.formats.links {
+            run.links = Some(draco_static::content::extract_links(&body, url));
+        }
+
         // Render-then-Markdown escalation: a thin or skeleton client-rendered
         // shell has almost no real static content, but the same Tier 2 isolate
         // that leaks JSON endpoints also hydrates the DOM. When a render is needed
@@ -422,15 +458,16 @@ where
             .await;
         }
 
-        if config.format == OutputFormat::Markdown && !config.discover_endpoints {
-            // Terminal for the default path (Static, or RuntimeInterception if
-            // the render escalation upgraded the Markdown). When discovery is
-            // also requested we fall through to the discovery branch below,
-            // carrying the staged Markdown into the final result.
+        if config.formats.is_static_terminal() {
+            // Terminal for the HTML-only path (Static, or RuntimeInterception if
+            // the render escalation upgraded the content). When `json`/`endpoints`
+            // are also requested we fall through to the ladder / discovery branch
+            // below, carrying the staged HTML formats into the final result.
             let tier = run.md_tier;
             return run.finish(Status::Success, Some(tier), None, None);
         }
-        // `Both`: continue into the JSON ladder, carrying markdown+metadata.
+        // json/endpoints also requested: continue into the JSON ladder,
+        // carrying the staged HTML-derived formats.
     }
 
     // ---- API discovery (the `endpoints` format / `/v1/discover`) ----------
@@ -439,7 +476,7 @@ where
     // cheap-tier early returns would otherwise preempt it. Terminal: it attaches
     // the ranked endpoint catalog (and, for `json`/`both`, the replayed winner
     // as `data`) plus any staged Markdown.
-    if config.discover_endpoints {
+    if config.formats.endpoints {
         if tier_max >= 2 {
             return try_discover(&mut run, url, &body, config, &opts, fetcher, capture).await;
         }
@@ -676,9 +713,9 @@ where
         Some(format!("{n} endpoint(s), {replayable} replayable")),
     );
 
-    // For json/both, also replay the winner so `data` carries the API payload
-    // (discovery + replay). Pure `endpoints`/markdown discovery skips the hop.
-    let data = if matches!(config.format, OutputFormat::Json | OutputFormat::Both) {
+    // When `json` is also requested, replay the winner so `data` carries the API
+    // payload (discovery + replay). Pure `endpoints` discovery skips the hop.
+    let data = if config.formats.wants_data() {
         let t_rank = Instant::now();
         match rank_and_replay(
             &capture_result,
@@ -728,6 +765,7 @@ where
     )
 }
 
+#[cfg(feature = "tier2")]
 async fn try_tier2<F, T>(
     run: &mut Run,
     url: &str,
@@ -1107,7 +1145,8 @@ async fn try_render_markdown<F, T>(
     // Merge the shell's real <head> (title, OG, canonical, <base>) with the
     // hydrated <body>, then re-run the identical Firecrawl-parity content engine.
     let merged = draco_static::content::merge_rendered_document(body, rendered);
-    let rescraped = draco_static::content::scrape(&merged, url, status, content_type, true);
+    let rescraped =
+        draco_static::content::scrape(&merged, url, status, content_type, config.only_main_content);
 
     let prev_len = run.markdown.as_deref().map(nonws_len).unwrap_or(0);
     let new_len = nonws_len(&rescraped.markdown);
@@ -1128,6 +1167,18 @@ async fn try_render_markdown<F, T>(
         run.markdown = Some(rescraped.markdown);
         run.metadata = Some(rescraped.metadata);
         run.md_tier = SourceTier::RuntimeInterception;
+        // Refresh the HTML-derived formats from the hydrated DOM (rawHtml stays
+        // the raw fetch). Only when the render actually won.
+        if config.formats.html {
+            run.html = Some(draco_static::content::clean_html(
+                &merged,
+                url,
+                config.only_main_content,
+            ));
+        }
+        if config.formats.links {
+            run.links = Some(draco_static::content::extract_links(&merged, url));
+        }
         let why = if resolved_skeleton {
             "resolved skeleton"
         } else {
@@ -1339,6 +1390,9 @@ impl Run {
             timing: std::mem::take(&mut self.timing),
             markdown: self.markdown.take(),
             metadata: self.metadata.take(),
+            html: self.html.take(),
+            raw_html: self.raw_html.take(),
+            links: self.links.take(),
             md_tier: self.md_tier,
             endpoints: self.endpoints.take(),
         }
@@ -1426,6 +1480,7 @@ mod tests {
     use super::*;
     use crate::ranking::Candidate;
     use crate::testutil::{err_fetcher, noop_capture, MockCapture, MockFetcher, MockStatic};
+    use crate::FormatSet;
     use draco_types::{ExtractOrigin, ExtractedData, InterceptVia, NetKind};
     use serde_json::json;
 
@@ -1573,7 +1628,7 @@ mod tests {
     /// covered by its own tests below.
     fn cfg(tier_max: u8) -> Config {
         Config {
-            format: OutputFormat::Json,
+            formats: FormatSet::json_only(),
             tier_max,
             ..Config::default()
         }
@@ -1885,9 +1940,12 @@ mod tests {
             ),
         ]);
         let config = Config {
-            format: OutputFormat::Json,
+            formats: FormatSet {
+                json: true,
+                endpoints: true,
+                ..FormatSet::none()
+            },
             tier_max: 2,
-            discover_endpoints: true,
             ..Config::default()
         };
         let r = run_ladder("https://x.com/p", &config, &fetcher, &statics, &capture).await;
@@ -1912,9 +1970,12 @@ mod tests {
         let statics = MockStatic::miss_no_build_id();
         let capture = MockCapture::empty();
         let config = Config {
-            format: OutputFormat::Json,
+            formats: FormatSet {
+                json: true,
+                endpoints: true,
+                ..FormatSet::none()
+            },
             tier_max: 1,
-            discover_endpoints: true,
             ..Config::default()
         };
         let r = run_ladder("https://x.com/p", &config, &fetcher, &statics, &capture).await;
@@ -2030,7 +2091,7 @@ mod tests {
     /// A Markdown-format config.
     fn cfg_markdown() -> Config {
         Config {
-            format: OutputFormat::Markdown,
+            formats: FormatSet::markdown_only(),
             ..Config::default()
         }
     }
@@ -2294,7 +2355,11 @@ mod tests {
 
     fn cfg_both() -> Config {
         Config {
-            format: OutputFormat::Both,
+            formats: FormatSet {
+                markdown: true,
+                json: true,
+                ..FormatSet::none()
+            },
             ..Config::default()
         }
     }

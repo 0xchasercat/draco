@@ -68,29 +68,99 @@ pub use ranking::{
     SCORE_SAME_ORIGIN,
 };
 
-/// What `draco extract` should produce.
+/// The set of outputs a scrape should produce — the multi-select `formats` of
+/// the Firecrawl-style request, replacing the old coarse three-way enum.
 ///
-/// The default is [`OutputFormat::Markdown`]: Draco is first a Firecrawl-style
-/// scraper (URL → clean Markdown + metadata), and that path is the fast one — it
-/// never touches V8/the jail.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum OutputFormat {
-    /// Clean Markdown + metadata of the page's main content (the fast,
-    /// static-only path). **Default.**
-    #[default]
-    Markdown,
-    /// The tiered JSON-API extraction (Tier 0 embedded state → Tier 1 build-id
-    /// → Tier 2 runtime interception), populating `data`.
-    Json,
-    /// Both: Markdown + metadata AND the JSON-API extraction.
-    Both,
+/// Each flag is an independent output; a request may ask for any combination.
+/// The default is `markdown` alone: Draco is first a Firecrawl-style scraper
+/// (URL → clean Markdown + metadata), and that path is the fast one — it never
+/// touches V8/the jail.
+///
+/// - `markdown` — clean Markdown of the main content (+ `metadata`).
+/// - `html` — cleaned, absolutized main-content HTML.
+/// - `raw_html` — the unmodified fetched HTML.
+/// - `links` — every absolutized `<a href>` on the page.
+/// - `json` — the tiered JSON-API extraction (Tier 0 → 1 → 2), populating `data`.
+/// - `endpoints` — the ranked catalog of API endpoints the page's JS called
+///   (the `endpoints` format / `/v1/discover`); forces the Tier 2 capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatSet {
+    pub markdown: bool,
+    pub html: bool,
+    pub raw_html: bool,
+    pub links: bool,
+    pub json: bool,
+    pub endpoints: bool,
+}
+
+impl Default for FormatSet {
+    /// Markdown-only, matching Firecrawl's default `["markdown"]`.
+    fn default() -> Self {
+        Self {
+            markdown: true,
+            html: false,
+            raw_html: false,
+            links: false,
+            json: false,
+            endpoints: false,
+        }
+    }
+}
+
+impl FormatSet {
+    /// The empty set (no outputs). Building block for the constructors below.
+    pub fn none() -> Self {
+        Self {
+            markdown: false,
+            html: false,
+            raw_html: false,
+            links: false,
+            json: false,
+            endpoints: false,
+        }
+    }
+
+    /// Markdown only — the default scrape.
+    pub fn markdown_only() -> Self {
+        Self::default()
+    }
+
+    /// The JSON-API extraction only.
+    pub fn json_only() -> Self {
+        Self {
+            json: true,
+            ..Self::none()
+        }
+    }
+
+    /// Any output derived from the fetched/rendered HTML (markdown / html /
+    /// links) is requested — i.e. the static scrape + DOM pre-processing must run.
+    pub fn wants_static_content(&self) -> bool {
+        self.markdown || self.html || self.links
+    }
+
+    /// The tiered JSON-API extraction (populating `data`) is requested.
+    pub fn wants_data(&self) -> bool {
+        self.json
+    }
+
+    /// Only HTML-derived content was asked for (no `data`, no `endpoints`), so
+    /// the run can return after the static scrape without entering the JSON
+    /// ladder. When `false`, the ladder (and/or discovery) still has work to do.
+    pub fn is_static_terminal(&self) -> bool {
+        self.wants_static_content() && !self.json && !self.endpoints
+    }
 }
 
 /// Orchestration configuration, assembled by the CLI from flags/env/config file.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// What to produce (Markdown / JSON / both). Default: Markdown.
-    pub format: OutputFormat,
+    /// What to produce — the set of requested output formats. Default: markdown.
+    pub formats: FormatSet,
+    /// Strip boilerplate (nav/header/footer/ads) to the main content —
+    /// Firecrawl's `onlyMainContent`. Applies to the `markdown` and `html`
+    /// formats (`rawHtml` is always the unmodified fetch). Default: `true`.
+    pub only_main_content: bool,
     pub proxy: Option<String>,
     pub delay_ms: u64,
     pub timeout_ms: u64,
@@ -114,17 +184,13 @@ pub struct Config {
     /// falls through to `Unsupported` (see [`ranking::best_replayable`]). Set via
     /// the CLI `--allow-unsafe-replay` flag when the side effect is intended.
     pub allow_unsafe_replay: bool,
-    /// Attach the ranked catalog of API endpoints the page's JS called (the
-    /// `endpoints` format / `/v1/discover`). Forces the Tier 2 capture so the
-    /// `fetch`/XHR calls can be observed; the catalog rides `ExtractionResult::
-    /// endpoints`. Off by default. Set via the CLI `--format endpoints`.
-    pub discover_endpoints: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            format: OutputFormat::Markdown,
+            formats: FormatSet::markdown_only(),
+            only_main_content: true,
             proxy: None,
             delay_ms: 0,
             timeout_ms: 30_000,
@@ -134,7 +200,6 @@ impl Default for Config {
             no_jail: false,
             strict_sandbox: false,
             allow_unsafe_replay: false,
-            discover_endpoints: false,
         }
     }
 }
@@ -172,7 +237,8 @@ mod tests {
     fn config_default_is_markdown_first_with_full_ladder_available() {
         let c = Config::default();
         // Default output is Markdown (Firecrawl-style scrape).
-        assert_eq!(c.format, OutputFormat::Markdown);
+        assert_eq!(c.formats, FormatSet::markdown_only());
+        assert!(c.formats.markdown && !c.formats.json && !c.formats.endpoints);
         // The JSON ladder ceiling is still fully available for --format json/both.
         assert_eq!(c.tier_max, 2);
         assert!(c.respect_robots);

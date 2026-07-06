@@ -103,6 +103,18 @@ pub struct ExtractionResult {
     /// Populated alongside `markdown`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+    /// Cleaned, absolutized HTML of the page's main content — the `html` format.
+    /// Script/style/chrome stripped and relative URLs resolved (the same DOM
+    /// pre-processing that feeds the Markdown transform). `None` unless requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html: Option<String>,
+    /// The unmodified fetched HTML — the `rawHtml` format. `None` unless requested.
+    #[serde(default, rename = "rawHtml", skip_serializing_if = "Option::is_none")]
+    pub raw_html: Option<String>,
+    /// Every absolutized `<a href>` found on the page — the `links` format.
+    /// `None` unless requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links: Option<Vec<String>>,
     /// The ranked catalog of JSON/XHR API endpoints the page's own JavaScript
     /// called, discovered during the Tier 2 capture (the `endpoints` format /
     /// `/v1/discover`). `Some` only when discovery was requested and the isolate
@@ -371,6 +383,9 @@ mod tests {
             data: Some(json!({ "price": 42, "title": "Widget" })),
             markdown: Some("# Widget\n\nA great widget.".into()),
             metadata: Some(json!({ "title": "Widget", "statusCode": 200 })),
+            html: None,
+            raw_html: None,
+            links: None,
             endpoints: None,
             timing: Timing {
                 network_ms: 210,
@@ -464,6 +479,9 @@ mod tests {
             data: None,
             markdown: None,
             metadata: None,
+            html: None,
+            raw_html: None,
+            links: None,
             endpoints: None,
             timing: Timing::default(),
             trace: vec![],

@@ -35,7 +35,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
-use draco_core::{extract, extract_with_pool, Config, OutputFormat, Tier2Pool};
+use draco_core::{extract, extract_with_pool, Config, FormatSet, Tier2Pool};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Semaphore;
@@ -211,9 +211,19 @@ fn scrape_tool_descriptor() -> Value {
                 },
                 "formats": {
                     "type": "array",
-                    "items": { "type": "string", "enum": ["markdown", "json"] },
-                    "description": "Output formats; defaults to [\"markdown\"]. \"json\" is \
-                                    the tiered JSON-API extraction."
+                    "items": { "type": "string", "enum": ["markdown", "html", "rawHtml", "links", "json", "endpoints"] },
+                    "description": "Output formats; defaults to [\"markdown\"]. \"html\" is \
+                                    cleaned main-content HTML, \"rawHtml\" the unmodified fetch, \
+                                    \"links\" every absolutized link, \"json\" the tiered JSON-API \
+                                    extraction, \"endpoints\" the ranked API-endpoint catalog."
+                },
+                "onlyMainContent": {
+                    "type": "boolean",
+                    "description": "Strip nav/header/footer/ads to the main content (default true)."
+                },
+                "waitFor": {
+                    "type": "integer",
+                    "description": "Alias for captureWindowMs: ms to let the page settle (Tier 2)."
                 },
                 "tierMax": {
                     "type": "integer",
@@ -304,21 +314,30 @@ async fn call_tool(
                 .collect()
         })
         .unwrap_or_default();
-    let (format, discover) = parse_formats(&formats).map_err(|msg| (-32602, msg))?;
+    let parsed_formats = parse_formats(&formats).map_err(|rej| (-32602, rej.message))?;
 
     let mut config = defaults.clone();
-    config.format = format;
-    // `draco_discover` always discovers (and replays the winner into `data`),
-    // regardless of the `formats` argument.
-    config.discover_endpoints = discover || is_discover;
+    config.formats = parsed_formats;
+    // `draco_discover` always discovers and replays the winner into `data`,
+    // regardless of the `formats` argument: force endpoints + json-only.
     if is_discover {
-        config.format = OutputFormat::Json;
+        config.formats = FormatSet {
+            json: true,
+            endpoints: true,
+            ..FormatSet::none()
+        };
     }
     if let Some(t) = args.get("tierMax").and_then(Value::as_u64) {
         config.tier_max = t.min(u8::MAX as u64) as u8;
     }
     if let Some(w) = args.get("captureWindowMs").and_then(Value::as_u64) {
         config.capture_window_ms = w;
+    } else if let Some(w) = args.get("waitFor").and_then(Value::as_u64) {
+        // Firecrawl-style alias; explicit captureWindowMs (above) wins.
+        config.capture_window_ms = w;
+    }
+    if let Some(only_main) = args.get("onlyMainContent").and_then(Value::as_bool) {
+        config.only_main_content = only_main;
     }
     if let Some(t) = args.get("timeout").and_then(Value::as_u64) {
         config.timeout_ms = t;
@@ -348,7 +367,7 @@ async fn call_tool(
     };
     drop(permit);
 
-    let (code, body) = to_firecrawl(&result, format);
+    let (code, body) = to_firecrawl(&result);
     if code != StatusCode::OK {
         let msg = body["error"].as_str().unwrap_or("extraction failed");
         return Ok(tool_error(&format!("{msg} (source: {url})")));
@@ -368,7 +387,7 @@ async fn call_tool(
     if let Some(md) = data["markdown"].as_str() {
         content.push(json!({ "type": "text", "text": md }));
     }
-    if matches!(format, OutputFormat::Json | OutputFormat::Both) {
+    if config.formats.wants_data() {
         if let Some(d) = data.get("json") {
             let pretty = serde_json::to_string_pretty(d).unwrap_or_else(|_| d.to_string());
             content.push(json!({ "type": "text", "text": pretty }));
@@ -379,7 +398,7 @@ async fn call_tool(
         // shape) — still a valid result; say so instead of returning nothing.
         content.push(json!({
             "type": "text",
-            "text": format!("scrape succeeded but produced no {format:?} content for {url}")
+            "text": format!("scrape succeeded but produced no {:?} content for {url}", config.formats)
         }));
     }
     Ok(json!({ "content": content, "isError": false }))

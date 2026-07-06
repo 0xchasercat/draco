@@ -14,11 +14,14 @@
 //! - `formats` defaults to `["markdown"]`. Draco's `"json"` is the tiered
 //!   JSON-API extraction (embedded state → build-id replay → runtime
 //!   interception) — a superset of "structured data from the page", surfaced
-//!   under `data.json` like Firecrawl's json format. Formats Draco does not
-//!   produce yet (`html`, `rawHtml`, `links`, `screenshot`, …) are rejected
-//!   with a clear `400` rather than silently dropped.
-//! - Unknown request fields (`onlyMainContent`, `waitFor`, `mobile`, …) are
-//!   accepted and ignored, so real-world Firecrawl client payloads work.
+//!   under `data.json` like Firecrawl's json format. `html`, `rawHtml`, and
+//!   `links` are also supported; only browser-only formats Draco's DOM-only
+//!   engine cannot produce (`screenshot`, `actions`, …) are rejected with a
+//!   clear `422` (`400` for a token that's unrecognized outright).
+//! - `onlyMainContent` (default `true`) and `waitFor` (an alias for
+//!   `captureWindowMs` — see below) are honored. Other unknown request fields
+//!   (`mobile`, `headers`, `includeTags`, `excludeTags`, …) are accepted and
+//!   ignored, so real-world Firecrawl client payloads still work.
 //! - Failures use Firecrawl's `{ "success": false, "error": … }` envelope.
 //! - Every response also carries a `draco` extension object (`sourceTier`,
 //!   `timing`, `trace`) — Draco's honest execution report. Extra keys are
@@ -34,7 +37,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use draco_core::{extract_with_pool, Config, OutputFormat, Tier2Pool};
+use draco_core::{extract_with_pool, Config, FormatSet, Tier2Pool};
 use draco_types::{DracoError, ExtractionResult, Status};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -159,11 +162,13 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
 }
 
-/// Firecrawl-shaped scrape request. Unknown fields are deliberately ignored so
-/// stock Firecrawl client payloads (`onlyMainContent`, `waitFor`, `mobile`, …)
-/// deserialize cleanly; camelCase to match their wire format. The `tierMax` /
-/// `captureWindowMs` / `noJail` / `allowUnsafeReplay` / `ignoreRobots` / `proxy`
-/// fields are Draco extensions mirroring the CLI flags.
+/// Firecrawl-shaped scrape request. `onlyMainContent` and `waitFor` are
+/// honored (see below); remaining unknown fields are deliberately ignored so
+/// stock Firecrawl client payloads (`mobile`, `headers`, `includeTags`, …)
+/// still deserialize cleanly. camelCase to match their wire format. The
+/// `tierMax` / `captureWindowMs` / `noJail` / `allowUnsafeReplay` /
+/// `ignoreRobots` / `proxy` fields are Draco extensions mirroring the CLI
+/// flags.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ScrapeRequest {
@@ -173,6 +178,17 @@ struct ScrapeRequest {
     /// Total request timeout in ms (Firecrawl field).
     #[serde(default)]
     timeout: Option<u64>,
+    /// Strip boilerplate to the main content (Firecrawl field). Defaults to
+    /// the daemon's `Config::only_main_content` default (`true`) when absent.
+    #[serde(default)]
+    only_main_content: Option<bool>,
+    /// Firecrawl field: milliseconds to wait for the page to settle before
+    /// extracting. Draco has no separate "wait" step — Tier 2's capture
+    /// window already serves this purpose — so `waitFor` is treated as an
+    /// alias for `captureWindowMs`: it only takes effect when the caller
+    /// didn't also send an explicit `captureWindowMs` (see the handler).
+    #[serde(default)]
+    wait_for: Option<u64>,
     // ---- Draco extensions ------------------------------------------------
     #[serde(default)]
     tier_max: Option<u8>,
@@ -192,9 +208,16 @@ async fn scrape(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ScrapeRequest>,
 ) -> (StatusCode, Json<Value>) {
-    let (format, discover) = match parse_formats(&req.formats) {
+    let formats = match parse_formats(&req.formats) {
         Ok(f) => f,
-        Err(msg) => return (StatusCode::BAD_REQUEST, Json(error_body(&msg))),
+        Err(rej) => {
+            let code = if rej.unsupported {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return (code, Json(error_body(&rej.message)));
+        }
     };
     if req.url.trim().is_empty() {
         return (
@@ -204,13 +227,18 @@ async fn scrape(
     }
 
     let config = Config {
-        format,
-        discover_endpoints: discover,
+        formats,
+        only_main_content: req
+            .only_main_content
+            .unwrap_or(state.defaults.only_main_content),
         proxy: req.proxy.clone().or_else(|| state.defaults.proxy.clone()),
         timeout_ms: req.timeout.unwrap_or(state.defaults.timeout_ms),
         tier_max: req.tier_max.unwrap_or(state.defaults.tier_max),
+        // `waitFor` is an alias for the capture window: an explicit
+        // `captureWindowMs` always wins when both are given.
         capture_window_ms: req
             .capture_window_ms
+            .or(req.wait_for)
             .unwrap_or(state.defaults.capture_window_ms),
         no_jail: req.no_jail.unwrap_or(state.defaults.no_jail),
         allow_unsafe_replay: req
@@ -233,7 +261,7 @@ async fn scrape(
         );
     };
     let result = extract_with_pool(&req.url, &config, &state.tier2_pool).await;
-    let (code, body) = to_firecrawl(&result, format);
+    let (code, body) = to_firecrawl(&result);
     (code, Json(body))
 }
 
@@ -241,49 +269,76 @@ async fn scrape(
 // Mapping
 // ===================================================================
 
-/// Parse Firecrawl `formats` into Draco's [`OutputFormat`]. Empty defaults to
-/// Markdown (Firecrawl's default). Recognized-but-unsupported formats fail
-/// loudly — a client asking for `rawHtml` should not get a silently different
-/// payload.
-pub(crate) fn parse_formats(formats: &[String]) -> Result<(OutputFormat, bool), String> {
-    let (mut markdown, mut json, mut endpoints) = (false, false, false);
+/// A rejected `formats` entry, carrying whether it was *unknown* (HTTP 400 — we
+/// don't recognize the token) or *unsupported* (HTTP 422 — recognized, but a
+/// DOM-only engine can't satisfy it, e.g. `screenshot`).
+#[derive(Debug)]
+pub(crate) struct FormatReject {
+    /// `true` → recognized but this engine can't produce it (map to 422);
+    /// `false` → unknown token (map to 400).
+    pub unsupported: bool,
+    pub message: String,
+}
+
+impl FormatReject {
+    fn unsupported(message: String) -> Self {
+        Self {
+            unsupported: true,
+            message,
+        }
+    }
+    fn unknown(message: String) -> Self {
+        Self {
+            unsupported: false,
+            message,
+        }
+    }
+}
+
+/// Parse Firecrawl `formats` into a Draco [`FormatSet`]. Empty defaults to
+/// `markdown` (Firecrawl's default). Supported: `markdown`, `html`, `rawHtml`,
+/// `links`, `json`, `endpoints`. Browser-only formats (`screenshot`,
+/// `screenshot@fullPage`, `actions`) and not-yet-implemented ones (`extract`,
+/// `changeTracking`, `summary`, `branding`, `product`, `menu`) are rejected as
+/// *unsupported* (422 — understood, but a DOM-only engine can't satisfy them);
+/// anything else is *unknown* (400). A client asking for `screenshot` should get
+/// a clear "needs a browser", not a silently different payload.
+pub(crate) fn parse_formats(formats: &[String]) -> Result<FormatSet, FormatReject> {
+    let mut set = FormatSet::none();
     for f in formats {
         match f.as_str() {
-            "markdown" => markdown = true,
-            "json" => json = true,
+            "markdown" => set.markdown = true,
+            "html" => set.html = true,
+            "rawHtml" => set.raw_html = true,
+            "links" => set.links = true,
+            "json" => set.json = true,
             // Discovery: the ranked catalog of API endpoints the page calls.
             // Composes with the content formats and rides `data.endpoints`.
-            "endpoints" => endpoints = true,
-            "html"
-            | "rawHtml"
-            | "links"
-            | "screenshot"
-            | "screenshot@fullPage"
-            | "extract"
-            | "changeTracking"
-            | "summary" => {
-                return Err(format!(
-                    "format {f:?} is not supported yet — supported formats: \
-                     \"markdown\", \"json\", \"endpoints\""
-                ));
+            "endpoints" => set.endpoints = true,
+            "screenshot" | "screenshot@fullPage" | "actions" => {
+                return Err(FormatReject::unsupported(format!(
+                    "format {f:?} needs a real browser — Draco is a DOM-only engine \
+                     and cannot capture screenshots or drive page actions"
+                )));
+            }
+            "extract" | "changeTracking" | "summary" | "branding" | "product" | "menu" => {
+                return Err(FormatReject::unsupported(format!(
+                    "format {f:?} is not supported by this engine"
+                )));
             }
             other => {
-                return Err(format!(
-                    "unknown format {other:?} — supported formats: \
-                     \"markdown\", \"json\", \"endpoints\""
-                ));
+                return Err(FormatReject::unknown(format!(
+                    "unknown format {other:?} — supported formats: \"markdown\", \
+                     \"html\", \"rawHtml\", \"links\", \"json\", \"endpoints\""
+                )));
             }
         }
     }
-    // Discovery replays the winner into `data` (discovery + replay), so its
-    // content dimension is the JSON path unless Markdown was also asked for.
-    let format = match (markdown, json || endpoints) {
-        (true, true) => OutputFormat::Both,
-        (false, true) => OutputFormat::Json,
-        // No formats given, or just "markdown".
-        _ => OutputFormat::Markdown,
-    };
-    Ok((format, endpoints))
+    // Empty `formats` → Firecrawl's default of markdown.
+    if formats.is_empty() {
+        set.markdown = true;
+    }
+    Ok(set)
 }
 
 /// Firecrawl error envelope.
@@ -292,7 +347,12 @@ pub(crate) fn error_body(message: &str) -> Value {
 }
 
 /// Map a terminal [`ExtractionResult`] to (HTTP status, Firecrawl body).
-pub(crate) fn to_firecrawl(result: &ExtractionResult, format: OutputFormat) -> (StatusCode, Value) {
+///
+/// Each output rides on its presence in the result: the machine only populates
+/// `markdown`/`html`/`rawHtml`/`links`/`data`/`endpoints` for formats the request
+/// actually asked for, so emitting whatever is `Some` reproduces the requested
+/// `formats` exactly — no separate format argument needed.
+pub(crate) fn to_firecrawl(result: &ExtractionResult) -> (StatusCode, Value) {
     let draco_ext = json!({
         "sourceTier": result.source_tier,
         "timing": result.timing,
@@ -304,10 +364,20 @@ pub(crate) fn to_firecrawl(result: &ExtractionResult, format: OutputFormat) -> (
         if let Some(md) = &result.markdown {
             data.insert("markdown".into(), Value::String(md.clone()));
         }
-        if matches!(format, OutputFormat::Json | OutputFormat::Both) {
-            if let Some(d) = &result.data {
-                data.insert("json".into(), d.clone());
-            }
+        if let Some(h) = &result.html {
+            data.insert("html".into(), Value::String(h.clone()));
+        }
+        if let Some(rh) = &result.raw_html {
+            data.insert("rawHtml".into(), Value::String(rh.clone()));
+        }
+        if let Some(links) = &result.links {
+            data.insert(
+                "links".into(),
+                serde_json::to_value(links).unwrap_or(Value::Null),
+            );
+        }
+        if let Some(d) = &result.data {
+            data.insert("json".into(), d.clone());
         }
         // The discovered API-endpoint catalog (the `endpoints` format), when
         // discovery ran. Rides `data.endpoints` alongside the content formats.
@@ -398,10 +468,10 @@ mod tests {
 
     #[test]
     fn formats_default_to_markdown() {
-        assert_eq!(parse_formats(&[]).unwrap(), (OutputFormat::Markdown, false));
+        assert_eq!(parse_formats(&[]).unwrap(), FormatSet::markdown_only());
         assert_eq!(
             parse_formats(&["markdown".into()]).unwrap(),
-            (OutputFormat::Markdown, false)
+            FormatSet::markdown_only()
         );
     }
 
@@ -409,41 +479,71 @@ mod tests {
     fn formats_map_json_and_both() {
         assert_eq!(
             parse_formats(&["json".into()]).unwrap(),
-            (OutputFormat::Json, false)
+            FormatSet::json_only()
         );
         assert_eq!(
             parse_formats(&["markdown".into(), "json".into()]).unwrap(),
-            (OutputFormat::Both, false)
+            FormatSet {
+                markdown: true,
+                json: true,
+                ..FormatSet::none()
+            }
         );
     }
 
     #[test]
     fn endpoints_format_sets_discovery() {
-        // Discovery alone → Json content dimension (winner replayed) + discover.
+        // Discovery alone → just the endpoints dimension set.
         assert_eq!(
             parse_formats(&["endpoints".into()]).unwrap(),
-            (OutputFormat::Json, true)
+            FormatSet {
+                endpoints: true,
+                ..FormatSet::none()
+            }
         );
-        // Composes with markdown → Both + discover.
+        // Composes with markdown → markdown + endpoints.
         assert_eq!(
             parse_formats(&["markdown".into(), "endpoints".into()]).unwrap(),
-            (OutputFormat::Both, true)
+            FormatSet {
+                markdown: true,
+                endpoints: true,
+                ..FormatSet::none()
+            }
+        );
+    }
+
+    #[test]
+    fn newly_supported_formats_succeed() {
+        // html / rawHtml / links used to be rejected as unsupported; they're
+        // now first-class formats the DOM-only engine can produce.
+        assert_eq!(
+            parse_formats(&["html".into(), "rawHtml".into(), "links".into()]).unwrap(),
+            FormatSet {
+                html: true,
+                raw_html: true,
+                links: true,
+                ..FormatSet::none()
+            }
         );
     }
 
     #[test]
     fn known_but_unsupported_formats_fail_loudly() {
-        let err = parse_formats(&["rawHtml".into()]).unwrap_err();
-        assert!(err.contains("not supported yet"), "{err}");
+        let err = parse_formats(&["screenshot".into()]).unwrap_err();
+        assert!(err.unsupported, "{}", err.message);
+        assert!(err.message.contains("real browser"), "{}", err.message);
         let err = parse_formats(&["bogus".into()]).unwrap_err();
-        assert!(err.contains("unknown format"), "{err}");
+        assert!(!err.unsupported, "{}", err.message);
+        assert!(err.message.contains("unknown format"), "{}", err.message);
     }
 
     // ---- request deserialization -------------------------------------------
 
     #[test]
     fn firecrawl_client_payload_deserializes_with_unknown_fields() {
-        // A realistic Firecrawl SDK payload: unknown fields must be ignored.
+        // A realistic Firecrawl SDK payload: `onlyMainContent`/`waitFor` are
+        // honored (see the dedicated tests below); genuinely unknown fields
+        // (`mobile`, `headers`, …) must still be ignored rather than erroring.
         let req: ScrapeRequest = serde_json::from_value(json!({
             "url": "https://example.com",
             "formats": ["markdown"],
@@ -456,6 +556,8 @@ mod tests {
         .unwrap();
         assert_eq!(req.url, "https://example.com");
         assert_eq!(req.timeout, Some(15_000));
+        assert_eq!(req.only_main_content, Some(true));
+        assert_eq!(req.wait_for, Some(123));
         assert!(req.tier_max.is_none());
     }
 
@@ -486,13 +588,21 @@ mod tests {
             url: "https://site.example/a".into(),
             status: Status::Success,
             source_tier: None,
-            data: Some(json!({ "items": [1, 2] })),
+            // Baseline is a markdown-only extraction: `data` (the JSON-API
+            // payload) rides on its own presence now that `to_firecrawl` no
+            // longer takes a separate format argument, so tests that want
+            // `data.json` in the body must set it explicitly (see
+            // `json_format_attaches_data_json`).
+            data: None,
             markdown: Some("# Title\n\nBody.".into()),
             metadata: Some(json!({
                 "title": "Title",
                 "sourceURL": "https://site.example/a",
                 "statusCode": 200
             })),
+            html: None,
+            raw_html: None,
+            links: None,
             endpoints: None,
             timing: Timing::default(),
             trace: vec![],
@@ -502,7 +612,7 @@ mod tests {
 
     #[test]
     fn success_maps_to_firecrawl_data_envelope() {
-        let (code, body) = to_firecrawl(&success_result(), OutputFormat::Markdown);
+        let (code, body) = to_firecrawl(&success_result());
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["success"], true);
         assert_eq!(body["data"]["markdown"], "# Title\n\nBody.");
@@ -518,8 +628,26 @@ mod tests {
 
     #[test]
     fn json_format_attaches_data_json() {
-        let (_, body) = to_firecrawl(&success_result(), OutputFormat::Both);
+        let mut r = success_result();
+        r.data = Some(json!({ "items": [1, 2] }));
+        let (_, body) = to_firecrawl(&r);
         assert_eq!(body["data"]["json"]["items"][0], 1);
+    }
+
+    #[test]
+    fn html_and_links_formats_attach_to_data() {
+        // When the result carries html/links (the request asked for those
+        // formats), to_firecrawl surfaces them under data.html / data.links.
+        let mut r = success_result();
+        r.html = Some("<h1>Title</h1><p>Body.</p>".into());
+        r.links = Some(vec![
+            "https://site.example/one".into(),
+            "https://site.example/two".into(),
+        ]);
+        let (_, body) = to_firecrawl(&r);
+        assert_eq!(body["data"]["html"], "<h1>Title</h1><p>Body.</p>");
+        assert_eq!(body["data"]["links"][0], "https://site.example/one");
+        assert_eq!(body["data"]["links"][1], "https://site.example/two");
     }
 
     #[test]
@@ -527,7 +655,7 @@ mod tests {
         let mut r = success_result();
         r.markdown = None;
         r.metadata = None;
-        let (_, body) = to_firecrawl(&r, OutputFormat::Json);
+        let (_, body) = to_firecrawl(&r);
         assert_eq!(
             body["data"]["metadata"]["sourceURL"],
             "https://site.example/a"
@@ -544,7 +672,7 @@ mod tests {
             reason: draco_types::NetKind::Timeout,
             detail: "connect timed out".into(),
         });
-        let (code, body) = to_firecrawl(&r, OutputFormat::Markdown);
+        let (code, body) = to_firecrawl(&r);
         assert_eq!(code, StatusCode::BAD_GATEWAY);
         assert_eq!(body["success"], false);
         let msg = body["error"].as_str().unwrap();
@@ -557,7 +685,7 @@ mod tests {
         r.status = Status::Unsupported;
         r.markdown = None;
         r.data = None;
-        let (code, body) = to_firecrawl(&r, OutputFormat::Json);
+        let (code, body) = to_firecrawl(&r);
         assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["success"], false);
     }
@@ -584,6 +712,8 @@ mod tests {
 
     #[tokio::test]
     async fn scrape_rejects_bad_format_before_extracting() {
+        // "rawHtml" is a supported format now (see `newly_supported_formats_succeed`);
+        // use an unrecognized token to exercise the pre-extraction 400 short-circuit.
         let app = router(test_state(Config::default()));
         let resp = app
             .oneshot(
@@ -592,7 +722,7 @@ mod tests {
                     .uri("/v1/scrape")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        json!({ "url": "https://example.com", "formats": ["rawHtml"] }).to_string(),
+                        json!({ "url": "https://example.com", "formats": ["bogus"] }).to_string(),
                     ))
                     .unwrap(),
             )
