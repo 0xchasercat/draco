@@ -102,6 +102,18 @@ fn formats_from_args(args: &[FormatArg]) -> FormatSet {
     set
 }
 
+/// Parse a `--header "Name: Value"` CLI argument into a `(name, value)` pair.
+fn parse_header(s: &str) -> Result<(String, String), String> {
+    let (name, value) = s
+        .split_once(':')
+        .ok_or_else(|| format!("invalid header {s:?}: expected \"Name: Value\""))?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(format!("invalid header {s:?}: empty header name"));
+    }
+    Ok((name.to_string(), value.trim().to_string()))
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Scrape a URL to Markdown (default), or to any combination of
@@ -167,6 +179,18 @@ enum Command {
         /// the full page instead.
         #[arg(long)]
         no_main_content: bool,
+        /// CSS selector to keep (Firecrawl's `includeTags`); repeatable. When
+        /// any are given, only matching subtrees survive into markdown/html.
+        #[arg(long = "include-tag")]
+        include_tag: Vec<String>,
+        /// CSS selector to drop before extraction (Firecrawl's `excludeTags`);
+        /// repeatable.
+        #[arg(long = "exclude-tag")]
+        exclude_tag: Vec<String>,
+        /// Extra request header as `Name: Value` (Firecrawl's `headers`);
+        /// repeatable.
+        #[arg(long = "header", value_parser = parse_header)]
+        header: Vec<(String, String)>,
         /// Pretty-print the JSON envelope (no effect on raw Markdown output).
         #[arg(long)]
         pretty: bool,
@@ -497,12 +521,18 @@ async fn async_main() {
             allow_unsafe_replay,
             ignore_robots,
             no_main_content,
+            include_tag,
+            exclude_tag,
+            header,
             pretty,
         } => {
             let formats = formats_from_args(&format);
             let config = Config {
                 formats,
                 only_main_content: !no_main_content,
+                include_tags: include_tag,
+                exclude_tags: exclude_tag,
+                headers: header,
                 proxy,
                 delay_ms: delay,
                 timeout_ms: timeout,
@@ -545,6 +575,9 @@ async fn async_main() {
                     ..FormatSet::none()
                 },
                 only_main_content: true,
+                include_tags: Vec::new(),
+                exclude_tags: Vec::new(),
+                headers: Vec::new(),
                 proxy,
                 delay_ms: 0,
                 timeout_ms: timeout,
@@ -639,6 +672,9 @@ async fn async_main() {
                 // overwritten on every request but keeps the struct total.
                 formats: FormatSet::markdown_only(),
                 only_main_content: true,
+                include_tags: Vec::new(),
+                exclude_tags: Vec::new(),
+                headers: Vec::new(),
                 proxy,
                 delay_ms: 0,
                 timeout_ms: timeout,
@@ -684,6 +720,9 @@ async fn async_main() {
             let defaults = Config {
                 formats: FormatSet::markdown_only(),
                 only_main_content: true,
+                include_tags: Vec::new(),
+                exclude_tags: Vec::new(),
+                headers: Vec::new(),
                 proxy,
                 delay_ms: 0,
                 timeout_ms: timeout,

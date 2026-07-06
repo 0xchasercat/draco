@@ -3,6 +3,23 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.11.1] — 2026-07-06
+
+### Added
+- **`includeTags` / `excludeTags`** are now honored (previously accepted and
+  ignored). `excludeTags` drops matching elements before extraction; `includeTags`
+  restricts to matching subtrees. Applied to the `markdown` and `html` formats
+  (before `onlyMainContent`); `rawHtml` stays the raw fetch and `links` is
+  harvested from the full page. Available on `POST /v1/scrape`, `draco scrape`
+  (`--include-tag` / `--exclude-tag`, repeatable), the `draco_scrape` MCP tool,
+  and per-page in `POST /v1/crawl`'s `scrapeOptions`.
+- **`headers`** (custom request headers) are now honored: forwarded to every
+  outbound fetch (initial request, retries, robots probe). Available on the same
+  four surfaces (`draco scrape --header "Name: Value"`, repeatable).
+
+This completes the request-field parity started in v0.11.0 (`onlyMainContent`,
+`waitFor`).
+
 ## [0.11.0] — 2026-07-06
 
 ### Added
