@@ -366,7 +366,13 @@ where
     if config.formats.wants_static_content() {
         let t_md = Instant::now();
         let content_type = content_type_of(&resp.meta.headers);
-        let scraped = statics.scrape(&body, url, resp.meta.status, &content_type, true);
+        let scraped = statics.scrape(
+            &body,
+            url,
+            resp.meta.status,
+            &content_type,
+            config.only_main_content,
+        );
         let md_ms = t_md.elapsed().as_millis() as u64;
 
         // A page needs the render pass when its static extraction is either
@@ -418,7 +424,11 @@ where
             run.raw_html = Some(body.clone());
         }
         if config.formats.html {
-            run.html = Some(draco_static::content::clean_html(&body, url, true));
+            run.html = Some(draco_static::content::clean_html(
+                &body,
+                url,
+                config.only_main_content,
+            ));
         }
         if config.formats.links {
             run.links = Some(draco_static::content::extract_links(&body, url));
@@ -1135,7 +1145,13 @@ async fn try_render_markdown<F, T>(
     // Merge the shell's real <head> (title, OG, canonical, <base>) with the
     // hydrated <body>, then re-run the identical Firecrawl-parity content engine.
     let merged = draco_static::content::merge_rendered_document(body, rendered);
-    let rescraped = draco_static::content::scrape(&merged, url, status, content_type, true);
+    let rescraped = draco_static::content::scrape(
+        &merged,
+        url,
+        status,
+        content_type,
+        config.only_main_content,
+    );
 
     let prev_len = run.markdown.as_deref().map(nonws_len).unwrap_or(0);
     let new_len = nonws_len(&rescraped.markdown);
@@ -1159,7 +1175,11 @@ async fn try_render_markdown<F, T>(
         // Refresh the HTML-derived formats from the hydrated DOM (rawHtml stays
         // the raw fetch). Only when the render actually won.
         if config.formats.html {
-            run.html = Some(draco_static::content::clean_html(&merged, url, true));
+            run.html = Some(draco_static::content::clean_html(
+                &merged,
+                url,
+                config.only_main_content,
+            ));
         }
         if config.formats.links {
             run.links = Some(draco_static::content::extract_links(&merged, url));
