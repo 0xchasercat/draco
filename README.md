@@ -79,7 +79,13 @@ Flags: `--format <markdown|html|raw-html|links|json|endpoints|both>` (repeatable
 default `markdown`; `both` = `markdown`+`json`), `--json`, `--extract
 <JSONPATH>`, `--no-main-content`, `--wait-for <ms>`, `--tier-max <0|1|2>`, `--proxy`, `--delay <ms>`, `--timeout <ms>`,
 `--capture-window-ms <ms>`, `--ignore-robots`, `--no-jail`, `--strict-sandbox`,
-`--allow-unsafe-replay`, `--pretty`.
+`--allow-unsafe-replay`, `--runtime-log`, `--pretty`.
+
+Debugging a page that hydrates to nothing? `--runtime-log` (also on `discover`,
+and as `runtimeLog` on the daemon/MCP) surfaces the isolate's page-side
+diagnostics — swallowed exceptions, `console.error` lines, dynamic-chunk
+throws — as `runtime.log` steps in the trace: browser-devtools visibility,
+no browser.
 
 ### Client-rendered SPAs → Markdown (render-then-Markdown)
 
