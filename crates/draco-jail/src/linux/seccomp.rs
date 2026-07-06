@@ -27,11 +27,12 @@
 //! cross-process memory access), the module/kexec/`bpf`/keyring/`reboot` families,
 //! namespace-escape calls (`setns`/`unshare`/`pivot_root`/`chroot`/`mount`), and
 //! `mprotect`/`pkey_mprotect` **when `PROT_EXEC` is set** (W^X / JIT-spray guard,
-//! safe under V8 `--jitless`). It deliberately does **not** touch `clone`/`fork`
-//! (V8/tokio spawn threads; a fork can exec nothing because `execve` is killed and
-//! inherits this same filter) or `open`/`openat` (the filesystem is covered by
-//! Landlock, not seccomp — killing file-opens is exactly the per-host-tuning
-//! fragility we are removing). The inherited fd-3 IPC uses `read`/`write` on an
+//! safe under V8 `--jitless`). It deliberately does **not** touch `clone`/`fork`/
+//! `clone3` (V8/tokio/libc may spawn threads; a cloned task can exec nothing
+//! because `execve` is killed and inherits this same filter) or `open`/`openat`
+//! (the filesystem is covered by Landlock, not seccomp — killing file-opens is
+//! exactly the per-host-tuning fragility we are removing). The inherited fd-3 IPC
+//! uses `read`/`write` on an
 //! **already-created** socketpair, so killing `socket`/`connect` does not affect
 //! it (the child never calls `socket()` itself).
 //!
@@ -139,11 +140,11 @@ fn denylist_map() -> Result<BTreeMap<i64, Rules>, SeccompError> {
     rule_any(&mut map, libc::SYS_chroot);
     rule_any(&mut map, libc::SYS_setns);
     rule_any(&mut map, libc::SYS_unshare);
-    // `clone3` is killed as a namespace-flag / new-process vector. It is safe to
-    // kill because V8/tokio spawn threads through the legacy `clone` path (which
-    // we leave allowed), never `clone3`; a `clone3` attempt therefore only ever
-    // comes from breakout code. Present on both supported arches in modern libc.
-    rule_any(&mut map, libc::SYS_clone3);
+    // Do not kill `clone3`: modern libc/pthread implementations may try clone3
+    // first for ordinary thread creation and fall back only if it returns ENOSYS.
+    // The denylist already kills execve/execveat, so a cloned task cannot turn
+    // into a new program image; strict mode remains the opt-in profile for a
+    // tighter, per-host-tuned process/thread surface.
 
     // --- Kernel image / module / eBPF / keyring / power. ---
     rule_any(&mut map, libc::SYS_kexec_load);
@@ -477,6 +478,18 @@ mod tests {
         assert!(
             !map.contains_key(&nr(libc::SYS_write)),
             "write must be allowed"
+        );
+    }
+
+    #[test]
+    fn denylist_allows_clone3_for_libc_thread_creation() {
+        // Modern libc/pthread may try clone3 for ordinary thread creation. The
+        // default denylist must allow it; execve/execveat still prevent a cloned
+        // task from becoming a new program image.
+        let map = denylist_map().expect("denylist map builds");
+        assert!(
+            !map.contains_key(&nr(libc::SYS_clone3)),
+            "default denylist must not kill clone3"
         );
     }
 
