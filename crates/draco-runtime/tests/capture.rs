@@ -604,3 +604,30 @@ fn missing_dynamic_import_does_not_crash() {
     );
     find(&report.requests, "/api/ok").expect("fetch after missing import should still fire");
 }
+
+#[test]
+fn multiple_captures_same_thread_fresh_isolate_each() {
+    // Warm-pool prerequisite: a single thread must be able to run many captures
+    // sequentially, each getting a fresh isolate (no V8-flags-latched panic, no
+    // state bleed). Three back-to-back captures on THIS thread.
+    for i in 0..3 {
+        let html = format!(
+            "<html><body><div id=r></div><script>\
+             var h=document.createElement('h1');h.textContent='run {i} content here';\
+             document.getElementById('r').appendChild(h);</script></body></html>"
+        );
+        let report = run_capture("https://ex.com/", &html, &cfg());
+        let dom = report.rendered_html.expect("serialized DOM");
+        assert!(
+            dom.contains(&format!("run {i} content here")),
+            "run {i}: {dom}"
+        );
+        // Isolation: prior runs' content must NOT appear in this fresh isolate.
+        if i > 0 {
+            assert!(
+                !dom.contains("run 0 content here") || i == 0,
+                "state from run 0 bled into run {i}: {dom}"
+            );
+        }
+    }
+}

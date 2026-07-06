@@ -34,7 +34,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use draco_core::{extract, Config, OutputFormat};
+use draco_core::{extract_with_pool, Config, OutputFormat, Tier2Pool};
 use draco_types::{DracoError, ExtractionResult, Status};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -55,12 +55,21 @@ pub struct ServeOptions {
     pub host: String,
     pub port: u16,
     pub max_concurrency: usize,
+    /// Warm Tier 2 workers to keep pooled (also caps concurrent isolates).
+    pub isolate_pool_size: usize,
+    /// Recycle a pooled worker after this many captures (leak hygiene).
+    pub isolate_max_jobs: u32,
     pub defaults: Config,
 }
 
 pub(crate) struct AppState {
     pub(crate) defaults: Config,
     pub(crate) gate: Semaphore,
+    /// Warm Tier 2 isolate pool: reused across requests so each scrape skips the
+    /// jail spawn + snapshot cost. Its sandbox posture is fixed from `defaults`
+    /// at startup; a request overriding the posture falls back to a one-shot
+    /// capture inside the pool.
+    pub(crate) tier2_pool: Tier2Pool,
     /// In-memory registry of async crawl jobs (`/v1/crawl`).
     pub(crate) crawl: crawl::JobStore,
 }
@@ -72,9 +81,18 @@ pub(crate) struct AppState {
 /// Bind and run the daemon until ctrl-c / SIGTERM. Returns an error string only
 /// for startup/bind failures (the caller maps it to a nonzero exit).
 pub async fn serve(opts: ServeOptions) -> Result<(), String> {
+    // The pool's workers inherit the daemon's default sandbox posture; per-request
+    // posture overrides fall back to a one-shot capture (handled in the pool).
+    let tier2_pool = Tier2Pool::new(
+        opts.isolate_pool_size,
+        opts.isolate_max_jobs,
+        opts.defaults.no_jail,
+        opts.defaults.strict_sandbox,
+    );
     let state = Arc::new(AppState {
         defaults: opts.defaults,
         gate: Semaphore::new(opts.max_concurrency.max(1)),
+        tier2_pool,
         crawl: crawl::JobStore::default(),
     });
     let addr = format!("{}:{}", opts.host, opts.port);
@@ -82,11 +100,19 @@ pub async fn serve(opts: ServeOptions) -> Result<(), String> {
         .await
         .map_err(|e| format!("bind {addr}: {e}"))?;
     let local = listener.local_addr().map(|a| a.to_string()).unwrap_or(addr);
-    eprintln!("draco serve: listening on http://{local} (Firecrawl-compatible API at /v1/scrape)");
-    axum::serve(listener, router(state))
+    eprintln!(
+        "draco serve: listening on http://{local} (Firecrawl-compatible API at /v1/scrape); \
+         warm isolate pool: {} workers",
+        opts.isolate_pool_size
+    );
+    let result = axum::serve(listener, router(state.clone()))
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .map_err(|e| format!("server error: {e}"))
+        .map_err(|e| format!("server error: {e}"));
+    // Retire pooled workers promptly on shutdown instead of leaving children to
+    // exit on socket EOF.
+    state.tier2_pool.shutdown();
+    result
 }
 
 fn router(state: Arc<AppState>) -> Router {
@@ -202,7 +228,7 @@ async fn scrape(
             Json(error_body("server is shutting down")),
         );
     };
-    let result = extract(&req.url, &config).await;
+    let result = extract_with_pool(&req.url, &config, &state.tier2_pool).await;
     let (code, body) = to_firecrawl(&result, format);
     (code, Json(body))
 }
@@ -338,6 +364,7 @@ mod tests {
         Arc::new(AppState {
             defaults,
             gate: Semaphore::new(2),
+            tier2_pool: Tier2Pool::new(1, 100, true, false),
             crawl: crawl::JobStore::default(),
         })
     }
