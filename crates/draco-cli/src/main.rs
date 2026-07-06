@@ -491,21 +491,26 @@ async fn async_main() {
             timeout,
             tier_max,
             capture_window_ms,
+            wait_for,
             no_jail,
             strict_sandbox,
             allow_unsafe_replay,
             ignore_robots,
+            no_main_content,
             pretty,
         } => {
             let formats = formats_from_args(&format);
             let config = Config {
                 formats,
+                only_main_content: !no_main_content,
                 proxy,
                 delay_ms: delay,
                 timeout_ms: timeout,
                 respect_robots: !ignore_robots,
                 tier_max,
-                capture_window_ms,
+                // `--capture-window-ms` wins; `--wait-for` is the Firecrawl-style
+                // alias; 2000ms when neither is given.
+                capture_window_ms: capture_window_ms.or(wait_for).unwrap_or(2_000),
                 no_jail,
                 strict_sandbox,
                 allow_unsafe_replay,
@@ -539,6 +544,7 @@ async fn async_main() {
                     endpoints: true,
                     ..FormatSet::none()
                 },
+                only_main_content: true,
                 proxy,
                 delay_ms: 0,
                 timeout_ms: timeout,
@@ -632,6 +638,7 @@ async fn async_main() {
                 // Per-request `formats` decides markdown/json/…; this default is
                 // overwritten on every request but keeps the struct total.
                 formats: FormatSet::markdown_only(),
+                only_main_content: true,
                 proxy,
                 delay_ms: 0,
                 timeout_ms: timeout,
@@ -676,6 +683,7 @@ async fn async_main() {
         } => {
             let defaults = Config {
                 formats: FormatSet::markdown_only(),
+                only_main_content: true,
                 proxy,
                 delay_ms: 0,
                 timeout_ms: timeout,
