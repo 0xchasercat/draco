@@ -161,6 +161,15 @@ pub struct Config {
     /// Firecrawl's `onlyMainContent`. Applies to the `markdown` and `html`
     /// formats (`rawHtml` is always the unmodified fetch). Default: `true`.
     pub only_main_content: bool,
+    /// CSS selectors to keep — Firecrawl's `includeTags`. When non-empty, only
+    /// matching subtrees survive into the `markdown`/`html` formats; empty means
+    /// the whole page. Applied before `only_main_content`.
+    pub include_tags: Vec<String>,
+    /// CSS selectors to drop before extraction — Firecrawl's `excludeTags`.
+    pub exclude_tags: Vec<String>,
+    /// Extra request headers forwarded to every outbound fetch — Firecrawl's
+    /// `headers` (custom UA, cookies, auth). Ordered; empty by default.
+    pub headers: Vec<(String, String)>,
     pub proxy: Option<String>,
     pub delay_ms: u64,
     pub timeout_ms: u64,
@@ -191,6 +200,9 @@ impl Default for Config {
         Self {
             formats: FormatSet::markdown_only(),
             only_main_content: true,
+            include_tags: Vec::new(),
+            exclude_tags: Vec::new(),
+            headers: Vec::new(),
             proxy: None,
             delay_ms: 0,
             timeout_ms: 30_000,

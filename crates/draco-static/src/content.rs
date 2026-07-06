@@ -468,6 +468,75 @@ fn detach_matching(document: &mut Html, selectors: &[&str]) {
     }
 }
 
+/// Firecrawl's `includeTags`/`excludeTags` as a standalone HTML→HTML
+/// pre-filter, run *before* [`scrape`]/[`clean_html`] see the document.
+///
+/// * `exclude_tags` — every element matching any of these CSS selectors is
+///   removed from the document (same detach approach as [`detach_matching`],
+///   adapted to owned `String` selectors).
+/// * `include_tags` — when **non-empty**, the result keeps only the subtrees
+///   matching these selectors: every matching element's outer HTML is
+///   collected, in document order, skipping elements that are descendants of
+///   an already-collected match (so a nested match like `main` and `main p`
+///   doesn't duplicate content). When empty, the whole document is kept.
+///
+/// Excludes are applied first, then includes are selected from the pruned
+/// tree, so an excluded element inside an included region stays excluded —
+/// matching Firecrawl v1 semantics.
+///
+/// Invalid CSS selectors are skipped silently; malformed HTML is tolerated by
+/// the underlying parser. This never panics. The return value is HTML (not
+/// necessarily a full document — a body fragment is fine, since downstream
+/// `scraper::Html::parse_document` tolerates fragments).
+pub fn apply_tag_filters(html: &str, include_tags: &[String], exclude_tags: &[String]) -> String {
+    if include_tags.is_empty() && exclude_tags.is_empty() {
+        return html.to_string();
+    }
+
+    let mut document = Html::parse_document(html);
+
+    if !exclude_tags.is_empty() {
+        let selectors: Vec<&str> = exclude_tags.iter().map(String::as_str).collect();
+        detach_matching(&mut document, &selectors);
+    }
+
+    if include_tags.is_empty() {
+        return body_inner_html(&document);
+    }
+
+    // Collect every element matching any include selector, in document order.
+    let mut matched_ids: Vec<ego_tree::NodeId> = Vec::new();
+    let mut matched_set: std::collections::HashSet<ego_tree::NodeId> =
+        std::collections::HashSet::new();
+    for sel in include_tags {
+        let Ok(selector) = Selector::parse(sel) else {
+            continue;
+        };
+        for el in document.select(&selector) {
+            if matched_set.insert(el.id()) {
+                matched_ids.push(el.id());
+            }
+        }
+    }
+
+    // Drop any match that is itself a descendant of another match, so nested
+    // hits (e.g. `main` and `main .content`) don't duplicate content.
+    let mut out = String::new();
+    for id in matched_ids {
+        let Some(node) = document.tree.get(id) else {
+            continue;
+        };
+        let is_nested = node.ancestors().any(|a| matched_set.contains(&a.id()));
+        if is_nested {
+            continue;
+        }
+        if let Some(el) = scraper::ElementRef::wrap(node) {
+            out.push_str(&el.html());
+        }
+    }
+    out
+}
+
 /// Detach the boilerplate regions (Firecrawl's `EXCLUDE_NON_MAIN_TAGS`),
 /// skipping any node that contains a `FORCE_INCLUDE_MAIN_TAGS` marker — the
 /// exact `:not(:has(marker))` filter Firecrawl applies.
@@ -1802,5 +1871,96 @@ mod tests {
         // And it is NOT thin (chrome alone clears the bar) — proving length-based
         // detection alone would have missed it.
         assert!(!is_thin_content(&res.markdown, MIN_MAIN_CONTENT_CHARS));
+    }
+
+    // ---- apply_tag_filters (Firecrawl includeTags/excludeTags) ---------
+
+    const TAG_FILTER_DOC: &str = r#"<!doctype html><html><body>
+        <nav>Site nav links</nav>
+        <div class="ad">Buy now!</div>
+        <header>Masthead here</header>
+        <main>
+          <article>
+            <p>Real article body text.</p>
+            <div class="promo">Limited time promo copy.</div>
+          </article>
+        </main>
+        <footer>Copyright footer text</footer>
+        </body></html>"#;
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn exclude_tags_removes_matching_elements() {
+        let out = apply_tag_filters(TAG_FILTER_DOC, &[], &strings(&["nav", ".ad"]));
+        assert!(!out.contains("Site nav links"), "nav leaked:\n{out}");
+        assert!(!out.contains("Buy now!"), ".ad leaked:\n{out}");
+        // Everything else, including the article, survives.
+        assert!(out.contains("Real article body text."), "{out}");
+        assert!(out.contains("Masthead here"), "{out}");
+        assert!(out.contains("Copyright footer text"), "{out}");
+    }
+
+    #[test]
+    fn include_tags_keeps_only_matching_subtrees() {
+        let out = apply_tag_filters(TAG_FILTER_DOC, &strings(&["main"]), &[]);
+        assert!(out.contains("Real article body text."), "{out}");
+        // header/footer/nav/ad text must be gone.
+        assert!(!out.contains("Masthead here"), "header leaked:\n{out}");
+        assert!(
+            !out.contains("Copyright footer text"),
+            "footer leaked:\n{out}"
+        );
+        assert!(!out.contains("Site nav links"), "nav leaked:\n{out}");
+        assert!(!out.contains("Buy now!"), "ad leaked:\n{out}");
+    }
+
+    #[test]
+    fn exclude_tags_applied_within_include_tags() {
+        // Excludes prune first, then includes select from the pruned tree — an
+        // excluded element inside an included region stays excluded.
+        let out = apply_tag_filters(
+            TAG_FILTER_DOC,
+            &strings(&["article"]),
+            &strings(&[".promo"]),
+        );
+        assert!(out.contains("Real article body text."), "{out}");
+        assert!(!out.contains("Limited time promo copy."), "{out}");
+        // Chrome outside <article> is not part of the include, so it's absent too.
+        assert!(!out.contains("Masthead here"), "{out}");
+    }
+
+    #[test]
+    fn both_empty_returns_input_unchanged() {
+        let out = apply_tag_filters(TAG_FILTER_DOC, &[], &[]);
+        assert_eq!(out, TAG_FILTER_DOC);
+        // Also check on a completely different / degenerate input, to ensure
+        // this is a true identity fast path and not coincidental.
+        let weird = "not even html <<<";
+        assert_eq!(apply_tag_filters(weird, &[], &[]), weird);
+    }
+
+    #[test]
+    fn invalid_selector_is_skipped_without_panic() {
+        // An invalid exclude selector is ignored; valid ones in the same call
+        // still apply.
+        let out = apply_tag_filters(TAG_FILTER_DOC, &[], &strings(&[":::bad", "nav"]));
+        assert!(!out.contains("Site nav links"), "{out}");
+
+        // An invalid include selector alone yields no matches (i.e. empty
+        // output), but must not panic.
+        let out2 = apply_tag_filters(TAG_FILTER_DOC, &strings(&[":::bad"]), &[]);
+        assert_eq!(out2, "");
+    }
+
+    #[test]
+    fn include_tags_nested_matches_not_duplicated() {
+        // "main" and "article" both match, and article is a descendant of
+        // main — the article's text must appear exactly once in the output.
+        let out = apply_tag_filters(TAG_FILTER_DOC, &strings(&["main", "article"]), &[]);
+        let occurrences = out.matches("Real article body text.").count();
+        assert_eq!(occurrences, 1, "content duplicated:\n{out}");
     }
 }

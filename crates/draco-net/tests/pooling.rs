@@ -57,6 +57,17 @@ async fn spawn_fixture() -> String {
                     .body(axum::body::Body::empty())
                     .unwrap()
             }),
+        )
+        // Echoes back the custom `X-Custom` request header (or "none").
+        .route(
+            "/echo-header",
+            get(|headers: HeaderMap| async move {
+                headers
+                    .get("x-custom")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("none")
+                    .to_string()
+            }),
         );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -73,6 +84,26 @@ fn opts() -> SessionOpts {
         timeout_ms: 5_000,
         ..Default::default()
     }
+}
+
+/// Caller-supplied `SessionOpts::headers` must be sent on the outbound request.
+#[tokio::test]
+async fn custom_headers_are_sent_on_the_request() {
+    let base = spawn_fixture().await;
+    let opts = SessionOpts {
+        respect_robots: false,
+        timeout_ms: 5_000,
+        headers: vec![("X-Custom".to_string(), "hello-draco".to_string())],
+        ..Default::default()
+    };
+    let resp = fetch_target(&format!("{base}/echo-header"), &opts)
+        .await
+        .expect("echo-header fetch");
+    let body = String::from_utf8_lossy(&resp.body);
+    assert_eq!(
+        body, "hello-draco",
+        "custom X-Custom header should reach the server"
+    );
 }
 
 /// A cookie set in one call must NOT leak into a later, unrelated call — even

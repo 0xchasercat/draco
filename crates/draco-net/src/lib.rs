@@ -82,6 +82,9 @@ pub struct SessionOpts {
     pub delay_ms: u64,
     pub respect_robots: bool,
     pub timeout_ms: u64,
+    /// Extra request headers applied to every outbound request (Firecrawl's
+    /// `headers` — custom UA, cookies, auth, etc.). Ordered; empty by default.
+    pub headers: Vec<(String, String)>,
 }
 
 impl Default for SessionOpts {
@@ -91,6 +94,7 @@ impl Default for SessionOpts {
             delay_ms: 0,
             respect_robots: true,
             timeout_ms: 30_000,
+            headers: Vec::new(),
         }
     }
 }
@@ -147,8 +151,15 @@ pub async fn replay(
 /// attempt, and the robots probe) so cookie isolation and the timeout hold
 /// uniformly now that neither lives on the shared client.
 fn dress(rb: RequestBuilder, jar: &Arc<Jar>, opts: &SessionOpts) -> RequestBuilder {
-    rb.cookie_provider(jar.clone())
-        .timeout(Duration::from_millis(opts.timeout_ms.max(1)))
+    let mut rb = rb
+        .cookie_provider(jar.clone())
+        .timeout(Duration::from_millis(opts.timeout_ms.max(1)));
+    // Caller-supplied request headers, applied uniformly to the real fetch,
+    // each retry, and the robots probe (dress runs on all three).
+    for (name, value) in &opts.headers {
+        rb = rb.header(name, value);
+    }
+    rb
 }
 
 // ===================================================================
