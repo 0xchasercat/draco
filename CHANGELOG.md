@@ -3,6 +3,16 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.13.3] — 2026-07-06
+
+### Fixed
+- **Next.js / webpack chunk prefetching** now handles the common split-map runtime
+  shape where one numeric map gives a chunk basename and another gives the content
+  hash. Short hex basenames such as `7722f4ca` are no longer mistaken for hashes,
+  so Draco can prefetch and execute chunks like
+  `_next/static/chunks/7722f4ca.78bc63657a3a3377.js` before the page's loader
+  reports `ChunkLoadError`.
+
 ## [0.13.2] — 2026-07-06
 
 ### Fixed
