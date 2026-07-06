@@ -70,6 +70,39 @@
   if (w.location) g.location = w.location;
   if (w.history) g.history = w.history;
 
+  // Browser-ish Performance API shim. Some framework/telemetry chunks (Sentry,
+  // web-vitals) assume these exist and abort setup if they don't. They are
+  // observational APIs; returning empty entries is safer than letting analytics
+  // code stop the app before data-fetching code runs.
+  function installPerformanceShim(target) {
+    try {
+      const p = target.performance || (target.performance = {});
+      if (typeof p.now !== "function") p.now = () => Date.now();
+      if (typeof p.timeOrigin !== "number") p.timeOrigin = Date.now();
+      if (typeof p.getEntriesByType !== "function") p.getEntriesByType = () => [];
+      if (typeof p.getEntriesByName !== "function") p.getEntriesByName = () => [];
+      if (typeof p.getEntries !== "function") p.getEntries = () => [];
+      if (typeof p.mark !== "function") p.mark = () => undefined;
+      if (typeof p.measure !== "function") p.measure = () => undefined;
+      if (typeof p.clearMarks !== "function") p.clearMarks = () => undefined;
+      if (typeof p.clearMeasures !== "function") p.clearMeasures = () => undefined;
+      if (typeof p.clearResourceTimings !== "function") p.clearResourceTimings = () => undefined;
+      if (typeof p.setResourceTimingBufferSize !== "function") p.setResourceTimingBufferSize = () => undefined;
+    } catch (_) {}
+  }
+  installPerformanceShim(g);
+  installPerformanceShim(w);
+  if (typeof g.PerformanceObserver !== "function") {
+    g.PerformanceObserver = class {
+      static supportedEntryTypes = [];
+      constructor() {}
+      observe() {}
+      disconnect() {}
+      takeRecords() { return []; }
+    };
+    try { w.PerformanceObserver = g.PerformanceObserver; } catch (_) {}
+  }
+
   // 3. fetch / XHR interceptor → op_raze_fetch. Reuse happy-dom's Headers when
   //    present; otherwise a tiny shim below.
   function headersToPairs(h) {

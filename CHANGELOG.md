@@ -3,6 +3,15 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.13.5] — 2026-07-06
+
+### Fixed
+- **Performance API compatibility** for telemetry/web-vitals chunks. The runtime now
+  installs safe no-op implementations for `performance.getEntriesByType`,
+  `getEntriesByName`, `getEntries`, `mark`, `measure`, resource-timing buffer
+  methods, and `PerformanceObserver`, preventing Sentry/web-vitals setup code from
+  aborting Next.js hydration before application fetches run.
+
 ## [0.13.4] — 2026-07-06
 
 ### Fixed
