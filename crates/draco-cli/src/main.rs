@@ -174,6 +174,12 @@ enum Command {
         /// Bypass robots.txt.
         #[arg(long)]
         ignore_robots: bool,
+        /// Surface the Tier 2 runtime's page-side diagnostics (swallowed
+        /// exceptions, console.error lines, script throws) as `runtime.log`
+        /// trace steps — the "devtools" for debugging why a page hydrated to
+        /// nothing. Implies the JSON envelope output (the trace carries them).
+        #[arg(long)]
+        runtime_log: bool,
         /// Strip boilerplate (nav/header/footer/ads) to the main content
         /// (Firecrawl's `onlyMainContent`). On by default; pass this to get
         /// the full page instead.
@@ -230,6 +236,12 @@ enum Command {
         /// Bypass robots.txt.
         #[arg(long)]
         ignore_robots: bool,
+        /// Surface the Tier 2 runtime's page-side diagnostics (swallowed
+        /// exceptions, console.error lines, script throws) as `runtime.log`
+        /// trace steps — the "devtools" for debugging why a page hydrated to
+        /// nothing.
+        #[arg(long)]
+        runtime_log: bool,
         /// Pretty-print the JSON envelope.
         #[arg(long)]
         pretty: bool,
@@ -445,8 +457,11 @@ fn render(result: &ExtractionResult, pretty: bool) -> String {
 ///   string — clean and pipeable (`draco scrape url > page.md`) — unless
 ///   `--json` is set, in which case the full envelope is printed. If a
 ///   markdown-only run produced no markdown (e.g. a challenge →
-///   `NeedsBrowser`, or a fetch error), we fall back to the envelope so the
-///   failure is still legible on stdout.
+///   `NeedsBrowser`, or a fetch error) — or only *empty* markdown (a
+///   client-rendered shell with no static text that hydration could not
+///   improve) — we fall back to the envelope so the status/trace is legible
+///   on stdout rather than emitting a blank line indistinguishable from a
+///   crash.
 /// * Any other combination of formats always prints the full
 ///   [`ExtractionResult`] envelope.
 ///
@@ -460,10 +475,12 @@ fn render_output(
     let print_envelope = json || formats != FormatSet::markdown_only();
     if !print_envelope {
         if let Some(md) = result.markdown.as_deref() {
-            return format!("{md}\n");
+            if !md.trim().is_empty() {
+                return format!("{md}\n");
+            }
         }
-        // No markdown to print (non-success markdown run): show the envelope so
-        // the status/error is visible rather than emitting an empty line.
+        // No (or empty) markdown to print: show the envelope so the
+        // status/error/trace is visible rather than emitting an empty line.
     }
     format!("{}\n", render(result, pretty))
 }
@@ -520,6 +537,7 @@ async fn async_main() {
             strict_sandbox,
             allow_unsafe_replay,
             ignore_robots,
+            runtime_log,
             no_main_content,
             include_tag,
             exclude_tag,
@@ -544,11 +562,14 @@ async fn async_main() {
                 no_jail,
                 strict_sandbox,
                 allow_unsafe_replay,
+                runtime_log,
             };
             let mut result = extract(&url, &config).await;
             if let Some(expr) = extract_expr.as_deref() {
                 result = filter_result(result, expr);
             }
+            // `--runtime-log` implies the envelope: the trace carries the logs.
+            let json = json || runtime_log;
             print!("{}", render_output(&result, formats, json, pretty));
             std::process::exit(status_to_exit_code(result.status));
         }
@@ -562,6 +583,7 @@ async fn async_main() {
             strict_sandbox,
             allow_unsafe_replay,
             ignore_robots,
+            runtime_log,
             pretty,
         } => {
             // Discovery + replay: the ranked endpoint catalog plus the winner
@@ -587,6 +609,7 @@ async fn async_main() {
                 no_jail,
                 strict_sandbox,
                 allow_unsafe_replay,
+                runtime_log,
             };
             let result = extract(&url, &config).await;
             println!("{}", render(&result, pretty));
@@ -684,6 +707,8 @@ async fn async_main() {
                 no_jail,
                 strict_sandbox,
                 allow_unsafe_replay: false,
+                // Per-request opt-in (`runtimeLog`); no server-wide default.
+                runtime_log: false,
             };
             // Pool size 0 → auto: the available parallelism (CPU count), a sane
             // cap on concurrent isolates. Fall back to 4 if it can't be probed.
@@ -732,6 +757,8 @@ async fn async_main() {
                 no_jail,
                 strict_sandbox,
                 allow_unsafe_replay: false,
+                // Per-request opt-in (`runtimeLog`); no server-wide default.
+                runtime_log: false,
             };
             if let Err(e) = mcp::run_stdio(defaults).await {
                 eprintln!("draco mcp: {e}");
@@ -983,6 +1010,21 @@ mod tests {
         let out = render_output(&r, FormatSet::markdown_only(), false, false);
         let json: Value = serde_json::from_str(out.trim()).expect("envelope is JSON");
         assert_eq!(json["status"], "needs_browser");
+    }
+
+    #[test]
+    fn markdown_format_falls_back_to_envelope_when_markdown_is_empty() {
+        // A client-rendered shell with no static text stages `Some("")` (or
+        // whitespace); printing it raw emits a lone blank line
+        // indistinguishable from a crash — the original "scrape exits without
+        // output" symptom. The envelope keeps the status/trace legible.
+        for md in ["", "  \n\t "] {
+            let mut r = markdown_result();
+            r.markdown = Some(md.to_string());
+            let out = render_output(&r, FormatSet::markdown_only(), false, false);
+            let json: Value = serde_json::from_str(out.trim()).expect("envelope is JSON");
+            assert_eq!(json["status"], "success", "markdown {md:?}");
+        }
     }
 
     // ---- FormatArg slice → FormatSet folding ----

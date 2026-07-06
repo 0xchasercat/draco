@@ -193,6 +193,13 @@ pub struct Config {
     /// falls through to `Unsupported` (see [`ranking::best_replayable`]). Set via
     /// the CLI `--allow-unsafe-replay` flag when the side effect is intended.
     pub allow_unsafe_replay: bool,
+    /// Surface the Tier 2 runtime's page-side diagnostics (swallowed exceptions,
+    /// `console.error` lines, page-script throws) as `runtime.log` trace steps —
+    /// the "browser devtools" for debugging why a page hydrated to nothing.
+    /// Off by default to keep routine traces lean; the lines are count- and
+    /// length-bounded child-side regardless. Set via the CLI `--runtime-log`
+    /// flag or the daemon's `runtimeLog` request field (Draco extension).
+    pub runtime_log: bool,
 }
 
 impl Default for Config {
@@ -212,6 +219,7 @@ impl Default for Config {
             no_jail: false,
             strict_sandbox: false,
             allow_unsafe_replay: false,
+            runtime_log: false,
         }
     }
 }
