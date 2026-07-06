@@ -44,11 +44,10 @@
 //! restart, matching self-hosted Firecrawl's default (no external queue) and
 //! keeping the daemon dependency-free.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use draco_core::{extract_with_pool, Config};
@@ -57,7 +56,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use url::Url;
 
-use super::{error_body, parse_formats, to_firecrawl, AppState};
+use super::{error_body, parse_formats, to_firecrawl, AppState, PageQuery};
 
 /// Default page budget when the request gives none, and the hard cap a request
 /// may ask for — one HTTP call shouldn't be able to schedule an unbounded
@@ -67,145 +66,6 @@ const MAX_LIMIT: usize = 100;
 
 /// Default BFS depth (seed = 0).
 const DEFAULT_MAX_DEPTH: usize = 2;
-
-// ===================================================================
-// Job registry
-// ===================================================================
-
-/// Lifecycle of a crawl job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JobStatus {
-    Scraping,
-    Completed,
-    Cancelled,
-    Failed,
-}
-
-impl JobStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            JobStatus::Scraping => "scraping",
-            JobStatus::Completed => "completed",
-            JobStatus::Cancelled => "cancelled",
-            JobStatus::Failed => "failed",
-        }
-    }
-}
-
-/// One crawl job's observable state. `total` counts URLs admitted to the
-/// frontier (bounded by `limit`); `completed` counts pages whose extraction
-/// finished (successfully or not); `data` holds the successful pages' payloads
-/// in completion order.
-struct Job {
-    status: JobStatus,
-    total: usize,
-    completed: usize,
-    data: Vec<Value>,
-}
-
-/// In-memory registry of crawl jobs. Interior mutability so the daemon can
-/// share one instance behind `Arc<AppState>`; every critical section is a few
-/// field updates — the lock is never held across an await.
-pub(crate) struct JobStore {
-    jobs: Mutex<HashMap<String, Job>>,
-    next_id: AtomicU64,
-}
-
-impl Default for JobStore {
-    fn default() -> Self {
-        Self {
-            jobs: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
-        }
-    }
-}
-
-impl JobStore {
-    /// Register a new job in `scraping` state with the seed already admitted.
-    fn create(&self) -> String {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
-        self.jobs.lock().unwrap().insert(
-            id.clone(),
-            Job {
-                status: JobStatus::Scraping,
-                total: 1,
-                completed: 0,
-                data: Vec::new(),
-            },
-        );
-        id
-    }
-
-    /// Snapshot a job as its Firecrawl status body. `None` for unknown ids.
-    fn snapshot(&self, id: &str) -> Option<Value> {
-        let jobs = self.jobs.lock().unwrap();
-        let job = jobs.get(id)?;
-        Some(json!({
-            "success": true,
-            "status": job.status.as_str(),
-            "total": job.total,
-            "completed": job.completed,
-            "data": job.data,
-        }))
-    }
-
-    /// Request cancellation. Returns whether the id existed. Terminal jobs stay
-    /// terminal (cancelling a completed job is a no-op beyond the flag check).
-    fn cancel(&self, id: &str) -> bool {
-        let mut jobs = self.jobs.lock().unwrap();
-        match jobs.get_mut(id) {
-            Some(job) => {
-                if job.status == JobStatus::Scraping {
-                    job.status = JobStatus::Cancelled;
-                }
-                true
-            }
-            None => false,
-        }
-    }
-
-    fn is_cancelled(&self, id: &str) -> bool {
-        let jobs = self.jobs.lock().unwrap();
-        jobs.get(id)
-            .map(|j| j.status == JobStatus::Cancelled)
-            .unwrap_or(true)
-    }
-
-    /// Record a finished page: bump `completed`, append its data entry if the
-    /// scrape succeeded.
-    fn record_page(&self, id: &str, entry: Option<Value>) {
-        let mut jobs = self.jobs.lock().unwrap();
-        if let Some(job) = jobs.get_mut(id) {
-            job.completed += 1;
-            if let Some(e) = entry {
-                job.data.push(e);
-            }
-        }
-    }
-
-    /// Record newly admitted frontier URLs.
-    fn add_admitted(&self, id: &str, n: usize) {
-        let mut jobs = self.jobs.lock().unwrap();
-        if let Some(job) = jobs.get_mut(id) {
-            job.total += n;
-        }
-    }
-
-    /// Transition a drained job to its terminal state (unless cancelled, which
-    /// is sticky).
-    fn finish(&self, id: &str) {
-        let mut jobs = self.jobs.lock().unwrap();
-        if let Some(job) = jobs.get_mut(id) {
-            if job.status == JobStatus::Scraping {
-                job.status = if job.data.is_empty() {
-                    JobStatus::Failed
-                } else {
-                    JobStatus::Completed
-                };
-            }
-        }
-    }
-}
 
 // ===================================================================
 // Requests / handlers
@@ -347,7 +207,7 @@ pub(crate) async fn start_handler(
         config,
     };
 
-    let id = state.crawl.create();
+    let id = state.crawl.create_seeded();
     tokio::spawn(run_crawl(state.clone(), id.clone(), plan));
 
     // The status URL is relative: the daemon can't reliably know the external
@@ -363,8 +223,27 @@ pub(crate) async fn start_handler(
 pub(crate) async fn status_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(page): Query<PageQuery>,
 ) -> (StatusCode, Json<Value>) {
-    match state.crawl.snapshot(&id) {
+    let next_base = format!("/v1/crawl/{id}");
+    match state
+        .crawl
+        .snapshot(&id, page.skip.unwrap_or(0), page.limit, &next_base)
+    {
+        Some(body) => (StatusCode::OK, Json(body)),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(error_body("crawl job not found")),
+        ),
+    }
+}
+
+/// `GET /v1/crawl/{id}/errors` — per-page failures + robots-blocked URLs.
+pub(crate) async fn errors_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    match state.crawl.errors_snapshot(&id) {
         Some(body) => (StatusCode::OK, Json(body)),
         None => (
             StatusCode::NOT_FOUND,
@@ -419,14 +298,17 @@ async fn run_crawl(state: Arc<AppState>, id: String, plan: CrawlPlan) {
             let result = extract_with_pool(&page_url, &plan.config, &state.tier2_pool).await;
             let (code, mut body) = to_firecrawl(&result);
             if code == StatusCode::OK {
-                Some((body["data"].take(), result.markdown))
+                Ok((body["data"].take(), result.markdown))
             } else {
-                None
+                Err(body["error"]
+                    .as_str()
+                    .unwrap_or("extraction failed")
+                    .to_string())
             }
         };
 
         match entry {
-            Some((data, markdown)) => {
+            Ok((data, markdown)) => {
                 state.crawl.record_page(&id, Some(data));
                 // Frontier growth from this page's Markdown links (children
                 // sit at depth + 1, which must stay within max_depth).
@@ -449,7 +331,10 @@ async fn run_crawl(state: Arc<AppState>, id: String, plan: CrawlPlan) {
                     }
                 }
             }
-            None => state.crawl.record_page(&id, None),
+            Err(msg) => {
+                state.crawl.record_error(&id, &page_url, &msg);
+                state.crawl.record_page(&id, None);
+            }
         }
     }
     state.crawl.finish(&id);
@@ -665,7 +550,8 @@ mod tests {
             },
             gate: Semaphore::new(2),
             tier2_pool: draco_core::Tier2Pool::new(1, 100, true, false),
-            crawl: JobStore::default(),
+            crawl: Default::default(),
+            batch: Default::default(),
         })
     }
 
@@ -853,7 +739,7 @@ mod tests {
         let state = test_state();
         // Create a job directly (no worker) — cancellation is a store-level
         // contract; the worker only ever observes the flag.
-        let id = state.crawl.create();
+        let id = state.crawl.create_seeded();
         let app = crawl_router(state.clone());
         let resp = app
             .clone()

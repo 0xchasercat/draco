@@ -619,6 +619,7 @@ mod tests {
             gate: Semaphore::new(2),
             tier2_pool: draco_core::Tier2Pool::new(1, 100, true, false),
             crawl: Default::default(),
+            batch: Default::default(),
         })
     }
 

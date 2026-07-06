@@ -3,6 +3,35 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.12.0] — 2026-07-06
+
+### Added
+- **Batch scrape** — `POST /v1/batch/scrape` takes a list of URLs and runs each
+  through the full extraction ladder as one async job. Scrape options are **flat**
+  at the top level (matching Firecrawl's batch request, unlike crawl's nested
+  `scrapeOptions`): `formats`, `onlyMainContent`, `includeTags`/`excludeTags`,
+  `headers`, `waitFor`, plus the Draco extensions. `ignoreInvalidURLs` drops
+  non-http(s) URLs and reports them in `invalidURLs` instead of failing the whole
+  request. Parallelism is bounded by the daemon-wide `--max-concurrency` gate, so
+  a large batch saturates exactly the configured budget.
+  - `GET /v1/batch/scrape/{id}` — status + accumulated `data`, **paginated** via
+    `?skip=&limit=` with a `next` URL when the job is still running or the page
+    hit the 10 MiB serialized-size cap.
+  - `GET /v1/batch/scrape/{id}/errors` — `{ errors, robotsBlocked }`.
+  - `DELETE /v1/batch/scrape/{id}` — cancel (keeps data already gathered).
+- **Crawl status parity** — `GET /v1/crawl/{id}` now supports the same
+  `?skip=&limit=` pagination + `next`, `creditsUsed`, and `expiresAt` fields, and
+  gains a **`GET /v1/crawl/{id}/errors`** endpoint. Failed crawl pages now record
+  their URL + error for that endpoint.
+
+### Changed
+- The async-job registry (`JobStore`) is extracted into a shared `serve::jobs`
+  module used by both crawl and batch scrape — one lifecycle, one status shape,
+  one pagination implementation instead of two.
+
+_Webhooks (the crawl/batch event lifecycle) are the next release; batch lands
+first because webhooks hook into it._
+
 ## [0.11.1] — 2026-07-06
 
 ### Added

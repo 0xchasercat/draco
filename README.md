@@ -175,7 +175,24 @@ Beyond scraping, the daemon speaks two more Firecrawl endpoints:
   page's Markdown (already absolutized; JS-injected links included when the
   render escalation ran). Poll `GET /v1/crawl/{id}` for
   `{ status, total, completed, data: [ per-page results ] }`; `DELETE` cancels.
-  Jobs are in-memory and share the daemon's concurrency budget.
+  Jobs are in-memory and share the daemon's concurrency budget. Status is
+  paginated (`?skip=&limit=`, `next` when more remains); `GET /v1/crawl/{id}/errors`
+  lists per-page failures.
+- **`POST /v1/batch/scrape`** — scrape a list of URLs as one async job. Scrape
+  options are **flat** at the top level (`formats`, `onlyMainContent`,
+  `includeTags`/`excludeTags`, `headers`, `waitFor`, …), applied to every URL;
+  `ignoreInvalidURLs` drops non-http(s) URLs into an `invalidURLs` list instead
+  of failing the request. URLs run in parallel, bounded by `--max-concurrency`.
+
+  ```sh
+  curl -X POST localhost:3002/v1/batch/scrape -H 'content-type: application/json' \
+    -d '{"urls": ["https://a.example", "https://b.example"], "formats": ["markdown"]}'
+  # → { "success": true, "id": "7", "url": "/v1/batch/scrape/7" }
+  ```
+
+  Poll `GET /v1/batch/scrape/{id}` (paginated `?skip=&limit=`, `next` when more
+  remains) for `{ status, total, completed, creditsUsed, expiresAt, next, data }`;
+  `GET /v1/batch/scrape/{id}/errors` lists per-URL failures; `DELETE` cancels.
 
 ### API discovery/replay (`endpoints` / `POST /v1/discover`)
 
