@@ -92,7 +92,7 @@ pub fn run_loop(mut stream: UnixStream) -> Result<(), PayloadError> {
         match msg.header {
             // Prefetched script subresources are accepted and ignored by this
             // trivial echo payload (the real capture payload consumes them).
-            SupervisorToJail::Resource { .. } => {}
+            SupervisorToJail::Resource { .. } | SupervisorToJail::Script { .. } => {}
             SupervisorToJail::Hydrate { .. } => {
                 // Slice 2 stand-in for a real hydration: acknowledge with a
                 // terminal Result reporting that nothing was intercepted. The

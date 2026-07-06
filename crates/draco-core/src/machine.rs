@@ -631,7 +631,7 @@ where
     let t_cap = Instant::now();
     let resources = prefetch_scripts(url, body, opts, fetcher).await;
     let capture_result = match capture
-        .capture(url, body.as_bytes(), &resources, config)
+        .capture(url, body.as_bytes(), &resources, config, opts)
         .await
     {
         Ok(c) => c,
@@ -1322,7 +1322,7 @@ async fn try_render_markdown<F, T>(
     let t_cap = Instant::now();
     let resources = prefetch_scripts(url, body, opts, fetcher).await;
     let capture_result = match capture
-        .capture(url, body.as_bytes(), &resources, config)
+        .capture(url, body.as_bytes(), &resources, config, opts)
         .await
     {
         Ok(c) => c,
