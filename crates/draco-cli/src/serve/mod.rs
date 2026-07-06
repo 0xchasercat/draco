@@ -42,6 +42,8 @@ use tokio::sync::Semaphore;
 
 /// `POST /v1/crawl` + `GET|DELETE /v1/crawl/{id}` — async whole-site crawl jobs.
 pub(crate) mod crawl;
+/// `POST /v1/discover` — JSON/XHR API endpoint discovery + winner replay.
+pub(crate) mod discover;
 /// `POST /v1/map` — fast site URL discovery (sitemap + on-page links).
 pub(crate) mod map;
 
@@ -120,6 +122,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/v1/scrape", post(scrape))
         .route("/v1/map", post(map::map_handler))
+        .route("/v1/discover", post(discover::discover_handler))
         .route("/v1/crawl", post(crawl::start_handler))
         .route(
             "/v1/crawl/{id}",
@@ -189,7 +192,7 @@ async fn scrape(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ScrapeRequest>,
 ) -> (StatusCode, Json<Value>) {
-    let format = match parse_formats(&req.formats) {
+    let (format, discover) = match parse_formats(&req.formats) {
         Ok(f) => f,
         Err(msg) => return (StatusCode::BAD_REQUEST, Json(error_body(&msg))),
     };
@@ -202,6 +205,7 @@ async fn scrape(
 
     let config = Config {
         format,
+        discover_endpoints: discover,
         proxy: req.proxy.clone().or_else(|| state.defaults.proxy.clone()),
         timeout_ms: req.timeout.unwrap_or(state.defaults.timeout_ms),
         tier_max: req.tier_max.unwrap_or(state.defaults.tier_max),
@@ -241,12 +245,15 @@ async fn scrape(
 /// Markdown (Firecrawl's default). Recognized-but-unsupported formats fail
 /// loudly — a client asking for `rawHtml` should not get a silently different
 /// payload.
-pub(crate) fn parse_formats(formats: &[String]) -> Result<OutputFormat, String> {
-    let (mut markdown, mut json) = (false, false);
+pub(crate) fn parse_formats(formats: &[String]) -> Result<(OutputFormat, bool), String> {
+    let (mut markdown, mut json, mut endpoints) = (false, false, false);
     for f in formats {
         match f.as_str() {
             "markdown" => markdown = true,
             "json" => json = true,
+            // Discovery: the ranked catalog of API endpoints the page calls.
+            // Composes with the content formats and rides `data.endpoints`.
+            "endpoints" => endpoints = true,
             "html"
             | "rawHtml"
             | "links"
@@ -256,22 +263,27 @@ pub(crate) fn parse_formats(formats: &[String]) -> Result<OutputFormat, String> 
             | "changeTracking"
             | "summary" => {
                 return Err(format!(
-                    "format {f:?} is not supported yet — supported formats: \"markdown\", \"json\""
+                    "format {f:?} is not supported yet — supported formats: \
+                     \"markdown\", \"json\", \"endpoints\""
                 ));
             }
             other => {
                 return Err(format!(
-                    "unknown format {other:?} — supported formats: \"markdown\", \"json\""
+                    "unknown format {other:?} — supported formats: \
+                     \"markdown\", \"json\", \"endpoints\""
                 ));
             }
         }
     }
-    Ok(match (markdown, json) {
+    // Discovery replays the winner into `data` (discovery + replay), so its
+    // content dimension is the JSON path unless Markdown was also asked for.
+    let format = match (markdown, json || endpoints) {
         (true, true) => OutputFormat::Both,
         (false, true) => OutputFormat::Json,
         // No formats given, or just "markdown".
         _ => OutputFormat::Markdown,
-    })
+    };
+    Ok((format, endpoints))
 }
 
 /// Firecrawl error envelope.
@@ -296,6 +308,14 @@ pub(crate) fn to_firecrawl(result: &ExtractionResult, format: OutputFormat) -> (
             if let Some(d) = &result.data {
                 data.insert("json".into(), d.clone());
             }
+        }
+        // The discovered API-endpoint catalog (the `endpoints` format), when
+        // discovery ran. Rides `data.endpoints` alongside the content formats.
+        if let Some(endpoints) = &result.endpoints {
+            data.insert(
+                "endpoints".into(),
+                serde_json::to_value(endpoints).unwrap_or(Value::Null),
+            );
         }
         // Draco's metadata is already Firecrawl-keyed (title, description,
         // og:*, sourceURL, statusCode, contentType). Synthesize the minimum
@@ -324,7 +344,7 @@ pub(crate) fn to_firecrawl(result: &ExtractionResult, format: OutputFormat) -> (
 }
 
 /// One-line human summary of a failed result for the `error` field.
-fn error_summary(result: &ExtractionResult) -> String {
+pub(crate) fn error_summary(result: &ExtractionResult) -> String {
     match (&result.error, result.status) {
         (Some(DracoError::Network { reason, detail }), _) => {
             let reason = format!("{reason:?}").to_lowercase();
@@ -378,19 +398,36 @@ mod tests {
 
     #[test]
     fn formats_default_to_markdown() {
-        assert_eq!(parse_formats(&[]).unwrap(), OutputFormat::Markdown);
+        assert_eq!(parse_formats(&[]).unwrap(), (OutputFormat::Markdown, false));
         assert_eq!(
             parse_formats(&["markdown".into()]).unwrap(),
-            OutputFormat::Markdown
+            (OutputFormat::Markdown, false)
         );
     }
 
     #[test]
     fn formats_map_json_and_both() {
-        assert_eq!(parse_formats(&["json".into()]).unwrap(), OutputFormat::Json);
+        assert_eq!(
+            parse_formats(&["json".into()]).unwrap(),
+            (OutputFormat::Json, false)
+        );
         assert_eq!(
             parse_formats(&["markdown".into(), "json".into()]).unwrap(),
-            OutputFormat::Both
+            (OutputFormat::Both, false)
+        );
+    }
+
+    #[test]
+    fn endpoints_format_sets_discovery() {
+        // Discovery alone → Json content dimension (winner replayed) + discover.
+        assert_eq!(
+            parse_formats(&["endpoints".into()]).unwrap(),
+            (OutputFormat::Json, true)
+        );
+        // Composes with markdown → Both + discover.
+        assert_eq!(
+            parse_formats(&["markdown".into(), "endpoints".into()]).unwrap(),
+            (OutputFormat::Both, true)
         );
     }
 
@@ -456,6 +493,7 @@ mod tests {
                 "sourceURL": "https://site.example/a",
                 "statusCode": 200
             })),
+            endpoints: None,
             timing: Timing::default(),
             trace: vec![],
             error: None,

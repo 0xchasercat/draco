@@ -3,6 +3,30 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.10.0] — 2026-07-06
+
+### Added
+- **API discovery/replay** — surface the JSON/XHR API endpoints a
+  client-rendered page's own JavaScript calls, ranked, as a first-class result.
+  The Tier 2 isolate already intercepts and scores every `fetch`/XHR to pick a
+  replay winner; discovery exposes the *full ranked catalog* (`method`, `url`,
+  `via`, `score`, `replayable`, `headers`) so a caller can see — and replay —
+  any endpoint behind a SPA, not just the auto-picked one.
+  - **CLI:** `draco extract <url> --format endpoints` prints the catalog (plus
+    the replayed winner as `data`) in the envelope.
+  - **Daemon:** `POST /v1/scrape` with `formats: ["endpoints"]` returns
+    `data.endpoints` (composes with `markdown`/`json`); a dedicated
+    **`POST /v1/discover`** convenience route returns `{ success, endpoints,
+    data }` top-level, mirroring `/v1/map`'s shape.
+  - **MCP:** a new **`draco_discover`** tool alongside `draco_scrape`, for agent
+    clients that want a page's data API rather than its rendered text.
+  - Result contract: `ExtractionResult.endpoints` (additive, elided when
+    discovery didn't run); `draco-core` gains `Config::discover_endpoints` and
+    the `DiscoveredEndpoint` type. Discovery runs its own Tier-2 capture ahead
+    of the Tier 0/1 early-returns; capped below Tier 2 it records a skip and
+    returns no catalog. Ranked best-guess-data-API first; `replayable` reflects
+    the same viability + mutation-safety policy the winner replay uses.
+
 ## [0.9.0] — 2026-07-06
 
 ### Added
