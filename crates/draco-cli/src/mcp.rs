@@ -382,7 +382,7 @@ async fn call_tool(
         // shape) — still a valid result; say so instead of returning nothing.
         content.push(json!({
             "type": "text",
-            "text": format!("scrape succeeded but produced no {format:?} content for {url}")
+            "text": format!("scrape succeeded but produced no {:?} content for {url}", config.formats)
         }));
     }
     Ok(json!({ "content": content, "isError": false }))

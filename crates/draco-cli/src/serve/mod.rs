@@ -250,6 +250,7 @@ async fn scrape(
 /// A rejected `formats` entry, carrying whether it was *unknown* (HTTP 400 — we
 /// don't recognize the token) or *unsupported* (HTTP 422 — recognized, but a
 /// DOM-only engine can't satisfy it, e.g. `screenshot`).
+#[derive(Debug)]
 pub(crate) struct FormatReject {
     /// `true` → recognized but this engine can't produce it (map to 422);
     /// `false` → unknown token (map to 400).
@@ -445,10 +446,10 @@ mod tests {
 
     #[test]
     fn formats_default_to_markdown() {
-        assert_eq!(parse_formats(&[]).unwrap(), (OutputFormat::Markdown, false));
+        assert_eq!(parse_formats(&[]).unwrap(), FormatSet::markdown_only());
         assert_eq!(
             parse_formats(&["markdown".into()]).unwrap(),
-            (OutputFormat::Markdown, false)
+            FormatSet::markdown_only()
         );
     }
 
@@ -456,34 +457,62 @@ mod tests {
     fn formats_map_json_and_both() {
         assert_eq!(
             parse_formats(&["json".into()]).unwrap(),
-            (OutputFormat::Json, false)
+            FormatSet::json_only()
         );
         assert_eq!(
             parse_formats(&["markdown".into(), "json".into()]).unwrap(),
-            (OutputFormat::Both, false)
+            FormatSet {
+                markdown: true,
+                json: true,
+                ..FormatSet::none()
+            }
         );
     }
 
     #[test]
     fn endpoints_format_sets_discovery() {
-        // Discovery alone → Json content dimension (winner replayed) + discover.
+        // Discovery alone → just the endpoints dimension set.
         assert_eq!(
             parse_formats(&["endpoints".into()]).unwrap(),
-            (OutputFormat::Json, true)
+            FormatSet {
+                endpoints: true,
+                ..FormatSet::none()
+            }
         );
-        // Composes with markdown → Both + discover.
+        // Composes with markdown → markdown + endpoints.
         assert_eq!(
             parse_formats(&["markdown".into(), "endpoints".into()]).unwrap(),
-            (OutputFormat::Both, true)
+            FormatSet {
+                markdown: true,
+                endpoints: true,
+                ..FormatSet::none()
+            }
+        );
+    }
+
+    #[test]
+    fn newly_supported_formats_succeed() {
+        // html / rawHtml / links used to be rejected as unsupported; they're
+        // now first-class formats the DOM-only engine can produce.
+        assert_eq!(
+            parse_formats(&["html".into(), "rawHtml".into(), "links".into()]).unwrap(),
+            FormatSet {
+                html: true,
+                raw_html: true,
+                links: true,
+                ..FormatSet::none()
+            }
         );
     }
 
     #[test]
     fn known_but_unsupported_formats_fail_loudly() {
-        let err = parse_formats(&["rawHtml".into()]).unwrap_err();
-        assert!(err.contains("not supported yet"), "{err}");
+        let err = parse_formats(&["screenshot".into()]).unwrap_err();
+        assert!(err.unsupported, "{}", err.message);
+        assert!(err.message.contains("real browser"), "{}", err.message);
         let err = parse_formats(&["bogus".into()]).unwrap_err();
-        assert!(err.contains("unknown format"), "{err}");
+        assert!(!err.unsupported, "{}", err.message);
+        assert!(err.message.contains("unknown format"), "{}", err.message);
     }
 
     // ---- request deserialization -------------------------------------------
@@ -533,13 +562,21 @@ mod tests {
             url: "https://site.example/a".into(),
             status: Status::Success,
             source_tier: None,
-            data: Some(json!({ "items": [1, 2] })),
+            // Baseline is a markdown-only extraction: `data` (the JSON-API
+            // payload) rides on its own presence now that `to_firecrawl` no
+            // longer takes a separate format argument, so tests that want
+            // `data.json` in the body must set it explicitly (see
+            // `json_format_attaches_data_json`).
+            data: None,
             markdown: Some("# Title\n\nBody.".into()),
             metadata: Some(json!({
                 "title": "Title",
                 "sourceURL": "https://site.example/a",
                 "statusCode": 200
             })),
+            html: None,
+            raw_html: None,
+            links: None,
             endpoints: None,
             timing: Timing::default(),
             trace: vec![],
@@ -549,7 +586,7 @@ mod tests {
 
     #[test]
     fn success_maps_to_firecrawl_data_envelope() {
-        let (code, body) = to_firecrawl(&success_result(), OutputFormat::Markdown);
+        let (code, body) = to_firecrawl(&success_result());
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["success"], true);
         assert_eq!(body["data"]["markdown"], "# Title\n\nBody.");
@@ -565,8 +602,26 @@ mod tests {
 
     #[test]
     fn json_format_attaches_data_json() {
-        let (_, body) = to_firecrawl(&success_result(), OutputFormat::Both);
+        let mut r = success_result();
+        r.data = Some(json!({ "items": [1, 2] }));
+        let (_, body) = to_firecrawl(&r);
         assert_eq!(body["data"]["json"]["items"][0], 1);
+    }
+
+    #[test]
+    fn html_and_links_formats_attach_to_data() {
+        // When the result carries html/links (the request asked for those
+        // formats), to_firecrawl surfaces them under data.html / data.links.
+        let mut r = success_result();
+        r.html = Some("<h1>Title</h1><p>Body.</p>".into());
+        r.links = Some(vec![
+            "https://site.example/one".into(),
+            "https://site.example/two".into(),
+        ]);
+        let (_, body) = to_firecrawl(&r);
+        assert_eq!(body["data"]["html"], "<h1>Title</h1><p>Body.</p>");
+        assert_eq!(body["data"]["links"][0], "https://site.example/one");
+        assert_eq!(body["data"]["links"][1], "https://site.example/two");
     }
 
     #[test]
@@ -574,7 +629,7 @@ mod tests {
         let mut r = success_result();
         r.markdown = None;
         r.metadata = None;
-        let (_, body) = to_firecrawl(&r, OutputFormat::Json);
+        let (_, body) = to_firecrawl(&r);
         assert_eq!(
             body["data"]["metadata"]["sourceURL"],
             "https://site.example/a"
@@ -591,7 +646,7 @@ mod tests {
             reason: draco_types::NetKind::Timeout,
             detail: "connect timed out".into(),
         });
-        let (code, body) = to_firecrawl(&r, OutputFormat::Markdown);
+        let (code, body) = to_firecrawl(&r);
         assert_eq!(code, StatusCode::BAD_GATEWAY);
         assert_eq!(body["success"], false);
         let msg = body["error"].as_str().unwrap();
@@ -604,7 +659,7 @@ mod tests {
         r.status = Status::Unsupported;
         r.markdown = None;
         r.data = None;
-        let (code, body) = to_firecrawl(&r, OutputFormat::Json);
+        let (code, body) = to_firecrawl(&r);
         assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["success"], false);
     }
@@ -631,6 +686,8 @@ mod tests {
 
     #[tokio::test]
     async fn scrape_rejects_bad_format_before_extracting() {
+        // "rawHtml" is a supported format now (see `newly_supported_formats_succeed`);
+        // use an unrecognized token to exercise the pre-extraction 400 short-circuit.
         let app = router(test_state(Config::default()));
         let resp = app
             .oneshot(
@@ -639,7 +696,7 @@ mod tests {
                     .uri("/v1/scrape")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        json!({ "url": "https://example.com", "formats": ["rawHtml"] }).to_string(),
+                        json!({ "url": "https://example.com", "formats": ["bogus"] }).to_string(),
                     ))
                     .unwrap(),
             )

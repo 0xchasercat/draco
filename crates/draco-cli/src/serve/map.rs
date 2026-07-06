@@ -299,7 +299,7 @@ pub(crate) fn parse_http_url(raw: &str) -> Result<Url, String> {
 /// function never fails, matching the non-fatal spirit of sitemap discovery
 /// in general.
 async fn discover_sitemap_urls(target: &Url, opts: &SessionOpts) -> Vec<Url> {
-    if let Some(robots_url) = target.join("/robots.txt").ok() {
+    if let Ok(robots_url) = target.join("/robots.txt") {
         if let Ok(resp) = fetch_target(robots_url.as_str(), opts).await {
             if resp.meta.status < 400 {
                 let body = String::from_utf8_lossy(&resp.body);
