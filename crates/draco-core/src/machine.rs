@@ -1016,10 +1016,14 @@ where
         let bytes = resp.body.to_vec();
         total = total.saturating_add(bytes.len());
 
-        // Crawl this module's imports (resolved against its own URL).
+        // Crawl this module's imports and webpack/Next chunk-loader references
+        // (resolved against its own URL).
         if let Ok(mod_url) = url::Url::parse(&u) {
             let src = String::from_utf8_lossy(&bytes);
-            for spec in extract_module_imports(&src) {
+            for spec in extract_module_imports(&src)
+                .into_iter()
+                .chain(extract_chunk_candidates(&src))
+            {
                 if let Ok(child) = mod_url.join(&spec) {
                     if (child.scheme() == "http" || child.scheme() == "https")
                         && !visited.contains(child.as_str())
@@ -1161,6 +1165,43 @@ fn html_attr_value(tag: &str, name: &str) -> Option<String> {
         }
         search_from = at + name.len();
     }
+}
+
+/// Extract likely dynamically injected chunk URLs from JS source. This complements
+/// AST import extraction for webpack/Next runtimes, whose `import()` implementation
+/// often builds `<script src>` URLs from numeric chunk ids plus chunk-name/hash maps
+/// rather than leaving literal module specifiers in the source.
+#[cfg(feature = "tier2")]
+fn extract_chunk_candidates(src: &str) -> Vec<String> {
+    use std::sync::LazyLock;
+    static DIRECT_CHUNK_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r#"["']((?:\./|/)?(?:_next/static/)?chunks/[^"']+?\.js)["']"#).unwrap()
+    });
+    static NEXT_PART_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?s)(\d+)\s*:\s*["']([^"']+?)["'].*?\+\s*["']\.([0-9a-fA-F]{6,})\.js["']"#,
+        )
+        .unwrap()
+    });
+
+    let mut out = Vec::new();
+    for caps in DIRECT_CHUNK_RE.captures_iter(src) {
+        if let Some(m) = caps.get(1) {
+            out.push(m.as_str().to_string());
+        }
+    }
+    for caps in NEXT_PART_RE.captures_iter(src) {
+        let Some(name) = caps.get(2).map(|m| m.as_str()) else {
+            continue;
+        };
+        let Some(hash) = caps.get(3).map(|m| m.as_str()) else {
+            continue;
+        };
+        out.push(format!("./{name}.{hash}.js"));
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Extract ES-module import/export specifiers from JS source via the **Oxc**
@@ -1673,6 +1714,23 @@ mod tests {
                 "./_app/immutable/entry/app.js".to_string(),
                 "./_app/immutable/entry/start.js".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn extract_chunk_candidates_finds_next_chunk_literals_and_maps() {
+        let src = r#"
+            var a = "/_next/static/chunks/direct.abc123.js";
+            f.u = function(e) { return ({7871:"7722f4ca"}[e] || e) + ".78bc63657a3a3377.js"; }
+        "#;
+        let got = extract_chunk_candidates(src);
+        assert!(
+            got.contains(&"/_next/static/chunks/direct.abc123.js".to_string()),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&"./7722f4ca.78bc63657a3a3377.js".to_string()),
+            "{got:?}"
         );
     }
 
