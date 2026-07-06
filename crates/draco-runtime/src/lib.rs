@@ -1293,6 +1293,48 @@ mod tests {
     }
 
     #[test]
+    fn window_self_globalthis_are_the_same_object() {
+        // Browser top-level contract: window === self === globalThis. happy-dom
+        // instantiates its Window as a separate object, so the glue must unify
+        // the aliases. This is the exact shape of the Next.js hydration crash on
+        // bluff.com: write a global via `window`, read it back via `self` — if
+        // the aliases diverge the read is `undefined` and `.gssp` throws,
+        // aborting hydration before any fetch. A captured fetch here proves the
+        // write is visible through the other alias.
+        let html = r#"<script>
+            window.__NEXT_DATA__ = { gssp: true, props: {} };
+            if (self.__NEXT_DATA__.gssp && globalThis.__NEXT_DATA__ === window.__NEXT_DATA__) {
+                fetch("/api/hydrated");
+            }
+        </script>"#;
+        let report = run_capture(
+            "https://example.com/",
+            html,
+            &CaptureConfig {
+                capture_window_ms: 300,
+                quiesce_ms: 20,
+                max_intercepts: 8,
+                stub_response_json: "{}".to_string(),
+            },
+        );
+        assert!(
+            report
+                .requests
+                .iter()
+                .any(|r| r.url == "https://example.com/api/hydrated"),
+            "window/self/globalThis must alias the same object (Next.js gssp \
+             crash regression); logs={:?}, requests={:?}",
+            report.logs,
+            report.requests.iter().map(|r| &r.url).collect::<Vec<_>>()
+        );
+        assert!(
+            !report.logs.iter().any(|l| l.contains("gssp")),
+            "no gssp read error expected, got logs={:?}",
+            report.logs
+        );
+    }
+
+    #[test]
     fn page_diagnostics_land_in_report_logs() {
         // console.error goes through the glue's console hook (op_raze_log);
         // the sync throw is caught by the Rust script driver. Both must land

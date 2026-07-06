@@ -64,7 +64,26 @@
   };
   mirror(Object.getPrototypeOf(w)); // Window.prototype: DOM class getters
   mirror(w); // own props: document, location, navigator, history, …
-  g.window = w;
+
+  // Unify the global aliases. In a real top-level browsing context
+  // `window === self === globalThis === top === parent === frames` — all ONE
+  // object. happy-dom instantiates its Window as a *separate* object `w`, so if
+  // we point the page-facing `window` at `w` (while `self`/`globalThis` remain
+  // the V8 global `g`), the aliases diverge: a library that writes one and reads
+  // another sees `undefined`. Next.js is the canonical victim — it writes
+  // `window.__NEXT_DATA__ = data` (client/index.js) but the Router reads
+  // `self.__NEXT_DATA__.gssp` (router.js), so hydration throws
+  // "Cannot read properties of undefined (reading 'gssp')" and aborts before any
+  // data fetch. Pointing `window` (and top/parent/frames) at `g` makes every
+  // alias the same object, matching the browser. The DOM stays reachable because
+  // the DOM globals were just mirrored onto `g` (and `g.document === w.document`
+  // below); happy-dom's own internals reference their window through a private
+  // Symbol, not the global identifier, so they are unaffected.
+  g.window = g;
+  g.self = g;
+  g.top = g;
+  g.parent = g;
+  g.frames = g;
   g.document = w.document;
   if (w.navigator) g.navigator = w.navigator;
   if (w.location) g.location = w.location;
