@@ -8,16 +8,37 @@
 //! respects `Retry-After`, a capped redirect chain, and connect + total
 //! timeouts.
 //!
-//! ## What "session" means here
+//! ## Connection pool vs. cookie isolation
 //!
 //! The frozen public surface is two free functions, so a *session* is the scope
-//! of a single [`fetch_target`] / [`replay`] call: each call stands up its own
-//! [`wreq::Client`] with a fresh cookie [`Jar`](wreq::cookie::Jar), so cookies
-//! set by a redirect or a robots probe ride along to the real request but do not
-//! leak between unrelated calls. Two pieces of state are intentionally
-//! *process-wide* because the spec scopes them "per-host" across a run, not per
-//! call: the last-request timestamp used for delay spacing, and the parsed
-//! robots.txt cache. Both live behind small mutexes and are keyed by host.
+//! of a single [`fetch_target`] / [`replay`] call. Two concerns pull in
+//! opposite directions here, and are deliberately separated:
+//!
+//! - **Connection reuse wants sharing.** The [`wreq::Client`] owns the
+//!   keep-alive / HTTP-2 connection pool and the (expensive) BoringSSL
+//!   connector + emulation profile. Rebuilding it per call — as this module
+//!   originally did — throws the pool away every request, so every fetch pays a
+//!   fresh TCP + TLS handshake and the profile is recompiled each time. That is
+//!   pure waste in a long-lived process (the `draco serve` daemon) and even
+//!   across the several fetches of one extraction (page + script subresources +
+//!   replay, typically the same host). So the client is now built **once per
+//!   proxy** and cached process-wide ([`shared_client`]); `Client` is
+//!   `Arc`-backed, so handing out clones shares one pool.
+//! - **Cookies want isolation.** A shared client must not let one call's
+//!   cookies bleed into an unrelated one. wreq lets a cookie store be attached
+//!   *per request* ([`wreq::RequestBuilder::cookie_provider`]), which overrides
+//!   the client for that request, so each call gets its own fresh
+//!   [`Jar`](wreq::cookie::Jar): cookies set by a redirect or the robots probe
+//!   ride along within the call but never leak between calls. The total request
+//!   timeout is likewise applied per request, so the shared client need not be
+//!   fragmented by timeout.
+//!
+//! Net effect: one connection pool for the whole process (connection reuse
+//! across requests and within an extraction) with strict per-call cookie
+//! isolation. Two further pieces of state are *process-wide* because the spec
+//! scopes them "per-host" across a run, not per call: the last-request
+//! timestamp used for delay spacing, and the parsed robots.txt cache. Both live
+//! behind small mutexes and are keyed by host.
 //!
 //! ## Error mapping
 //!
@@ -34,9 +55,10 @@ use bytes::Bytes;
 use draco_types::{DracoError, HttpRequestSpec, HttpResponseMeta, NetKind};
 
 use base64::Engine as _;
+use wreq::cookie::Jar;
 use wreq::header::{HeaderMap, HeaderName, HeaderValue, OrigHeaderMap};
 use wreq::redirect::Policy;
-use wreq::{Client, Proxy};
+use wreq::{Client, Proxy, RequestBuilder};
 // wreq-util 3.0.0-rc.13 emulation surface: `Profile` = the browser/client
 // preset, `Platform` = the OS, and `Emulation` = the config struct (built via a
 // typed builder) that implements `wreq::IntoEmulation`.
@@ -75,20 +97,25 @@ impl Default for SessionOpts {
 
 /// Tier 0 entry: fetch a page with a browser-faithful fingerprint.
 pub async fn fetch_target(url: &str, opts: &SessionOpts) -> Result<HtmlResponse, DracoError> {
-    let client = build_client(opts)?;
+    let client = shared_client(opts.proxy.as_deref())?;
+    // Per-call cookie jar: isolates this call's cookies from every other call
+    // sharing the pooled client (see module docs).
+    let jar = Arc::new(Jar::default());
     // Robots gate + per-host spacing happen before the real request.
-    guard_request(&client, "GET", url, opts).await?;
+    guard_request(&client, &jar, url, opts).await?;
     // No explicit headers: let the emulation preset supply Chrome's header set
     // (names, values, and order) so the request-header fingerprint is faithful.
-    send_with_retry(|| client.get(url)).await
+    send_with_retry(|| dress(client.get(url), &jar, opts)).await
 }
 
-/// Replay a constructed (Tier 1) or intercepted (Tier 2) request with the same client.
+/// Replay a constructed (Tier 1) or intercepted (Tier 2) request with the same
+/// pooled client.
 pub async fn replay(
     spec: &HttpRequestSpec,
     opts: &SessionOpts,
 ) -> Result<HtmlResponse, DracoError> {
-    let client = build_client(opts)?;
+    let client = shared_client(opts.proxy.as_deref())?;
+    let jar = Arc::new(Jar::default());
 
     let method = parse_method(&spec.method)?;
     let body = decode_body(spec.body_b64.as_deref())?;
@@ -96,19 +123,32 @@ pub async fn replay(
     // fingerprint-relevant for an intercepted request.
     let ordered = build_ordered_headers(&spec.headers)?;
 
-    guard_request(&client, method.as_str(), &spec.url, opts).await?;
+    guard_request(&client, &jar, &spec.url, opts).await?;
 
     send_with_retry(|| {
-        let mut rb = client
-            .request(method.clone(), &spec.url)
-            .headers(ordered.map.clone())
-            .orig_headers(ordered.orig.clone());
+        let mut rb = dress(
+            client
+                .request(method.clone(), &spec.url)
+                .headers(ordered.map.clone())
+                .orig_headers(ordered.orig.clone()),
+            &jar,
+            opts,
+        );
         if let Some(bytes) = body.clone() {
             rb = rb.body(bytes);
         }
         rb
     })
     .await
+}
+
+/// Attach the per-call cookie jar and total request timeout to a request
+/// builder. Applied to *every* outbound request (the real fetch, each retry
+/// attempt, and the robots probe) so cookie isolation and the timeout hold
+/// uniformly now that neither lives on the shared client.
+fn dress(rb: RequestBuilder, jar: &Arc<Jar>, opts: &SessionOpts) -> RequestBuilder {
+    rb.cookie_provider(jar.clone())
+        .timeout(Duration::from_millis(opts.timeout_ms.max(1)))
 }
 
 // ===================================================================
@@ -135,8 +175,39 @@ const ROBOTS_UA_TOKEN: &str = "draco";
 // Client construction
 // ===================================================================
 
-/// Build a fingerprinted [`Client`] for one session from [`SessionOpts`].
-fn build_client(opts: &SessionOpts) -> Result<Client, DracoError> {
+/// Process-wide cache of pooled clients, keyed by proxy (empty string = no
+/// proxy). One client per proxy is all we need: the emulation profile,
+/// redirect policy, and connector are otherwise identical, and the total
+/// timeout + cookie jar are applied per request. Sharing the client shares its
+/// keep-alive / HTTP-2 connection pool across every call in the process.
+fn client_pool() -> &'static Mutex<HashMap<String, Client>> {
+    static POOL: OnceLock<Mutex<HashMap<String, Client>>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Get the pooled [`Client`] for this proxy, building (and caching) it on first
+/// use. The returned clone shares the cached client's connection pool.
+fn shared_client(proxy: Option<&str>) -> Result<Client, DracoError> {
+    let proxy = proxy.filter(|p| !p.is_empty());
+    let key = proxy.unwrap_or("").to_string();
+
+    if let Some(client) = client_pool().lock().unwrap().get(&key) {
+        return Ok(client.clone());
+    }
+
+    // Cache miss: build outside the lock (BoringSSL/connector setup isn't free),
+    // then insert-if-absent so a concurrent builder for the same proxy can't
+    // leave two live pools — the first insert wins, later ones reuse it.
+    let built = build_pooled_client(proxy)?;
+    let mut pool = client_pool().lock().unwrap();
+    Ok(pool.entry(key).or_insert(built).clone())
+}
+
+/// Build the fingerprinted, pooled [`Client`] for a proxy. Carries everything
+/// that is constant across calls (emulation, redirect policy, connect timeout,
+/// cookie layer); the per-call jar and total timeout are attached per request
+/// by [`dress`], so they are intentionally *absent* here.
+fn build_pooled_client(proxy: Option<&str>) -> Result<Client, DracoError> {
     // A faithful recent-Chrome preset: TLS (JA3/JA4), HTTP/2 SETTINGS &
     // pseudo-header order, and the default request-header set/order all come
     // from wreq-util's emulation database. `http2` and `headers` default to
@@ -146,18 +217,18 @@ fn build_client(opts: &SessionOpts) -> Result<Client, DracoError> {
         .platform(Platform::Windows)
         .build();
 
-    let total = Duration::from_millis(opts.timeout_ms.max(1));
-    let connect = Duration::from_millis(connect_timeout_ms(opts.timeout_ms));
-
     let mut builder = Client::builder()
         .emulation(emulation)
-        // Fresh per-session cookie jar.
-        .cookie_provider(Arc::new(wreq::cookie::Jar::default()))
+        // Enable the cookie layer; the *store* is supplied per request (see
+        // `dress`) so cookies never leak between calls on this shared client.
+        .cookie_store(true)
         .redirect(Policy::limited(MAX_REDIRECTS))
-        .timeout(total)
-        .connect_timeout(connect);
+        // Connect-phase fail-fast bound. The real per-request total timeout
+        // (applied by `dress`) is what ultimately bounds the whole operation,
+        // so a single ceiling here is fine for the shared client.
+        .connect_timeout(Duration::from_millis(CONNECT_TIMEOUT_CEIL_MS));
 
-    if let Some(proxy) = opts.proxy.as_deref().filter(|p| !p.is_empty()) {
+    if let Some(proxy) = proxy {
         // `Proxy::all` covers http+https targets; a `socks5://` URI is accepted
         // here too (the `socks` feature). Parse failures are a config-level
         // proxy error.
@@ -171,32 +242,23 @@ fn build_client(opts: &SessionOpts) -> Result<Client, DracoError> {
         .map_err(|e| classify_wreq_error(&e, "client build"))
 }
 
-/// Derive the connect-phase timeout from the total budget: a third of it,
-/// clamped to `[1s, CONNECT_TIMEOUT_CEIL_MS]`, and never exceeding the total.
-fn connect_timeout_ms(timeout_ms: u64) -> u64 {
-    let third = timeout_ms / 3;
-    third
-        .clamp(1_000, CONNECT_TIMEOUT_CEIL_MS)
-        .min(timeout_ms.max(1))
-}
-
 // ===================================================================
 // Request execution: robots gate, per-host spacing, retry/backoff.
 // ===================================================================
 
 /// Run the pre-flight guards shared by every outbound request: robots.txt
-/// (when enabled) then per-host delay spacing.
+/// (when enabled) then per-host delay spacing. `jar` is the call's cookie jar,
+/// used for the robots probe so it shares the call's cookie scope.
 async fn guard_request(
     client: &Client,
-    method: &str,
+    jar: &Arc<Jar>,
     url: &str,
     opts: &SessionOpts,
 ) -> Result<(), DracoError> {
     if opts.respect_robots {
-        enforce_robots(client, url, opts).await?;
+        enforce_robots(client, jar, url, opts).await?;
     }
     apply_host_delay(url, opts.delay_ms).await;
-    let _ = method; // reserved: robots policy is path/UA based, method-agnostic today.
     Ok(())
 }
 
@@ -324,7 +386,12 @@ fn robots_cache() -> &'static Mutex<HashMap<String, Arc<Robots>>> {
 /// `NetKind::Status` network error carrying the disallowed path. A robots file
 /// that cannot be fetched is treated as "allow all" (standard crawler
 /// behavior), and is cached so we do not re-probe on every request.
-async fn enforce_robots(client: &Client, url: &str, opts: &SessionOpts) -> Result<(), DracoError> {
+async fn enforce_robots(
+    client: &Client,
+    jar: &Arc<Jar>,
+    url: &str,
+    opts: &SessionOpts,
+) -> Result<(), DracoError> {
     let Some((scheme, host, path)) = split_url(url) else {
         return Ok(()); // unparseable → nothing to gate on
     };
@@ -339,10 +406,12 @@ async fn enforce_robots(client: &Client, url: &str, opts: &SessionOpts) -> Resul
         return robots.decision(&path);
     }
 
-    // Cache miss: fetch it. We still honor per-host spacing for the probe.
+    // Cache miss: fetch it. We still honor per-host spacing for the probe, and
+    // dress it with the call's jar + timeout (neither lives on the shared
+    // client anymore).
     apply_host_delay(url, opts.delay_ms).await;
     let robots_url = format!("{origin}/robots.txt");
-    let parsed = match client.get(&robots_url).send().await {
+    let parsed = match dress(client.get(&robots_url), jar, opts).send().await {
         Ok(resp) if resp.status().is_success() => match resp.text().await {
             Ok(body) => Robots::parse(&body, ROBOTS_UA_TOKEN),
             Err(_) => Robots::allow_all(),
@@ -771,16 +840,6 @@ mod tests {
         assert_eq!(o.timeout_ms, 30_000);
     }
 
-    #[test]
-    fn connect_timeout_is_bounded_fraction_of_total() {
-        // A third of the total, floored at 1s, ceiled at 10s, never > total.
-        assert_eq!(connect_timeout_ms(30_000), 10_000); // 10s == ceiling
-        assert_eq!(connect_timeout_ms(9_000), 3_000); // 9/3
-        assert_eq!(connect_timeout_ms(1_500), 1_000); // floored at 1s
-        assert_eq!(connect_timeout_ms(500), 500); // never exceed total
-        assert_eq!(connect_timeout_ms(0), 1); // degenerate but valid
-    }
-
     // ---- Header order preservation -----------------------------------
 
     #[test]
@@ -1010,6 +1069,37 @@ Disallow: /nope
             // delay < 10 still yields a valid (<=1) jitter, never panics.
             assert!(jitter_ms(3) <= 1);
         }
+    }
+
+    // ---- shared client pool -------------------------------------------
+
+    #[test]
+    fn shared_client_is_cached_per_proxy() {
+        // First call for the default (no-proxy) key builds + caches it.
+        let _a = shared_client(None).expect("build default client");
+        assert!(
+            client_pool().lock().unwrap().contains_key(""),
+            "no-proxy client should be cached under the empty key"
+        );
+
+        // A distinct proxy is a distinct pool entry (parse only — never dialed).
+        let proxy = "http://127.0.0.1:59321";
+        let _p = shared_client(Some(proxy)).expect("build proxied client");
+        assert!(client_pool().lock().unwrap().contains_key(proxy));
+
+        // Re-requesting the same proxy reuses the cached client (returns a
+        // clone sharing its pool) rather than rebuilding — no new key appears.
+        let before = client_pool().lock().unwrap().len();
+        let _p2 = shared_client(Some(proxy)).expect("reuse proxied client");
+        let after = client_pool().lock().unwrap().len();
+        assert_eq!(before, after, "same proxy must not add a pool entry");
+    }
+
+    #[test]
+    fn empty_proxy_string_maps_to_the_no_proxy_client() {
+        // An empty/whitespace proxy is treated as "no proxy", not a distinct key.
+        let _ = shared_client(Some("")).expect("empty proxy → default client");
+        assert!(client_pool().lock().unwrap().contains_key(""));
     }
 
     // ---- error classification ----------------------------------------
