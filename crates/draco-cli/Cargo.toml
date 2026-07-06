@@ -27,6 +27,7 @@ serve = [
     "dep:url",
     "dep:regex",
     "dep:time",
+    "dep:base64",
     "tokio/net",
     "tokio/signal",
     "tokio/sync",
@@ -63,6 +64,9 @@ regex = { version = "1", optional = true }
 # Async-job `expiresAt` timestamps (RFC3339). Already resolves transitively via
 # wreq→cookie; declared directly + serve-gated like the other daemon-only deps.
 time = { version = "0.3", features = ["formatting"], optional = true }
+# Webhook payload bodies handed to draco-net's `replay` are base64 (its
+# `HttpRequestSpec.body_b64`). Already resolves via draco-net; serve-gated.
+base64 = { version = "0.22", optional = true }
 
 [dev-dependencies]
 # Router-level tests drive handlers via `oneshot` (no sockets).

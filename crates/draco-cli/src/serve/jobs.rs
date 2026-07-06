@@ -255,17 +255,19 @@ impl JobStore {
 
     /// Transition a drained job to its terminal state (unless cancelled, which
     /// is sticky). `Completed` when any data was collected, else `Failed`.
-    pub(crate) fn finish(&self, id: &str) {
+    /// Returns the resulting terminal status (so the caller can fire the
+    /// matching webhook event); `None` for an unknown id.
+    pub(crate) fn finish(&self, id: &str) -> Option<JobStatus> {
         let mut jobs = self.jobs.lock().unwrap();
-        if let Some(job) = jobs.get_mut(id) {
-            if job.status == JobStatus::Scraping {
-                job.status = if job.data.is_empty() && !job.errors.is_empty() {
-                    JobStatus::Failed
-                } else {
-                    JobStatus::Completed
-                };
-            }
+        let job = jobs.get_mut(id)?;
+        if job.status == JobStatus::Scraping {
+            job.status = if job.data.is_empty() && !job.errors.is_empty() {
+                JobStatus::Failed
+            } else {
+                JobStatus::Completed
+            };
         }
+        Some(job.status)
     }
 }
 
