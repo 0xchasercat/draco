@@ -84,3 +84,58 @@ fn svga_element_is_defined_and_sane() {
         report.logs
     );
 }
+
+/// `new EventSource(url)` during init must not throw (it was aborting stake.com's
+/// app bootstrap with `ReferenceError: EventSource is not defined`), AND the SSE
+/// URL should be recorded as a discovered endpoint — an SSE stream is exactly the
+/// API surface `discover` exists to find. Code after the `new EventSource(...)`
+/// must still run.
+#[test]
+fn event_source_is_stubbed_and_records_the_sse_endpoint() {
+    let html = r#"<!doctype html><html><body>
+<script>
+  var es = new EventSource("/stream/live");
+  es.addEventListener("message", function () {});
+  // Code after the EventSource construction must still run (the real bug was a
+  // ReferenceError aborting everything downstream).
+  fetch("/api/after-eventsource");
+</script>
+</body></html>"#;
+
+    let report = run_capture("https://sse.example.com/", html, &cfg());
+    assert!(
+        captured(&report, "/api/after-eventsource"),
+        "code after `new EventSource(...)` did not run; logs: {:?}",
+        report.logs
+    );
+    assert!(
+        captured(&report, "/stream/live"),
+        "SSE endpoint not recorded as an intercept; requests: {:?}",
+        report.requests.iter().map(|r| &r.url).collect::<Vec<_>>()
+    );
+}
+
+/// `new WebSocket(url)` is likewise stubbed (same init-time abort class) and
+/// records its endpoint.
+#[test]
+fn websocket_is_stubbed_and_records_endpoint() {
+    let html = r#"<!doctype html><html><body>
+<script>
+  var ws = new WebSocket("wss://sse.example.com/socket");
+  ws.send("hello");
+  fetch("/api/after-websocket");
+</script>
+</body></html>"#;
+
+    let report = run_capture("https://sse.example.com/", html, &cfg());
+    assert!(
+        captured(&report, "/api/after-websocket"),
+        "code after `new WebSocket(...)` did not run; logs: {:?}",
+        report.logs
+    );
+    assert!(
+        captured(&report, "/socket"),
+        "WebSocket endpoint not recorded; requests: {:?}",
+        report.requests.iter().map(|r| &r.url).collect::<Vec<_>>()
+    );
+}
