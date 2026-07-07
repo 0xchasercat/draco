@@ -89,6 +89,46 @@
   if (w.location) g.location = w.location;
   if (w.history) g.history = w.history;
 
+  // Backfill DOM element constructors that happy-dom does not implement but that
+  // frameworks reference as BARE globals in `instanceof` / `typeof` guards. A
+  // bare reference to an undefined identifier is a ReferenceError (not
+  // `undefined`), so a single missing constructor in a hot guard aborts the
+  // surrounding code. happy-dom ships 69 `SVG*Element` classes but not
+  // `SVGAElement` (SVG `<a>`); SvelteKit's link router runs
+  // `el instanceof SVGAElement ? el.href.baseVal : el.href` on hydration and
+  // throws "SVGAElement is not defined", killing navigation wiring (seen on
+  // chaser.sh). Define each missing name as a subclass of the nearest base
+  // happy-dom DOES provide, so `instanceof` is well-typed (false for the common
+  // HTML element) instead of throwing. Never clobber a constructor happy-dom
+  // already exposes.
+  (function backfillMissingElementCtors() {
+    const base = (...names) => {
+      for (const n of names) if (typeof g[n] === "function") return g[n];
+      return g.Element || function () {};
+    };
+    // name -> preferred base chain (nearest first).
+    const missing = {
+      SVGAElement: ["SVGGraphicsElement", "SVGGeometryElement", "SVGElement"],
+    };
+    for (const name of Object.keys(missing)) {
+      if (typeof g[name] === "function") continue; // happy-dom has it — leave it.
+      const Base = base.apply(null, missing[name]);
+      try {
+        const Ctor = function () {
+          throw new TypeError("Illegal constructor");
+        };
+        Ctor.prototype = Object.create(Base.prototype, {
+          constructor: { value: Ctor, writable: true, configurable: true },
+        });
+        Object.defineProperty(Ctor, "name", { value: name, configurable: true });
+        g[name] = Ctor;
+      } catch (_) {
+        /* defining failed — leave undefined; guard will still throw, but we did
+           our best without masking a real happy-dom regression */
+      }
+    }
+  })();
+
   // Browser-ish Performance API shim. Some framework/telemetry chunks (Sentry,
   // web-vitals) assume these exist and abort setup if they don't. They are
   // observational APIs; returning empty entries is safer than letting analytics
