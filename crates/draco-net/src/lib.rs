@@ -8,11 +8,10 @@
 //! respects `Retry-After`, a capped redirect chain, and connect + total
 //! timeouts.
 //!
-//! ## Connection pool vs. cookie isolation
+//! ## Connection pool vs. cookie scope
 //!
-//! The frozen public surface is two free functions, so a *session* is the scope
-//! of a single [`fetch_target`] / [`replay`] call. Two concerns pull in
-//! opposite directions here, and are deliberately separated:
+//! The public surface is two free functions ([`fetch_target`] / [`replay`]).
+//! Two concerns are deliberately separated:
 //!
 //! - **Connection reuse wants sharing.** The [`wreq::Client`] owns the
 //!   keep-alive / HTTP-2 connection pool and the (expensive) BoringSSL
@@ -24,21 +23,26 @@
 //!   replay, typically the same host). So the client is now built **once per
 //!   proxy** and cached process-wide ([`shared_client`]); `Client` is
 //!   `Arc`-backed, so handing out clones shares one pool.
-//! - **Cookies want isolation.** A shared client must not let one call's
-//!   cookies bleed into an unrelated one. wreq lets a cookie store be attached
-//!   *per request* ([`wreq::RequestBuilder::cookie_provider`]), which overrides
-//!   the client for that request, so each call gets its own fresh
-//!   [`Jar`](wreq::cookie::Jar): cookies set by a redirect or the robots probe
-//!   ride along within the call but never leak between calls. The total request
-//!   timeout is likewise applied per request, so the shared client need not be
-//!   fragmented by timeout.
+//! - **Cookies want operation scope, not per-call scope.** A browser scopes
+//!   cookies to a *page session*: a `Set-Cookie` on the document response (e.g.
+//!   Cloudflare's `__cf_bm` bot-management cookie) is replayed on every
+//!   subresource and navigation to that origin. draco mirrors that with
+//!   [`SharedCookieJar`]: a caller creates one jar per logical operation
+//!   (a scrape, discover, batch/crawl, or `/interact` session) and threads it
+//!   through [`SessionOpts::cookie_jar`], so cookies persist across the page
+//!   fetch, its prefetched + on-demand chunks, and every other request in that
+//!   job — while still being isolated from *unrelated* operations. wreq attaches
+//!   a store per request ([`wreq::RequestBuilder::cookie_provider`]); handing the
+//!   same jar to every request in the job is what makes the cookies flow. When no
+//!   jar is supplied (a genuinely one-shot fetch) a throwaway per-call jar is
+//!   used. The total request timeout is likewise applied per request, so the
+//!   shared client need not be fragmented by timeout.
 //!
-//! Net effect: one connection pool for the whole process (connection reuse
-//! across requests and within an extraction) with strict per-call cookie
-//! isolation. Two further pieces of state are *process-wide* because the spec
-//! scopes them "per-host" across a run, not per call: the last-request
-//! timestamp used for delay spacing, and the parsed robots.txt cache. Both live
-//! behind small mutexes and are keyed by host.
+//! Net effect: one connection pool for the whole process, with cookies scoped to
+//! the caller's operation. Two further pieces of state are *process-wide* because
+//! the spec scopes them "per-host" across a run: the last-request timestamp used
+//! for delay spacing, and the parsed robots.txt cache. Both live behind small
+//! mutexes and are keyed by host.
 //!
 //! ## Error mapping
 //!
@@ -75,6 +79,40 @@ pub struct HtmlResponse {
     pub body: Bytes,
 }
 
+/// A cookie jar scoped to one logical **operation** and shared across every
+/// request it makes — the page fetch, all prefetched subresources, every
+/// on-demand chunk, a batch/crawl's URLs, and (ahead) an `/interact` session's
+/// clicks and navigations. This is how a browser behaves: cookies set on the
+/// initial response (e.g. Cloudflare's `__cf_bm` bot-management cookie) ride
+/// along on every follow-up request to the same origin. Without it, subresource
+/// fetches go out cookie-less and a bot wall throttles or challenges them.
+///
+/// Isolation is **between** operations — each gets its own jar — not within one.
+/// It is also the cookie half of the `SessionState` an `/interact` turn carries
+/// forward. Cheaply cloneable (an `Arc`); a clone shares the same store.
+#[derive(Clone)]
+pub struct SharedCookieJar(Arc<Jar>);
+
+impl SharedCookieJar {
+    /// A fresh, empty jar for a new operation.
+    pub fn new() -> Self {
+        Self(Arc::new(Jar::default()))
+    }
+}
+
+impl Default for SharedCookieJar {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for SharedCookieJar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Opaque — never surface cookie contents in debug output.
+        f.write_str("SharedCookieJar(..)")
+    }
+}
+
 /// Per-session network options.
 #[derive(Debug, Clone)]
 pub struct SessionOpts {
@@ -85,6 +123,11 @@ pub struct SessionOpts {
     /// Extra request headers applied to every outbound request (Firecrawl's
     /// `headers` — custom UA, cookies, auth, etc.). Ordered; empty by default.
     pub headers: Vec<(String, String)>,
+    /// Operation-scoped cookie jar. `Some` → cookies persist across every request
+    /// in the operation (the browser-faithful default a caller sets once per
+    /// scrape/discover/crawl/`interact` job). `None` → a throwaway per-call jar,
+    /// for a genuinely one-shot fetch with no follow-ups.
+    pub cookie_jar: Option<SharedCookieJar>,
 }
 
 impl Default for SessionOpts {
@@ -95,6 +138,7 @@ impl Default for SessionOpts {
             respect_robots: true,
             timeout_ms: 30_000,
             headers: Vec::new(),
+            cookie_jar: None,
         }
     }
 }
@@ -102,9 +146,10 @@ impl Default for SessionOpts {
 /// Tier 0 entry: fetch a page with a browser-faithful fingerprint.
 pub async fn fetch_target(url: &str, opts: &SessionOpts) -> Result<HtmlResponse, DracoError> {
     let client = shared_client(opts.proxy.as_deref())?;
-    // Per-call cookie jar: isolates this call's cookies from every other call
-    // sharing the pooled client (see module docs).
-    let jar = Arc::new(Jar::default());
+    // Operation-scoped jar when the caller supplied one (cookies persist across
+    // the page fetch, its subresources, and the rest of the job); otherwise a
+    // throwaway per-call jar for a one-shot fetch. See [`SharedCookieJar`].
+    let jar = jar_for(opts);
     // Robots gate + per-host spacing happen before the real request.
     guard_request(&client, &jar, url, opts).await?;
     // No explicit headers: let the emulation preset supply Chrome's header set
@@ -119,7 +164,7 @@ pub async fn replay(
     opts: &SessionOpts,
 ) -> Result<HtmlResponse, DracoError> {
     let client = shared_client(opts.proxy.as_deref())?;
-    let jar = Arc::new(Jar::default());
+    let jar = jar_for(opts);
 
     let method = parse_method(&spec.method)?;
     let body = decode_body(spec.body_b64.as_deref())?;
@@ -146,10 +191,22 @@ pub async fn replay(
     .await
 }
 
-/// Attach the per-call cookie jar and total request timeout to a request
-/// builder. Applied to *every* outbound request (the real fetch, each retry
-/// attempt, and the robots probe) so cookie isolation and the timeout hold
-/// uniformly now that neither lives on the shared client.
+/// Resolve the cookie store for a request: the caller's operation-scoped jar
+/// when present (so cookies persist across the whole job), else a fresh
+/// throwaway jar for a one-shot call. Every outbound request in the same
+/// operation shares the returned `Arc`, so `Set-Cookie` on one response is
+/// replayed on the next request.
+fn jar_for(opts: &SessionOpts) -> Arc<Jar> {
+    match &opts.cookie_jar {
+        Some(shared) => shared.0.clone(),
+        None => Arc::new(Jar::default()),
+    }
+}
+
+/// Attach the cookie jar and total request timeout to a request builder.
+/// Applied to *every* outbound request (the real fetch, each retry attempt, and
+/// the robots probe) so the cookie store and the timeout hold uniformly now that
+/// neither lives on the shared client.
 fn dress(rb: RequestBuilder, jar: &Arc<Jar>, opts: &SessionOpts) -> RequestBuilder {
     let mut rb = rb
         .cookie_provider(jar.clone())
