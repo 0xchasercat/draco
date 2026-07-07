@@ -130,6 +130,55 @@ async fn cookies_do_not_leak_between_calls() {
     );
 }
 
+/// With an operation-scoped [`SharedCookieJar`] on the opts, a cookie set on one
+/// call MUST be replayed on a later call in the same operation — the browser
+/// behavior that lets Cloudflare's `__cf_bm` from the page fetch ride along on
+/// every subresource request.
+#[tokio::test]
+async fn cookies_persist_across_calls_with_a_shared_jar() {
+    use draco_net::SharedCookieJar;
+    let base = spawn_fixture().await;
+    let shared = SharedCookieJar::new();
+    let job_opts = SessionOpts {
+        respect_robots: false,
+        timeout_ms: 5_000,
+        cookie_jar: Some(shared.clone()),
+        ..Default::default()
+    };
+
+    // Call 1: receive Set-Cookie into the shared jar.
+    let set = fetch_target(&format!("{base}/set-cookie"), &job_opts)
+        .await
+        .expect("set-cookie fetch");
+    assert_eq!(set.meta.status, 200);
+
+    // Call 2: same jar → the cookie must be sent.
+    let echo = fetch_target(&format!("{base}/echo-cookie"), &job_opts)
+        .await
+        .expect("echo-cookie fetch");
+    let body = String::from_utf8_lossy(&echo.body);
+    assert!(
+        body.contains("sid=SECRET"),
+        "shared jar did not persist the cookie across calls: {body:?}"
+    );
+
+    // A DIFFERENT operation (fresh jar) must still be isolated from this one.
+    let other = SessionOpts {
+        respect_robots: false,
+        timeout_ms: 5_000,
+        cookie_jar: Some(SharedCookieJar::new()),
+        ..Default::default()
+    };
+    let echo2 = fetch_target(&format!("{base}/echo-cookie"), &other)
+        .await
+        .expect("echo-cookie fetch (other op)");
+    assert_eq!(
+        String::from_utf8_lossy(&echo2.body),
+        "none",
+        "cookie leaked across operations (separate jars must isolate)"
+    );
+}
+
 /// Within a single call, the per-call jar must carry a cookie set by a redirect
 /// hop through to the redirect target — the behavior the old per-call client
 /// provided, preserved on the shared pool.
