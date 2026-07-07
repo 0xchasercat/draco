@@ -63,6 +63,7 @@ use deno_core::{
     ModuleType, OpState, PollEventLoopOptions, ResolutionKind, RuntimeOptions,
 };
 use deno_error::JsErrorBox;
+use futures::FutureExt;
 use serde::Deserialize;
 
 use draco_types::{InterceptVia, RuntimeOutcome};
@@ -445,14 +446,40 @@ const GLUE_JS: &str = include_str!("../js/glue.js");
 // ES-module support: in-isolate module loader + script model
 // ===================================================================
 
-/// Module loader backed by a pre-fetched `{url -> source}` map (the page's script
-/// subresources, fetched by the air-gapped supervisor and handed in). Serves
-/// static + dynamic `import`s from the map; a module that isn't present (e.g. a
-/// runtime-only lazy chunk the supervisor didn't prefetch) resolves to an **empty
-/// module** rather than throwing, so a missing dynamic import can't crash the
-/// hydration we're trying to observe.
+/// Module loader backed by the supervisor-prefetched `{url -> source}` map, with
+/// an on-demand fallback to the same supervisor loader that `op_raze_load_script`
+/// uses for dynamic `<script src>` chunks.
+///
+/// Resolution order for every `import` / `import()` the isolate makes:
+///   1. **Prefetch map** — the subresources the air-gapped supervisor fetched up
+///      front. The common case; served directly.
+///   2. **On-demand loader** — a chunk missing from the prefetch set (a lazy
+///      route/chunk whose URL the static prefetch scanner didn't discover — e.g.
+///      a *minified* `import{x}from"../chunks/HASH.js"` the heuristics missed) is
+///      fetched through the supervisor (draco-net) and cached back into the map.
+///   3. **Honest failure** — a module that is neither prefetched nor fetchable
+///      rejects the import with a real *load* error.
+///
+/// Returning an **empty module** on a miss (the pre-v0.13.8 behavior) is a trap:
+/// a chunk served as empty satisfies the load but then fails V8 *linking* with a
+/// phantom `SyntaxError: … does not provide an export named 'x'`, which aborts
+/// hydration far from the real cause and blames the page's own code. That single
+/// `unwrap_or_default()` was the shared root cause of the stake.com and chaser.sh
+/// "0 endpoints" field failures. An honest load error rejects only the specific
+/// dynamic import (a browser rejects a 404'd chunk the same way); sibling scripts
+/// and already-scheduled fetches still surface.
+///
+/// `load` returns [`ModuleLoadResponse::Async`] so module fetching is driven on
+/// the event loop rather than compiled synchronously inside V8's dynamic-import
+/// host callback — the whole graph is pulled and registered before evaluation, so
+/// a re-entrant `import()` during evaluation resolves against an already-loaded
+/// module (deno_core's fast path) instead of forcing a fresh recursive load from
+/// inside the callback.
 struct MapModuleLoader {
     modules: Rc<RefCell<HashMap<String, Vec<u8>>>>,
+    /// On-demand loader for chunks absent from the prefetch map (same supervisor
+    /// path `op_raze_load_script` uses). `None` in resource-only capture modes.
+    script_loader: Option<Arc<ScriptLoader>>,
 }
 
 impl ModuleLoader for MapModuleLoader {
@@ -471,21 +498,53 @@ impl ModuleLoader for MapModuleLoader {
         _maybe_referrer: Option<&ModuleLoadReferrer>,
         _options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
-        let code = self
-            .modules
-            .borrow()
-            .get(module_specifier.as_str())
-            .cloned()
-            .unwrap_or_default();
-        let source = String::from_utf8_lossy(&code).into_owned();
-        let module = ModuleSource::new(
-            ModuleType::JavaScript,
-            ModuleSourceCode::String(source.into()),
-            module_specifier,
-            None,
-        );
-        ModuleLoadResponse::Sync(Ok(module))
+        let modules = self.modules.clone();
+        let script_loader = self.script_loader.clone();
+        let spec = module_specifier.clone();
+
+        ModuleLoadResponse::Async(
+            async move {
+                let key = spec.as_str();
+
+                // 1. Prefetched subresource.
+                if let Some(bytes) = modules.borrow().get(key).cloned() {
+                    return Ok(js_module_source(&bytes, &spec));
+                }
+
+                // 2. On-demand fetch through the supervisor loader; cache the
+                //    result so a later static/dynamic import of the same URL is a
+                //    map hit. The loader is a blocking IPC round-trip; that is the
+                //    same cost `op_raze_load_script` pays and is acceptable on the
+                //    single-threaded capture runtime.
+                if let Some(load) = &script_loader {
+                    if let Some(bytes) = load(key) {
+                        modules.borrow_mut().insert(key.to_string(), bytes.clone());
+                        return Ok(js_module_source(&bytes, &spec));
+                    }
+                }
+
+                // 3. Genuinely unavailable: reject THIS import honestly instead of
+                //    poisoning the graph with a silent empty module.
+                Err(JsErrorBox::generic(format!(
+                    "draco: failed to load module (not prefetched and no on-demand \
+                     loader could fetch it): {key}"
+                )))
+            }
+            .boxed_local(),
+        )
     }
+}
+
+/// Build a JavaScript [`ModuleSource`] from raw chunk bytes (lossy-decoded — page
+/// bytes are not guaranteed valid UTF-8 and V8 wants a `str`).
+fn js_module_source(bytes: &[u8], spec: &ModuleSpecifier) -> ModuleSource {
+    let source = String::from_utf8_lossy(bytes).into_owned();
+    ModuleSource::new(
+        ModuleType::JavaScript,
+        ModuleSourceCode::String(source.into()),
+        spec,
+        None,
+    )
 }
 
 /// One `<script>` from the page, in document order.
@@ -530,6 +589,7 @@ async fn run_capture_inner_with_resources(
         extensions: vec![draco_runtime_ext::init(cap.clone())],
         module_loader: Some(Rc::new(MapModuleLoader {
             modules: modules.clone(),
+            script_loader: cap.borrow().script_loader.clone(),
         })),
         ..Default::default()
     });
