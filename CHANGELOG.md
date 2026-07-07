@@ -3,6 +3,40 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.13.11] — 2026-07-07
+
+### Fixed
+- **`EventSource` / `WebSocket` no longer abort hydration** — and now surface as
+  discovered endpoints. SPAs commonly open a streaming connection during init;
+  stake.com's app bootstrap does `new EventSource(...)`, and a bare reference to
+  a missing constructor is a `ReferenceError` that kills hydration before any
+  data fetch runs (same failure class as the 0.13.8 `SVGAElement` and 0.13.5
+  Performance backfills). happy-dom ships no `EventSource` and only a
+  non-functional `WebSocket` stub that throws "ws does not work in the browser".
+  The glue now installs no-op stubs for both that never throw and **record the
+  connection URL as an intercepted request** — an SSE/WebSocket endpoint is
+  precisely the API surface `discover` exists to find. Installed unconditionally
+  (overriding happy-dom's broken `WebSocket`), same posture as the `fetch`/XHR
+  interceptors.
+
+### Changed
+- **Prefetch no longer chases dynamic `import()` route bundles.** v0.13.10 fetched
+  the static critical graph first but still walked dynamic imports afterward,
+  spending the budget on lazy route bundles — on stake.com, **12.9 MB** of them
+  versus a **548 KB** critical graph, and under Cloudflare's per-fetch throttling
+  that starved the critical graph itself (a 4130ms on-demand-budget miss on a
+  *static* entry dep). The prefetch walk now fetches only the **static** module
+  graph (the eager `import`/`export … from` closure — precisely what hydration
+  needs) plus webpack/Next chunk-loader candidates; dynamic `import("…")` targets
+  are left to the on-demand `LoadScript` path, which fetches any lazy chunk
+  hydration actually reaches. `discover`'s capture window never navigates, so
+  route bundles never come due — skipping them removes megabytes of wasted
+  fetching and keeps the critical graph inside budget even under CDN throttling.
+  (Oxc's `requested_modules` is static-only and `dynamic_imports` separate, so the
+  static/dynamic split from the one parse is exact; the webpack chunk-candidate
+  regex does not match Vite's relative `../chunks/` form, so Vite route bundles
+  are correctly excluded.)
+
 ## [0.13.10] — 2026-07-07
 
 ### Changed
