@@ -3,6 +3,25 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.13.9] — 2026-07-07
+
+### Added
+- **On-demand chunk-load failures now explain themselves** under `--runtime-log`.
+  When the runtime's module loader (v0.13.8) asks the supervisor for a chunk that
+  wasn't prefetched and the supervisor can't produce it, the reason was collapsed
+  to a bare "missing" — indistinguishable between *budget exhausted*, an HTTP
+  status (a `403` bot-wall or `404`), and a network/timeout error. The supervisor
+  now records the specific cause as a bounded `runtime.log` line
+  (`[loadscript] HTTP 403: <url>`, `[loadscript] on-demand load budget exhausted
+  (…ms ≥ 4000ms); not fetched: <url>`, `[loadscript] fetch error: …: <url>`),
+  correlated by URL to the runtime's own import rejection. A SvelteKit/Vite SPA
+  that hydrates to 0 endpoints on a missing chunk now says *why* — the difference
+  between "raise the dynamic-load budget", "the CDN is challenging our fetch"
+  (needs the future browser fallback), and "the chunk URL is wrong" — instead of
+  leaving it to guesswork. `fetch_dynamic_script` returns the reason rather than
+  swallowing it to `None`; successful loads stay silent. Diagnostic only — no
+  change to capture control flow or the jail wire protocol.
+
 ## [0.13.8] — 2026-07-07
 
 ### Fixed
