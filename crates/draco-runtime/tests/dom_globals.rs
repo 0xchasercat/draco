@@ -115,6 +115,29 @@ fn event_source_is_stubbed_and_records_the_sse_endpoint() {
     );
 }
 
+/// `response.body.getReader().read()` must not throw (it was aborting a
+/// SvelteKit data loader with `Cannot read properties of undefined (reading
+/// 'getReader')`); the stub returns an already-closed stream so the reader loop
+/// ends cleanly and code after it runs.
+#[test]
+fn fetch_response_body_getreader_does_not_throw() {
+    let html = r#"<!doctype html><html><body>
+<script type="module">
+  const res = await fetch("/api/stream");
+  const reader = res.body.getReader();
+  const { done } = await reader.read();
+  fetch("/api/after-getreader?done=" + done);
+</script>
+</body></html>"#;
+
+    let report = run_capture("https://sse.example.com/", html, &cfg());
+    assert!(
+        captured(&report, "/api/after-getreader?done=true"),
+        "response.body.getReader() path threw or stalled; logs: {:?}",
+        report.logs
+    );
+}
+
 /// `new WebSocket(url)` is likewise stubbed (same init-time abort class) and
 /// records its endpoint.
 #[test]

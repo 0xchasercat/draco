@@ -200,9 +200,29 @@
     const headers = new HeadersCtor((stub && stub.headers) || []);
     let used = false;
     const guard = () => { if (used) throw new TypeError("body already consumed"); used = true; };
+    // Minimal ReadableStream stand-in for `response.body`. Streaming-fetch code
+    // (`res.body.getReader().read()`, common in SvelteKit data loaders and
+    // fetch-based SSE) throws `Cannot read properties of undefined (reading
+    // 'getReader')` when `body` is absent, aborting hydration. We expose an
+    // already-closed stream: `getReader().read()` resolves `{done:true}` at once,
+    // so the reader loop terminates cleanly with no data (the isolate is
+    // air-gapped — there is no real stream), never throwing. One-shot text/json
+    // bodies still come through `text()`/`json()` above.
+    const emptyStreamBody = () => ({
+      locked: false,
+      getReader() {
+        return {
+          read() { return Promise.resolve({ done: true, value: undefined }); },
+          releaseLock() {},
+          cancel() { return Promise.resolve(); },
+        };
+      },
+      cancel() { return Promise.resolve(); },
+    });
     return {
       ok: status >= 200 && status < 300, status, statusText: status === 200 ? "OK" : "",
       url: finalUrl, redirected: false, type: "basic", headers, bodyUsed: false,
+      body: emptyStreamBody(),
       async text() { guard(); return bodyText; },
       async json() { guard(); return JSON.parse(bodyText); },
       async arrayBuffer() { guard(); return new TextEncoder().encode(bodyText).buffer; },
