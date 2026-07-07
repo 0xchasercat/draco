@@ -1047,7 +1047,16 @@ where
     // Subresource fetch posture: clamped per-fetch timeout, no politeness delay.
     let sub_opts = crate::tier2::subresource_opts(opts);
 
-    let mut queue: VecDeque<String> = VecDeque::new();
+    // Two-tier frontier. `critical` is the eager module graph — seeds plus the
+    // static imports discovered under them — that hydration cannot proceed
+    // without; `lazy` is dynamic `import()` targets and webpack/Next chunk
+    // candidates, which the app pulls on demand when a code path (usually a route)
+    // reaches them. Each wave drains `critical` first and only touches `lazy` once
+    // `critical` is fully exhausted, so a file/byte/wall cap can never spend the
+    // budget on a lazy route chunk while a critical dep goes unfetched. `visited`
+    // is shared so a specifier reachable both ways is fetched once.
+    let mut critical: VecDeque<String> = VecDeque::new();
+    let mut lazy: VecDeque<String> = VecDeque::new();
     let mut visited: HashSet<String> = HashSet::new();
     let mut out: Vec<ScriptResource> = Vec::new();
     let mut total = 0usize;
@@ -1058,13 +1067,13 @@ where
     {
         if let Ok(u) = base.join(&src) {
             if u.scheme() == "http" || u.scheme() == "https" {
-                queue.push_back(u.to_string());
+                critical.push_back(u.to_string());
             }
         }
     }
 
     let started = Instant::now();
-    'waves: while !queue.is_empty() {
+    'waves: while !critical.is_empty() || !lazy.is_empty() {
         if out.len() >= MAX_FILES
             || total >= MAX_TOTAL_BYTES
             || started.elapsed().as_millis() as u64 >= wall_budget_ms
@@ -1072,17 +1081,26 @@ where
             break;
         }
 
-        // Assemble the next wave of unvisited URLs.
+        // A wave is drawn from ONE tier: `critical` while any remains, else
+        // `lazy`. This keeps critical fetches strictly ahead of lazy ones even at
+        // the cost of an occasional under-full wave — the whole point is that the
+        // critical graph finishes before the budget can be spent on lazy chunks.
+        let source = if !critical.is_empty() {
+            &mut critical
+        } else {
+            &mut lazy
+        };
         let mut wave: Vec<String> = Vec::new();
         while wave.len() < PREFETCH_CONCURRENCY.min(MAX_FILES - out.len()) {
-            let Some(u) = queue.pop_front() else { break };
+            let Some(u) = source.pop_front() else { break };
             if visited.insert(u.clone()) {
                 wave.push(u);
             }
         }
         if wave.is_empty() {
-            // Everything left in the queue had been visited already.
-            break;
+            // Everything drawable this tier had been visited; loop re-picks the
+            // other tier (or terminates when both are drained).
+            continue;
         }
 
         let responses = join_all(wave.iter().map(|u| fetcher.fetch(u, &sub_opts))).await;
@@ -1094,21 +1112,31 @@ where
             let bytes = resp.body.to_vec();
             total = total.saturating_add(bytes.len());
 
-            // Crawl this module's imports and webpack/Next chunk-loader
-            // references (resolved against its own URL).
+            // Crawl this module's imports (resolved against its own URL): static
+            // imports extend the critical graph; dynamic `import()` targets and
+            // webpack/Next chunk-loader references are lazy.
             if let Ok(mod_url) = url::Url::parse(&u) {
                 let src = String::from_utf8_lossy(&bytes);
-                for spec in extract_module_imports(&src)
-                    .into_iter()
-                    .chain(extract_chunk_candidates(&src))
-                {
-                    if let Ok(child) = mod_url.join(&spec) {
+                let imports = extract_imports(&src);
+                let enqueue = |spec: &str, into: &mut VecDeque<String>| {
+                    if let Ok(child) = mod_url.join(spec) {
                         if (child.scheme() == "http" || child.scheme() == "https")
                             && !visited.contains(child.as_str())
                         {
-                            queue.push_back(child.to_string());
+                            into.push_back(child.to_string());
                         }
                     }
+                };
+                for spec in &imports.statik {
+                    enqueue(spec, &mut critical);
+                }
+                for spec in imports
+                    .dynamic
+                    .iter()
+                    .cloned()
+                    .chain(extract_chunk_candidates(&src))
+                {
+                    enqueue(&spec, &mut lazy);
                 }
             }
 
@@ -1366,15 +1394,34 @@ fn looks_like_hash_part(value: &str) -> bool {
     value.len() >= 12 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// A module's outbound import specifiers, split by load semantics.
+///
+/// `statik` are eagerly loaded as part of the module graph *before* the module
+/// evaluates — they are the **critical hydration path** and must be fetched for
+/// hydration to proceed at all. `dynamic` (`import("…")`) are loaded only when
+/// the code path reaches them — usually lazy routes/widgets that initial
+/// hydration does not need. The prefetch walk fetches `statik` at higher
+/// priority so a budget cap never starves the critical graph in favour of a lazy
+/// route chunk (the stake.com failure mode: a critical `chunks/HASH.js` static
+/// dep of the entry went unfetched while the walk spent its budget elsewhere,
+/// then the on-demand path's own budget expired before it could recover it).
+#[cfg(feature = "tier2")]
+#[derive(Default)]
+struct ModuleImports {
+    statik: Vec<String>,
+    dynamic: Vec<String>,
+}
+
 /// Extract ES-module import/export specifiers from JS source via the **Oxc**
-/// parse-once AST — static `import … from`, side-effect `import "…"`, re-export
-/// `export … from` / `export * from`, and dynamic `import("…")` with a string
-/// literal. A real parse (vs. regex) means specifiers inside strings/comments
+/// parse-once AST, split into static vs dynamic (see [`ModuleImports`]): static
+/// `import … from`, side-effect `import "…"`, re-export `export … from` /
+/// `export * from` are `statik`; dynamic `import("…")` with a string literal is
+/// `dynamic`. A real parse (vs. regex) means specifiers inside strings/comments
 /// are never matched and computed `import(expr)` is correctly ignored. Oxc
 /// recovers from syntax errors, so a partial/odd bundle still yields whatever
 /// specifiers it could parse.
 #[cfg(feature = "tier2")]
-fn extract_module_imports(src: &str) -> Vec<String> {
+fn extract_imports(src: &str) -> ModuleImports {
     use oxc_allocator::Allocator;
     use oxc_parser::Parser;
     use oxc_span::SourceType;
@@ -1383,10 +1430,10 @@ fn extract_module_imports(src: &str) -> Vec<String> {
     let ret = Parser::new(&allocator, src, SourceType::mjs()).parse();
     let mr = &ret.module_record;
 
-    let mut out = Vec::new();
+    let mut imports = ModuleImports::default();
     // Static import/export module requests (the map keys are the specifiers).
     for (spec, _) in mr.requested_modules.iter() {
-        out.push(spec.as_str().to_string());
+        imports.statik.push(spec.as_str().to_string());
     }
     // Dynamic `import("…")`: the span points at the argument; keep it only when
     // it is a string literal (skip `import(dynamicExpr)`).
@@ -1402,10 +1449,21 @@ fn extract_module_imports(src: &str) -> Vec<String> {
                 && (bytes[0] == b'"' || bytes[0] == b'\'')
                 && bytes[bytes.len() - 1] == bytes[0]
             {
-                out.push(t[1..t.len() - 1].to_string());
+                imports.dynamic.push(t[1..t.len() - 1].to_string());
             }
         }
     }
+    imports
+}
+
+/// All import specifiers (static + dynamic), order-preserving. Used where load
+/// priority does not matter — seeding from inline `<script>` bodies (every
+/// specifier there is a page entry point) — and by tests.
+#[cfg(feature = "tier2")]
+fn extract_module_imports(src: &str) -> Vec<String> {
+    let i = extract_imports(src);
+    let mut out = i.statik;
+    out.extend(i.dynamic);
     out
 }
 
@@ -1907,6 +1965,175 @@ mod tests {
             1,
             "deduped candidate list: {got:?}"
         );
+    }
+
+    #[test]
+    fn extract_imports_splits_static_from_dynamic() {
+        let src = r#"
+            import a from "./a.js";
+            export { c } from "./c.js";
+            import "./side-effect.js";
+            const p = import("./lazy.js");
+            const q = import('./lazy2.js');
+            const dyn = import(computed);
+        "#;
+        let i = extract_imports(src);
+        // Static graph (critical): the three `import`/`export … from` specifiers.
+        for want in ["./a.js", "./c.js", "./side-effect.js"] {
+            assert!(
+                i.statik.contains(&want.to_string()),
+                "static missing {want}: {:?}",
+                i.statik
+            );
+        }
+        assert!(
+            !i.statik.iter().any(|s| s.contains("lazy")),
+            "dynamic leaked into static: {:?}",
+            i.statik
+        );
+        // Dynamic (lazy): the string-literal `import(...)` targets; computed skipped.
+        for want in ["./lazy.js", "./lazy2.js"] {
+            assert!(
+                i.dynamic.contains(&want.to_string()),
+                "dynamic missing {want}: {:?}",
+                i.dynamic
+            );
+        }
+        assert!(
+            !i.dynamic
+                .iter()
+                .any(|s| s.contains("a.js") || s.contains("c.js")),
+            "static leaked into dynamic: {:?}",
+            i.dynamic
+        );
+    }
+
+    /// A per-URL recording fetcher: serves a fixed `{url -> body}` map and logs
+    /// the exact order in which URLs were fetched, so a test can assert the
+    /// prefetch walk's fetch ordering across waves.
+    struct GraphFetcher {
+        bodies: std::collections::HashMap<String, String>,
+        order: std::sync::Mutex<Vec<String>>,
+    }
+    impl GraphFetcher {
+        fn new(pairs: &[(&str, &str)]) -> Self {
+            Self {
+                bodies: pairs
+                    .iter()
+                    .map(|(u, b)| (u.to_string(), b.to_string()))
+                    .collect(),
+                order: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn order(&self) -> Vec<String> {
+            self.order.lock().unwrap().clone()
+        }
+    }
+    #[async_trait::async_trait]
+    impl PageFetcher for GraphFetcher {
+        async fn fetch(
+            &self,
+            url: &str,
+            _opts: &SessionOpts,
+        ) -> Result<draco_net::HtmlResponse, DracoError> {
+            self.order.lock().unwrap().push(url.to_string());
+            let (status, body) = match self.bodies.get(url) {
+                Some(b) => (200u16, b.clone()),
+                None => (404u16, String::new()),
+            };
+            Ok(draco_net::HtmlResponse {
+                meta: draco_types::HttpResponseMeta {
+                    status,
+                    headers: vec![("content-type".into(), "application/javascript".into())],
+                    final_url: url.to_string(),
+                    elapsed_ms: 1,
+                },
+                body: bytes::Bytes::from(body.into_bytes()),
+            })
+        }
+        async fn replay(
+            &self,
+            _spec: &draco_types::HttpRequestSpec,
+            _opts: &SessionOpts,
+        ) -> Result<draco_net::HtmlResponse, DracoError> {
+            Ok(draco_net::HtmlResponse {
+                meta: draco_types::HttpResponseMeta {
+                    status: 404,
+                    headers: vec![],
+                    final_url: String::new(),
+                    elapsed_ms: 1,
+                },
+                body: bytes::Bytes::new(),
+            })
+        }
+    }
+
+    /// The stake.com fix: the prefetch walk must fetch the entry's transitive
+    /// **static** graph (the critical hydration path) before it spends its budget
+    /// on **lazy** dynamic-import / chunk-loader targets. Here the seed statically
+    /// imports `a.js` (which statically imports `a2.js`) and dynamically imports
+    /// `d1.js` plus references a webpack-style `chunks/c1.js`. Every critical
+    /// static node must appear in the fetch log before any lazy node.
+    #[tokio::test]
+    async fn prefetch_prioritizes_critical_static_over_lazy() {
+        let base = "https://app.example.com/";
+        let html = r#"<html><body>
+            <script type="module">import("/seed.js")</script>
+        </body></html>"#;
+
+        let fetcher = GraphFetcher::new(&[
+            (
+                "https://app.example.com/seed.js",
+                r#"import { a } from "/a.js";
+                   const lazyRoute = () => import("/d1.js");
+                   const chunk = "chunks/c1.js";"#,
+            ),
+            (
+                "https://app.example.com/a.js",
+                r#"import { a2 } from "/a2.js";"#,
+            ),
+            ("https://app.example.com/a2.js", "export const a2 = 1;"),
+            ("https://app.example.com/d1.js", r#"import("/d2.js");"#),
+            ("https://app.example.com/d2.js", "export const d2 = 1;"),
+            (
+                "https://app.example.com/chunks/c1.js",
+                "export const c1 = 1;",
+            ),
+        ]);
+
+        let out =
+            prefetch_scripts_with_budget(base, html, &SessionOpts::default(), &fetcher, 5_000)
+                .await;
+        let fetched: std::collections::HashSet<String> =
+            out.iter().map(|r| r.url.clone()).collect();
+        // The whole critical static graph is prefetched.
+        for u in [
+            "https://app.example.com/seed.js",
+            "https://app.example.com/a.js",
+            "https://app.example.com/a2.js",
+        ] {
+            assert!(
+                fetched.contains(u),
+                "critical node not prefetched: {u}; got {fetched:?}"
+            );
+        }
+
+        // Ordering: every critical static node is fetched before ANY lazy node.
+        let order = fetcher.order();
+        let pos = |needle: &str| order.iter().position(|u| u == needle);
+        let last_critical = ["/seed.js", "/a.js", "/a2.js"]
+            .iter()
+            .filter_map(|s| pos(&format!("https://app.example.com{s}")))
+            .max()
+            .expect("critical nodes fetched");
+        for lazy in ["/d1.js", "/d2.js", "/chunks/c1.js"] {
+            if let Some(p) = pos(&format!("https://app.example.com{lazy}")) {
+                assert!(
+                    p > last_critical,
+                    "lazy {lazy} (pos {p}) fetched before a critical node (last critical pos {last_critical}); order: {order:?}"
+                );
+            }
+        }
     }
 
     #[test]

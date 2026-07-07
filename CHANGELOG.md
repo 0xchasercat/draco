@@ -3,6 +3,29 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.13.10] — 2026-07-07
+
+### Changed
+- **Prefetch prioritizes the critical hydration path.** The supervisor's
+  script-graph prefetch walk (`prefetch_scripts_with_budget`) now fetches a
+  page's **static** module graph — the eager `import`/`export … from` closure
+  that hydration cannot proceed without — strictly ahead of **lazy** targets
+  (dynamic `import("…")` and webpack/Next chunk-loader references, which the app
+  pulls on demand, usually for routes). Previously both were enqueued into one
+  FIFO frontier, so on a large code-split SPA the file/byte/wall budget could be
+  spent fetching lazy route chunks while a critical dependency of the entry went
+  unfetched — it then fell to the on-demand `LoadScript` path, whose own budget
+  could expire mid-hydration, stalling the page at **0 endpoints**. This was the
+  stake.com `discover` failure: v0.13.9's `--runtime-log` pinned it to
+  `on-demand load budget exhausted … chunks/BBKH46HI.js`, a *static* dep of the
+  SvelteKit entry. The walk now uses a two-tier frontier (`critical` drained
+  fully before `lazy`, `visited` shared) so the eager graph is fetched up-front
+  and in parallel — on-demand loading becomes the rare fallback it was meant to
+  be, not the mechanism the critical path depends on. Helps every heavy SPA, not
+  just stake. Import extraction is split accordingly (`extract_imports` returns
+  static vs dynamic specifiers from the one Oxc parse). No API or wire-protocol
+  change; budgets and caps are unchanged (this spends them better).
+
 ## [0.13.9] — 2026-07-07
 
 ### Added
