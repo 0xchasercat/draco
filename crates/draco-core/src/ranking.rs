@@ -399,8 +399,34 @@ pub fn best_replayable(
 }
 
 /// Is this candidate allowed to be replayed under the mutation-safety policy?
+///
+/// A **streaming** endpoint is never replay-eligible regardless of method: an
+/// SSE stream or WebSocket has no finite body, so replaying it to capture a
+/// sample hangs until the session timeout (stake.com's
+/// `/_api/feature-flag/v1/flags/stream` produced a 30 s replay timeout — a 43 s
+/// total run — once the `EventSource` stub started surfacing it as an endpoint).
+/// It is still reported as a discovered endpoint; it just isn't replayed.
 fn is_replay_eligible(c: &Candidate, allow_unsafe: bool) -> bool {
-    allow_unsafe || is_safe_method(&c.method) || is_read_style_post(c)
+    !is_streaming_endpoint(c)
+        && (allow_unsafe || is_safe_method(&c.method) || is_read_style_post(c))
+}
+
+/// A long-lived streaming endpoint (Server-Sent Events or WebSocket) that cannot
+/// be meaningfully HTTP-replayed for a sample body. Detected from the request
+/// itself: an `Accept: text/event-stream` header (SSE — set by real EventSource
+/// clients and by the runtime's `EventSource` stub) or a `ws(s)://` URL
+/// (WebSocket handshake).
+pub fn is_streaming_endpoint(c: &Candidate) -> bool {
+    let url = c.url.trim_start();
+    if url.len() >= 5 {
+        let head = url[..url.len().min(6)].to_ascii_lowercase();
+        if head.starts_with("ws://") || head.starts_with("wss://") {
+            return true;
+        }
+    }
+    c.headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("accept") && v.to_ascii_lowercase().contains("text/event-stream")
+    })
 }
 
 #[cfg(test)]
@@ -412,6 +438,46 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn streaming_endpoints_are_discovered_but_never_replay_eligible() {
+        let page = Some("https://stake.com/");
+        // SSE: same-origin(10) + api-path(8) = 18, well above MIN_VIABLE, and a
+        // safe GET — yet must NOT be replay-eligible (replaying it hangs).
+        let sse = Candidate {
+            method: "GET".into(),
+            url: "https://stake.com/_api/feature-flag/v1/flags/stream".into(),
+            headers: hdr(&[("accept", "text/event-stream")]),
+            via: InterceptVia::Fetch,
+        };
+        assert!(is_streaming_endpoint(&sse));
+        assert!(score_request(&sse, page) >= MIN_VIABLE_SCORE);
+        assert!(
+            best_replayable(&[sse], page, false).is_none(),
+            "SSE endpoint must not be selected for replay"
+        );
+
+        // WebSocket handshake URL — likewise never replay-eligible.
+        let ws = Candidate {
+            method: "GET".into(),
+            url: "wss://stake.com/socket".into(),
+            headers: hdr(&[]),
+            via: InterceptVia::Fetch,
+        };
+        assert!(is_streaming_endpoint(&ws));
+        assert!(best_replayable(&[ws], page, false).is_none());
+
+        // A normal same-origin JSON GET is still replay-eligible (guard against
+        // over-broad matching).
+        let json = Candidate {
+            method: "GET".into(),
+            url: "https://stake.com/api/data".into(),
+            headers: hdr(&[("accept", "application/json")]),
+            via: InterceptVia::Fetch,
+        };
+        assert!(!is_streaming_endpoint(&json));
+        assert!(best_replayable(&[json], page, false).is_some());
     }
 
     #[test]
