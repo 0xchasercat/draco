@@ -3,6 +3,29 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [Unreleased]
+
+### Added
+- `scripts/gate.sh` — the sandbox-safe way to run the CI gates. It refuses to
+  *start* a build below a free-space floor (auto-reclaiming first), pins
+  `CARGO_BUILD_JOBS=1` for the ~4 GiB box, and prints free space between phases —
+  turning the recurring silent 0-byte `ENOSPC` deadlock (at which point even
+  `rm` can no longer run and the whole session is lost) into a loud early abort
+  with room to act.
+- `scripts/reclaim.sh` — one-shot, near-full-safe reclaim of the only large
+  *regenerable* consumers (the `target/` tree and cargo registry caches);
+  source, git history, and credentials are untouched.
+- `docs/SANDBOX.md` — the constrained-sandbox runbook: why disk-full loses the
+  whole session, the commit-before-build rule, and how to use the scripts.
+
+### Changed
+- Slimmed the dev/test build footprint: `[profile.dev]`/`[profile.test]` now
+  compile with `debug = "line-tables-only"` and dependencies with
+  `debug = false`. Full DWARF for a workspace that links V8/deno_core/oxc/
+  BoringSSL across every `--all-targets` test binary was several GiB of
+  `target/` — the dominant cause of the sandbox disk-full loss. Panic/backtrace
+  `file:line` is preserved for our own crates; fully reversible per-dev.
+
 ## [0.13.13] — 2026-07-07
 
 ### Fixed

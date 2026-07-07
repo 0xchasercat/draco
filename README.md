@@ -327,6 +327,19 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
+On a memory-/disk-constrained box (CI containers, the ~4 GiB build sandbox),
+run the gates through the guarded wrapper instead — it pins single-job builds
+and refuses to start when disk is low rather than filling it and losing the
+session:
+
+```sh
+bash scripts/gate.sh            # fmt + clippy + test, disk-guarded
+bash scripts/reclaim.sh         # free regenerable build artifacts in a pinch
+```
+
+See **[docs/SANDBOX.md](docs/SANDBOX.md)** for the full runbook (and the
+commit-before-build rule that makes a lost sandbox cost nothing).
+
 ## Compliance & intended use
 
 Draco is for public data, properties you operate, and APIs you're permitted to
