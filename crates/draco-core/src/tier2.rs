@@ -239,15 +239,18 @@ pub(crate) fn discover_endpoints(
     target_url: &str,
     allow_unsafe: bool,
 ) -> Vec<DiscoveredEndpoint> {
-    use crate::ranking::{is_safe_method, score_request, MIN_VIABLE_SCORE};
+    use crate::ranking::{is_safe_method, is_streaming_endpoint, score_request, MIN_VIABLE_SCORE};
 
     let mut out: Vec<DiscoveredEndpoint> = capture
         .candidates
         .iter()
         .map(|c| {
             let score = score_request(c, Some(target_url));
-            let replayable =
-                score >= MIN_VIABLE_SCORE && (is_safe_method(&c.method) || allow_unsafe);
+            // Streaming endpoints (SSE/WebSocket) are reported but never flagged
+            // replayable — replaying an infinite stream hangs until timeout.
+            let replayable = score >= MIN_VIABLE_SCORE
+                && !is_streaming_endpoint(c)
+                && (is_safe_method(&c.method) || allow_unsafe);
             DiscoveredEndpoint {
                 method: c.method.clone(),
                 url: c.url.clone(),

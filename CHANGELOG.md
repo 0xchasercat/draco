@@ -3,6 +3,27 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.13.12] — 2026-07-07
+
+### Fixed
+- **Streaming endpoints (SSE / WebSocket) are no longer replayed** — the fix that
+  turned stake.com's 43-second `discover` back into a fast one. Once the 0.13.11
+  `EventSource` stub started surfacing SSE endpoints, discovery correctly found
+  `/_api/feature-flag/v1/flags/stream` (score 18, a safe same-origin GET) and
+  picked it as the replay winner — but an SSE stream never closes, so replaying
+  it to capture a sample body hung for the full 30 s session timeout (43 s total
+  run). Ranking now treats any endpoint with `Accept: text/event-stream` (SSE) or
+  a `ws(s)://` URL (WebSocket) as **non-replayable**: it is still reported as a
+  discovered endpoint, it just isn't fetched for a body. Both `best_replayable`
+  (the replay winner) and the per-endpoint `replayable` output flag honor this.
+- **`response.body.getReader()` no longer aborts hydration.** The fetch-response
+  stub had no `body`, so streaming-response readers (SvelteKit data loaders,
+  fetch-based SSE) threw `Cannot read properties of undefined (reading
+  'getReader')`. The response now exposes a minimal already-closed
+  `ReadableStream` stand-in whose `getReader().read()` resolves `{done:true}` at
+  once — the reader loop ends cleanly with no data (the isolate is air-gapped),
+  never throwing. One-shot `text()`/`json()` bodies are unchanged.
+
 ## [0.13.11] — 2026-07-07
 
 ### Fixed
