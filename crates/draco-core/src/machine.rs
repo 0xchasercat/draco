@@ -134,6 +134,9 @@ pub fn session_opts(config: &Config) -> SessionOpts {
         respect_robots: config.respect_robots,
         timeout_ms: config.timeout_ms,
         headers: config.headers.clone(),
+        // Filled in per run by `run_ladder` so one operation's page fetch,
+        // subresources, and replay share a cookie jar (see `SharedCookieJar`).
+        cookie_jar: None,
     }
 }
 
@@ -320,7 +323,17 @@ where
     T: Tier2Capture + ?Sized,
 {
     let mut run = Run::new(url);
-    let opts = session_opts(config);
+    let mut opts = session_opts(config);
+    // One cookie jar for the whole operation: the page fetch, every prefetched
+    // and on-demand subresource, and the replay all share it, so a `Set-Cookie`
+    // on the initial response (e.g. Cloudflare's `__cf_bm`) is replayed on the
+    // follow-up requests — exactly as a browser scopes cookies to a page session.
+    // Without this, subresource fetches went out cookie-less and a bot wall
+    // throttled them intermittently. A batch/crawl caller can instead pre-set
+    // `cookie_jar` to share one jar across many pages.
+    if opts.cookie_jar.is_none() {
+        opts.cookie_jar = Some(draco_net::SharedCookieJar::new());
+    }
     let tier_max = clamp_tier_max(config.tier_max);
 
     // ---- Fetch ---------------------------------------------------------
