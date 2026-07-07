@@ -27,3 +27,20 @@ draco-core = { path = "crates/draco-core" }
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# --- Disk-footprint controls (see docs/SANDBOX.md) ---
+# The dev/test/clippy artifact tree is dominated by debuginfo. Full DWARF for a
+# workspace that links V8/deno_core/oxc/BoringSSL across many `--all-targets`
+# test binaries runs to several GiB of `target/` — the recurring cause of
+# sandbox ENOSPC (disk-full) session loss. Line-tables keep readable panic and
+# backtrace file:line for our own crates; dropping dependency debuginfo entirely
+# (we rarely step into deps) reclaims the bulk. Both are reversible per-dev and
+# safe on macOS/Linux alike. `test` inherits these from `dev`.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
