@@ -3,6 +3,31 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.13.13] — 2026-07-07
+
+### Fixed
+- **Cookies now persist across a whole operation, not per network call** — the
+  root cause of stake.com's intermittent missing chunk. `draco-net` created a
+  **fresh, empty cookie jar on every `fetch_target`/`replay` call**, so a
+  `Set-Cookie` on the initial page response was discarded before the next
+  request. On a Cloudflare-fronted site the page fetch is issued a `__cf_bm`
+  bot-management cookie; with it thrown away, every prefetch and on-demand chunk
+  request went out cookie-less, so Cloudflare throttled/challenged a rotating
+  subset of them — a different chunk failed to load each run (confirmed
+  fetchable-with-cookies: the chunk 200s under `curl --impersonate` and carries
+  `set-cookie: __cf_bm=…`). A browser scopes cookies to the *page session* and
+  replays them on every subresource; draco now does the same.
+- New `SharedCookieJar` on `SessionOpts::cookie_jar`: a jar scoped to one logical
+  operation (a scrape/discover, and — ahead — a batch/crawl or `/interact`
+  session) and shared across its page fetch, every prefetched + on-demand
+  subresource, and the replay. `run_ladder` creates one per job; a batch caller
+  can pre-set it to share one session across many pages. Isolation is now
+  **between** operations, not within one (verified: a cookie set on one call is
+  replayed on the next call in the same op, and separate jars stay isolated).
+  When no jar is supplied — a genuinely one-shot fetch — a throwaway per-call jar
+  is used, so nothing regresses. This is also the cookie half of the
+  `SessionState` the planned `/interact` endpoint threads across turns.
+
 ## [0.13.12] — 2026-07-07
 
 ### Fixed
