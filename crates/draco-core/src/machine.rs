@@ -1048,13 +1048,21 @@ where
     let sub_opts = crate::tier2::subresource_opts(opts);
 
     // Two-tier frontier. `critical` is the eager module graph — seeds plus the
-    // static imports discovered under them — that hydration cannot proceed
-    // without; `lazy` is dynamic `import()` targets and webpack/Next chunk
-    // candidates, which the app pulls on demand when a code path (usually a route)
-    // reaches them. Each wave drains `critical` first and only touches `lazy` once
-    // `critical` is fully exhausted, so a file/byte/wall cap can never spend the
-    // budget on a lazy route chunk while a critical dep goes unfetched. `visited`
-    // is shared so a specifier reachable both ways is fetched once.
+    // **static** imports discovered under them — that hydration cannot proceed
+    // without. `lazy` holds only webpack/Next chunk-loader candidates (computed
+    // `<script src>` URLs those runtimes inject during mount).
+    //
+    // Dynamic ESM `import("…")` targets are deliberately NOT prefetched. They are
+    // lazy route/widget bundles the app pulls on navigation, not the
+    // initial-mount critical path; speculatively fetching them spent the budget on
+    // megabytes of route code (stake.com: 12.9 MB of route bundles chased vs a
+    // 548 KB critical graph, and under Cloudflare's per-fetch throttling that
+    // starved the critical graph itself). The on-demand `LoadScript` path fetches
+    // any dynamic chunk hydration actually reaches, so nothing needed is lost —
+    // discover's capture window never navigates, so route bundles never come due.
+    // Each wave drains `critical` first; `lazy` (chunk candidates) only once
+    // `critical` is exhausted. `visited` is shared so a URL reachable both ways is
+    // fetched once.
     let mut critical: VecDeque<String> = VecDeque::new();
     let mut lazy: VecDeque<String> = VecDeque::new();
     let mut visited: HashSet<String> = HashSet::new();
@@ -1130,12 +1138,11 @@ where
                 for spec in &imports.statik {
                     enqueue(spec, &mut critical);
                 }
-                for spec in imports
-                    .dynamic
-                    .iter()
-                    .cloned()
-                    .chain(extract_chunk_candidates(&src))
-                {
+                // Dynamic imports (`imports.dynamic`) are intentionally dropped
+                // here — see the frontier comment above. Only webpack/Next chunk
+                // candidates are prefetched, at lower priority than the static
+                // graph.
+                for spec in extract_chunk_candidates(&src) {
                     enqueue(&spec, &mut lazy);
                 }
             }
@@ -2068,14 +2075,14 @@ mod tests {
         }
     }
 
-    /// The stake.com fix: the prefetch walk must fetch the entry's transitive
-    /// **static** graph (the critical hydration path) before it spends its budget
-    /// on **lazy** dynamic-import / chunk-loader targets. Here the seed statically
-    /// imports `a.js` (which statically imports `a2.js`) and dynamically imports
-    /// `d1.js` plus references a webpack-style `chunks/c1.js`. Every critical
-    /// static node must appear in the fetch log before any lazy node.
+    /// The stake.com fix. The prefetch walk fetches the entry's transitive
+    /// **static** graph (the critical hydration path) and webpack/Next chunk
+    /// candidates, but must NOT fetch dynamic `import()` targets (lazy route
+    /// bundles the app pulls on navigation — the 12.9 MB stake was chasing). Here
+    /// the seed statically imports `a.js` (→ `a2.js`), dynamically imports `d1.js`
+    /// (→ `d2.js`), and references a webpack-style `chunks/c1.js`.
     #[tokio::test]
-    async fn prefetch_prioritizes_critical_static_over_lazy() {
+    async fn prefetch_fetches_static_and_chunk_candidates_skips_dynamic() {
         let base = "https://app.example.com/";
         let html = r#"<html><body>
             <script type="module">import("/seed.js")</script>
@@ -2106,19 +2113,33 @@ mod tests {
                 .await;
         let fetched: std::collections::HashSet<String> =
             out.iter().map(|r| r.url.clone()).collect();
-        // The whole critical static graph is prefetched.
+
+        // The whole critical static graph plus the chunk candidate are prefetched.
         for u in [
             "https://app.example.com/seed.js",
             "https://app.example.com/a.js",
             "https://app.example.com/a2.js",
+            "https://app.example.com/chunks/c1.js",
         ] {
             assert!(
                 fetched.contains(u),
-                "critical node not prefetched: {u}; got {fetched:?}"
+                "expected node not prefetched: {u}; got {fetched:?}"
             );
         }
 
-        // Ordering: every critical static node is fetched before ANY lazy node.
+        // Dynamic `import()` targets are NEVER prefetched (on-demand's job).
+        for u in [
+            "https://app.example.com/d1.js",
+            "https://app.example.com/d2.js",
+        ] {
+            assert!(
+                !fetched.contains(u),
+                "dynamic import target was prefetched (should be skipped): {u}; got {fetched:?}"
+            );
+        }
+
+        // Ordering: the static critical graph is fetched before the chunk
+        // candidate (lazy tier).
         let order = fetcher.order();
         let pos = |needle: &str| order.iter().position(|u| u == needle);
         let last_critical = ["/seed.js", "/a.js", "/a2.js"]
@@ -2126,13 +2147,11 @@ mod tests {
             .filter_map(|s| pos(&format!("https://app.example.com{s}")))
             .max()
             .expect("critical nodes fetched");
-        for lazy in ["/d1.js", "/d2.js", "/chunks/c1.js"] {
-            if let Some(p) = pos(&format!("https://app.example.com{lazy}")) {
-                assert!(
-                    p > last_critical,
-                    "lazy {lazy} (pos {p}) fetched before a critical node (last critical pos {last_critical}); order: {order:?}"
-                );
-            }
+        if let Some(p) = pos("https://app.example.com/chunks/c1.js") {
+            assert!(
+                p > last_critical,
+                "chunk candidate (pos {p}) fetched before a critical node (last critical pos {last_critical}); order: {order:?}"
+            );
         }
     }
 

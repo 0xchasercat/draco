@@ -253,6 +253,61 @@
   }
   g.XMLHttpRequest = XHR;
 
+  // Streaming-connection APIs (EventSource / WebSocket). SPAs commonly open one
+  // during init — stake.com's app bootstrap does `new EventSource(...)` — and a
+  // bare reference to a missing constructor is a ReferenceError that aborts
+  // hydration before any data fetch runs (same failure class as the missing DOM
+  // constructors backfilled above). happy-dom ships neither. We install no-op
+  // stubs that (a) never throw, and (b) RECORD the connection's URL as an
+  // intercepted request, because an SSE/WebSocket endpoint is exactly the kind of
+  // API surface `discover` exists to find. They never emit events (the isolate is
+  // air-gapped), so nothing downstream blocks waiting on a live stream.
+  function installStreamingCtor(name, defaultMethod) {
+    // Always install (override), unlike the DOM-constructor backfill above:
+    // happy-dom's own EventSource is absent and its WebSocket is a non-functional
+    // stub that throws "ws does not work in the browser" — both useless in the
+    // air-gapped isolate. Same posture as the unconditional `fetch`/XHR override.
+    const Ctor = function (u) {
+      this.url = absolutize(u);
+      this.readyState = 0;
+      this.onopen = null;
+      this.onmessage = null;
+      this.onerror = null;
+      this.onclose = null;
+      this._l = Object.create(null);
+      try {
+        record("fetch", defaultMethod, u, [["accept", "text/event-stream"]], null);
+      } catch (_) {}
+    };
+    Ctor.prototype.addEventListener = function (t, fn) {
+      if (typeof fn === "function") (this._l[t] || (this._l[t] = [])).push(fn);
+    };
+    Ctor.prototype.removeEventListener = function (t, fn) {
+      const a = this._l[t];
+      if (!a) return;
+      const i = a.indexOf(fn);
+      if (i >= 0) a.splice(i, 1);
+    };
+    Ctor.prototype.close = function () {
+      this.readyState = 2;
+    };
+    Ctor.prototype.send = function () {}; // WebSocket.send: no-op (air-gapped).
+    // Standard readyState constants.
+    Ctor.CONNECTING = 0;
+    Ctor.OPEN = 1;
+    Ctor.CLOSING = 2;
+    Ctor.CLOSED = 3;
+    try {
+      Object.defineProperty(Ctor, "name", { value: name, configurable: true });
+    } catch (_) {}
+    g[name] = Ctor;
+    try {
+      w[name] = Ctor;
+    } catch (_) {}
+  }
+  installStreamingCtor("EventSource", "GET");
+  installStreamingCtor("WebSocket", "GET");
+
   // Dynamic script chunk loader hook. Frameworks such as Next/Webpack load lazy
   // chunks by creating <script src="/_next/static/chunks/..."></script> and
   // resolving a promise from onload/onerror. happy-dom's script loading is disabled
