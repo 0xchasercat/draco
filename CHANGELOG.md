@@ -3,6 +3,84 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.13.8] — 2026-07-07
+
+### Fixed
+- **ESM module loading is honest instead of silently empty** — the single biggest
+  cause of SvelteKit/Vite SPAs discovering **0 endpoints** (observed on stake.com
+  and chaser.sh). The in-isolate module loader previously served an **empty
+  module** for any `import` / `import()` whose URL was missing from the
+  supervisor's prefetch set (`unwrap_or_default()`). An empty module satisfies the
+  *load* but then fails V8 *linking* with a phantom
+  `SyntaxError: … does not provide an export named 'x'`, aborting hydration far
+  from the real cause and blaming the page's own code. Draco's static prefetch
+  scanner cannot always discover every chunk URL — *minified* static imports
+  (`import{x}from"../chunks/HASH.js"`, zero spaces) and Vite's runtime dep-map are
+  common misses — so this fired constantly on real apps. The loader now:
+  1. serves prefetched subresources (the common path);
+  2. on a miss, fetches the chunk **on demand** through the same supervisor loader
+     `op_raze_load_script` already uses (`draco-net`), caching it back; and
+  3. only if a module is genuinely unreachable, **rejects that import with a real
+     load error** — a browser rejects a 404'd chunk the same way, and sibling
+     scripts plus already-scheduled fetches still surface.
+  Module loads now resolve via `ModuleLoadResponse::Async`, so the graph is pulled
+  and registered on the event loop rather than compiled synchronously inside V8's
+  dynamic-import host callback. Verified against the real chaser.sh chunk graph
+  (56 chunks): with the `chunks/` directory withheld from the prefetch map — the
+  exact field state — hydration now recovers every chunk on demand and captures
+  the endpoint, where before it produced the phantom export error and 0 endpoints.
+- **Backfill DOM element constructors happy-dom omits.** Frameworks reference DOM
+  constructors as **bare globals** in `instanceof` / `typeof` guards; a bare
+  reference to an undefined identifier is a `ReferenceError` (not `undefined`), so
+  one missing constructor in a hot path aborts the surrounding code. happy-dom
+  ships 69 `SVG*Element` classes but not `SVGAElement` (SVG `<a>`); SvelteKit's
+  link router runs `el instanceof SVGAElement ? el.href.baseVal : el.href` during
+  hydration and threw `SVGAElement is not defined`, killing navigation wiring
+  (seen on chaser.sh even once all chunks were available). The glue now backfills
+  such missing constructors as subclasses of the nearest base happy-dom *does*
+  provide, so the guard evaluates (to `false` for the common HTML element) instead
+  of throwing. Same class of fix as the 0.13.5 Performance API and 0.13.7
+  window/self shims. Never clobbers a constructor happy-dom already exposes.
+
+## [0.13.7] — 2026-07-06
+
+### Fixed
+- **Unify `window === self === globalThis === top === parent === frames`** in the
+  Tier 2 isolate. The glue pointed the page-facing `window` at happy-dom's Window
+  *instance* while `self`/`globalThis` stayed the V8 global, so `window !== self`.
+  Any library that writes one global alias and reads another broke — Next.js is the
+  canonical victim: it writes `window.__NEXT_DATA__` (client/index.js) but the
+  Router reads `self.__NEXT_DATA__.gssp` (router.js) → `undefined` → throw,
+  aborting hydration before any data fetch (bluff.com and any Next.js pages-router
+  SPA hydrated to 0 endpoints). All aliases now point at the one V8 global, matching
+  the browser top-level contract; the DOM stays coherent because the DOM globals are
+  mirrored onto it and happy-dom references its own window via a private Symbol.
+
+## [0.13.6] — 2026-07-06
+
+### Fixed
+- **Tier 2 latency budgets + honest trace attribution.** `prefetch_scripts` fetched
+  up to 64 chunk candidates **sequentially** (30 s timeout each) inside the
+  `runtime.capture` timer, so a slow/hung subresource could blow the 2.5 s discover
+  cap to tens of seconds while attributing the time to the wrong stage. Prefetch is
+  now parallel with bounded concurrency, a wall-clock budget, and a per-fetch
+  timeout, surfaced as a `runtime.prefetch` trace step; a per-job dynamic
+  script-load budget bounds on-demand chunk loading too. New tunables:
+  `PREFETCH_CONCURRENCY`, `PREFETCH_WALL_BUDGET_MS`, `SUBRESOURCE_FETCH_TIMEOUT_MS`,
+  `DYNAMIC_LOAD_BUDGET_MS`.
+
+### Added
+- **`--runtime-log` diagnostics.** Glue-swallowed exceptions/rejections,
+  `console.error`/`console.warn`, and page-script throws are collected (count- and
+  length-bounded) and surfaced as `runtime.log` trace steps on `scrape`/`discover`,
+  with daemon `runtimeLog` field and MCP parity — so a page that fails to hydrate
+  can be self-diagnosed without a browser devtools. (This is the flag that surfaced
+  the 0.13.7 and 0.13.8 root causes.)
+
+### Changed
+- A markdown-only scrape that produced empty markdown now falls back to the JSON
+  envelope instead of printing a blank line.
+
 ## [0.13.5] — 2026-07-06
 
 ### Fixed
