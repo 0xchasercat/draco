@@ -551,7 +551,7 @@ mod prod {
                 capture_window_ms,
                 quiesce_ms: default_quiesce_ms(capture_window_ms),
                 max_intercepts: MAX_INTERCEPTS,
-                stub_response_json: "{}".to_string(),
+                stub_response_json: "[]".to_string(),
             };
             frame::write_supervisor_frame(ipc, &hydrate, html)
                 .map_err(|e| map_frame_err(e, "sending Hydrate"))?;
