@@ -12,9 +12,11 @@
 //! ({ absolute_url -> local_file }). Absent env var => the test no-ops.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use draco_runtime::{run_capture_with_resources_and_loader, CaptureConfig};
+use draco_runtime::{run_capture, CaptureConfig};
+
+mod common;
+use common::fn_fetcher;
 
 #[test]
 fn chaser_sh_real_chunk_graph_does_not_abort() {
@@ -61,8 +63,7 @@ fn chaser_sh_real_chunk_graph_does_not_abort() {
 
     // The supervisor-backed on-demand loader: serves any chunk by URL.
     let map_for_loader = full.clone();
-    let loader: Arc<draco_runtime::ScriptLoader> =
-        Arc::new(move |url: &str| map_for_loader.get(url).cloned());
+    let loader = move |url: &str| map_for_loader.get(url).cloned();
 
     let cfg = CaptureConfig {
         capture_window_ms: 5000,
@@ -71,12 +72,12 @@ fn chaser_sh_real_chunk_graph_does_not_abort() {
         stub_response_json: r#"{"ok":true,"items":[],"data":{}}"#.to_string(),
     };
 
-    let report = run_capture_with_resources_and_loader(
+    // Old resolution order preserved: prefetch map first, then on-demand loader.
+    let report = run_capture(
         "https://chaser.sh/",
         &html,
         &cfg,
-        resources,
-        Some(loader),
+        fn_fetcher(move |url| resources.get(url).cloned().or_else(|| loader(url))),
     );
 
     eprintln!("outcome: {:?}", report.outcome);
