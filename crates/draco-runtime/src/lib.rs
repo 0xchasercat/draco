@@ -907,10 +907,7 @@ fn ensure_v8_flags() {
         // V8 from spawning background compiler/GC threads (JIT runs on the main
         // thread), keeping the jailed child's syscall surface small. argv[0] is
         // ignored by V8.
-        let flags = vec![
-            "draco".to_string(),
-            "--single-threaded".to_string(),
-        ];
+        let flags = vec!["draco".to_string(), "--single-threaded".to_string()];
         let unrecognized = deno_core::v8_set_flags(flags);
         // unrecognized[0] is always argv[0] ("draco"); anything past that is a
         // flag V8 rejected. Report but continue.
