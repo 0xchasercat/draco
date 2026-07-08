@@ -511,6 +511,23 @@ mod prod {
             config: &Config,
             opts: &draco_net::SessionOpts,
         ) -> Result<CaptureResult, DracoError> {
+            // Per-job prewarmer: on-demand chunk fetches (and their static
+            // dependency closures) run concurrently on a small multi-thread
+            // runtime into a shared per-job cache, so the isolate's strictly
+            // serial `LoadScript`s land as warm-cache hits instead of each
+            // paying a fresh round-trip. The runtime is owned here, so it and
+            // any in-flight background warms are torn down when the job ends.
+            let prewarm_rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(crate::prewarm::PREWARM_WORKER_THREADS)
+                .enable_io()
+                .enable_time()
+                .build()
+                .map_err(|e| {
+                    jail_error(JailKind::Protocol, format!("prewarm runtime unavailable: {e}"))
+                })?;
+            let prewarmer =
+                crate::prewarm::Prewarmer::for_job(prewarm_rt.handle().clone(), opts);
+
             let ipc = self.handle.ipc_stream();
 
             // 1. Stream the pre-fetched script subresources (each source rides its
@@ -586,7 +603,7 @@ mod prod {
                         let elapsed_ms = hydrate_sent.elapsed().as_millis() as u64;
                         let within_budget = elapsed_ms < DYNAMIC_LOAD_BUDGET_MS;
                         let (body, fail_reason): (Vec<u8>, Option<String>) = if within_budget {
-                            match fetch_dynamic_script(&url, opts) {
+                            match prewarmer.serve(&url) {
                                 Ok(b) => (b, None),
                                 Err(reason) => (Vec::new(), Some(reason)),
                             }
@@ -912,34 +929,6 @@ mod prod {
     #[cfg(not(target_os = "linux"))]
     fn reap_pid(_pid: i32) {
         // Non-Linux degraded spawn manages child lifetime itself.
-    }
-
-    /// Fetch one on-demand chunk. `Ok(body)` on a 2xx; `Err(reason)` otherwise,
-    /// where `reason` is a short human string (HTTP status, or the network/timeout
-    /// error) the supervisor surfaces as a `runtime.log` line. Returning the
-    /// reason — rather than collapsing every failure to `None` — is what lets a
-    /// missing-chunk hydration stall explain itself under `--runtime-log`.
-    fn fetch_dynamic_script(url: &str, opts: &draco_net::SessionOpts) -> Result<Vec<u8>, String> {
-        // Subresource posture: per-fetch timeout clamped, politeness delay
-        // dropped (see `subresource_opts`) — a hung chunk CDN must fail fast,
-        // not pin the capture for the session's full page-fetch timeout.
-        let opts = super::subresource_opts(opts);
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .enable_io()
-            .build()
-            .map_err(|e| format!("subresource runtime unavailable: {e}"))?;
-        let resp = rt
-            .block_on(draco_net::fetch_target(url, &opts))
-            .map_err(|e| format!("fetch error: {e:?}"))?;
-        let status = resp.meta.status;
-        if (200..300).contains(&status) {
-            Ok(resp.body.to_vec())
-        } else {
-            // 403 → challenge/bot-wall (Cloudflare et al.); 404 → wrong URL or a
-            // chunk the CDN moved; others as-is.
-            Err(format!("HTTP {status}"))
-        }
     }
 
     /// Map a frame-codec error to the most specific [`DracoError::Jail`].

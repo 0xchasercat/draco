@@ -43,6 +43,9 @@ mod testutil;
 /// tier2" and finalizes `Unsupported`.
 mod tier2;
 
+#[cfg(feature = "tier2")]
+mod prewarm;
+
 // ---- Public API -----------------------------------------------------------
 
 pub use challenge::{detect_challenge, ChallengeKind};
