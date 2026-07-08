@@ -229,9 +229,13 @@ impl ChunkCache {
         let mut inner = self.lock_ram();
         inner.tick = inner.tick.wrapping_add(1);
         let now = inner.tick;
-        let previous = inner
-            .map
-            .insert(url.to_owned(), RamEntry { bytes, last_used: now });
+        let previous = inner.map.insert(
+            url.to_owned(),
+            RamEntry {
+                bytes,
+                last_used: now,
+            },
+        );
         if let Some(old) = previous {
             inner.total_bytes = inner.total_bytes.saturating_sub(old.bytes.len());
         }
@@ -315,7 +319,9 @@ impl ChunkCache {
         }
         // Size of any record we are about to replace, so the approximate
         // byte counter stays roughly honest across overwrites.
-        let replaced = fs::metadata(&final_path).map(|meta| meta.len()).unwrap_or(0);
+        let replaced = fs::metadata(&final_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
         if fs::rename(&tmp_path, &final_path).is_err() {
             // (E.g. on Windows, renaming onto an existing file can fail. The
             // existing record is for the same immutable URL, so losing this
@@ -616,8 +622,14 @@ mod tests {
                 }
             }
         }
-        assert_eq!(file_count, 3, "exactly two records should have been evicted");
-        assert!(total_bytes <= 10_000, "disk usage {total_bytes} exceeds cap");
+        assert_eq!(
+            file_count, 3,
+            "exactly two records should have been evicted"
+        );
+        assert!(
+            total_bytes <= 10_000,
+            "disk usage {total_bytes} exceeds cap"
+        );
 
         // Written after the eviction pass, so it must survive unconditionally.
         assert_eq!(cache.get("u4").as_deref(), Some(&chunk[..]));

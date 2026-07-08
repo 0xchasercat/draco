@@ -552,9 +552,10 @@ mod prod {
             // released on drop. The semaphore is never closed, so `acquire_owned`
             // only errors in impossible conditions — treat as a spawn error, don't
             // panic.
-            let _permit = self.permits.clone().acquire_owned().await.map_err(|e| {
-                jail_error(JailKind::Spawn, format!("pool semaphore closed: {e}"))
-            })?;
+            let _permit =
+                self.permits.clone().acquire_owned().await.map_err(|e| {
+                    jail_error(JailKind::Spawn, format!("pool semaphore closed: {e}"))
+                })?;
             ProdTier2Capture.capture(url, html, config, opts).await
         }
     }
