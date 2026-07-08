@@ -318,7 +318,8 @@ mod tests {
     fn harness(mock: Arc<MockFetch>, max_files: usize) -> (tokio::runtime::Runtime, Prewarmer) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(PREWARM_WORKER_THREADS)
-            .enable_io().enable_time()
+            .enable_io()
+            .enable_time()
             .build()
             .unwrap();
         let pw = Prewarmer::build(rt.handle().clone(), mock, max_files, MAX_TOTAL_BYTES);
@@ -371,7 +372,11 @@ mod tests {
 
         pw.serve(ROOT).unwrap();
         std::thread::sleep(Duration::from_millis(400));
-        assert_eq!(mock.call_count(C), 1, "shared leaf fetched once, not per-parent");
+        assert_eq!(
+            mock.call_count(C),
+            1,
+            "shared leaf fetched once, not per-parent"
+        );
     }
 
     /// Warming a fan-out closure overlaps fetches — proof the walk is concurrent,
@@ -435,10 +440,7 @@ mod tests {
     #[test]
     fn serve_after_warm_is_a_cache_hit() {
         let mock = MockFetch::make(
-            &[
-                (ROOT, "import \"./a.js\";"),
-                (A, "export const a = 1;"),
-            ],
+            &[(ROOT, "import \"./a.js\";"), (A, "export const a = 1;")],
             20,
         );
         let (_rt, pw) = harness(mock.clone(), MAX_FILES);
