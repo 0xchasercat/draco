@@ -418,7 +418,7 @@
     // (`runtime.log` trace steps) without a browser devtools.
     try { ops.op_raze_log("[" + kind + "] " + (e && (e.stack || e.message) || e)); } catch (_) {}
     if (swallowed++ >= 5) return;
-    try { Deno.core.print("[glue] swallowed " + kind + ": " + (e && e.stack || e) + "\n"); } catch (_) {}
+    try { Deno.core.print("[glue] swallowed " + kind + ": " + (e && e.stack || e) + "\n", true); } catch (_) {}
   };
   try {
     if (Deno.core.setUnhandledPromiseRejectionHandler) {

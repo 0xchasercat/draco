@@ -555,7 +555,7 @@ mod prod {
             };
             frame::write_supervisor_frame(ipc, &hydrate, html)
                 .map_err(|e| map_frame_err(e, "sending Hydrate"))?;
-            let hydrate_sent = std::time::Instant::now();
+            let mut hydrate_sent = std::time::Instant::now();
 
             // 3. Collect Intercept frames until the terminal Result. On the FIRST
             //    job the child's boot-time sandbox-level Log is still queued ahead
@@ -602,6 +602,10 @@ mod prod {
                         // wall budget: past it, answer "missing" immediately
                         // rather than fetching — hydration degrades exactly like
                         // a missing chunk instead of pinning the job open.
+                        //
+                        // The budget resets after each successful load so that
+                        // scripts evaluated early in the page don't consume the
+                        // entire window before later dynamic imports fire.
                         let elapsed_ms = hydrate_sent.elapsed().as_millis() as u64;
                         let within_budget = elapsed_ms < DYNAMIC_LOAD_BUDGET_MS;
                         let (body, fail_reason): (Vec<u8>, Option<String>) = if within_budget {
@@ -619,6 +623,12 @@ mod prod {
                             )
                         };
                         let ok = !body.is_empty();
+                        // Reset the budget timer on success so the next chunk
+                        // gets a fresh window. Failed loads keep the old timer
+                        // so repeated failures for the same chunk don't infinite-loop.
+                        if ok {
+                            hydrate_sent = std::time::Instant::now();
+                        }
                         // A failed on-demand chunk fetch is the difference between
                         // a hydrated SPA and 0 endpoints, and the child only sees a
                         // bare "missing" (its module loader rejects the import). So
