@@ -39,7 +39,7 @@ mod seccomp;
 // rlimits
 // ---------------------------------------------------------------------------
 
-/// Address-space cap for the child. A jitless V8 isolate reserves large *virtual*
+/// Address-space cap for the child. A V8 isolate reserves large *virtual*
 /// regions for its managed heap/cage and the snapshot-restored DOM runtime even
 /// though resident memory stays small, so `RLIMIT_AS` must be generous or `mmap`
 /// reservations fail at boot. 64 GiB fits current deno_core/V8 Oilpan cage
@@ -390,8 +390,9 @@ fn report_fatal(err: &JailError) {
 // For an *allowed* syscall the parent asserts the child was NOT SIGSYS-killed.
 //
 // The default policy is the **denylist**: `KILL_PROCESS` only a curated breakout
-// set, everything else `Allow`. So `execve`/`connect`/`ptrace`/`mprotect(EXEC)`
-// are killed, while `openat` and `clone`/`fork` are ALLOWED — the filesystem is
+// set, everything else `Allow`. So `execve`/`connect`/`ptrace` are killed
+// (`mprotect(EXEC)` is now ALLOWED — V8's JIT needs executable code pages),
+// while `openat` and `clone`/`fork` are ALLOWED — the filesystem is
 // denied by **Landlock**, not seccomp, and thread creation must work for V8/tokio.
 // The strict allowlist model (opt-in) is exercised by its own tests below.
 //
@@ -532,38 +533,11 @@ mod redteam {
 
     #[test]
     #[ignore = "needs bare-metal kernel honouring seccomp KILL_PROCESS"]
-    fn mprotect_exec_is_killed_but_rw_is_allowed_under_denylist() {
-        // PROT_EXEC set -> killed (W^X / JIT-spray guard).
+    fn mprotect_exec_is_allowed_under_denylist_for_jit() {
+        // JIT enabled: mprotect(PROT_EXEC) must be ALLOWED (child exits ALLOWED_OK,
+        // not SIGSYS) so V8 can map executable code. W^X is not the containment.
         fn exec_body() -> ! {
-            // SAFETY: mmap a page then flip it to RX; the filter kills on the
-            // PROT_EXEC arg. All raw, async-signal-safe syscalls.
-            unsafe {
-                let len = 4096usize;
-                let p = libc::mmap(
-                    std::ptr::null_mut(),
-                    len,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                );
-                if p == libc::MAP_FAILED {
-                    libc::_exit(9);
-                }
-                libc::syscall(
-                    libc::SYS_mprotect,
-                    p as usize,
-                    len,
-                    (libc::PROT_READ | libc::PROT_EXEC) as usize,
-                );
-                libc::_exit(NOT_KILLED);
-            }
-        }
-        assert_killed_by_sigsys(run_under(Model::Denylist, exec_body));
-
-        // PROT_EXEC clear -> allowed (child exits 0, not SIGSYS).
-        fn noexec_body() -> ! {
-            // SAFETY: as above but the mprotect keeps PROT_EXEC clear.
+            // SAFETY: mmap a page then flip it to RX; raw async-signal-safe syscalls.
             unsafe {
                 let len = 4096usize;
                 let p = libc::mmap(
@@ -581,14 +555,14 @@ mod redteam {
                     libc::SYS_mprotect,
                     p as usize,
                     len,
-                    libc::PROT_READ as usize,
+                    (libc::PROT_READ | libc::PROT_EXEC) as usize,
                 );
                 libc::_exit(if rc == 0 { ALLOWED_OK } else { 8 });
             }
         }
-        match run_under(Model::Denylist, noexec_body) {
+        match run_under(Model::Denylist, exec_body) {
             WaitStatus::Exited(_, ALLOWED_OK) => {}
-            other => panic!("PROT_EXEC-clear mprotect should be allowed, got {other:?}"),
+            other => panic!("PROT_EXEC mprotect should be allowed for JIT, got {other:?}"),
         }
     }
 

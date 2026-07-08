@@ -28,14 +28,17 @@
 //!   heap + compiled code only — ops are registered per-isolate and resolved
 //!   lazily by the baked JS (`Deno.core.ops.op_*`) after restore.
 //!
-//! * **`--jitless`.** We pass `--jitless` and `--single-threaded` via
-//!   `deno_core::v8_set_flags` *before* the first isolate is created. `--jitless`
-//!   disables the JIT (no RWX pages) so the jail's seccomp policy can forbid
-//!   executable memory; `--single-threaded` avoids V8 background threads. Both
-//!   reduce the jail's syscall surface. Measured cost is negligible: the isolate's
-//!   work is snapshot restore + DOM construction, not hot JIT-tier loops, so JIT
-//!   buys nothing here — we keep the W^X lockdown. Flags V8 rejects are reported
-//!   and skipped (best-effort).
+//! * **JIT enabled; `--single-threaded`.** We pass `--single-threaded` via
+//!   `deno_core::v8_set_flags` *before* the first isolate is created; V8's JIT is
+//!   left ON. Real SPA hydration is hot JS (React/SvelteKit reconcilers, not just
+//!   snapshot restore + DOM construction), and `--jitless` ran it 3–10× slower —
+//!   slow enough to blow the capture/on-demand budgets and fail to extract
+//!   content. Containment does not rest on W^X: page JS has no host-capability
+//!   bindings (no I/O regardless of JIT), and on Linux the jail's seccomp still
+//!   kills the network/exec/ptrace breakout set while Landlock locks the FS.
+//!   `--single-threaded` keeps V8 from spawning background compiler/GC threads
+//!   (JIT still runs synchronously on the main thread). Flags V8 rejects are
+//!   reported and skipped (best-effort).
 //!
 //! * **Timers / event-loop driver.** deno_core 0.406.0's only timer reactor is
 //!   tokio-based (`tokio::time::sleep_until`), so the event loop must run under a
@@ -897,15 +900,15 @@ static V8_FLAGS: Once = Once::new();
 /// not understand are reported and ignored (we do not abort).
 fn ensure_v8_flags() {
     V8_FLAGS.call_once(|| {
-        // `--jitless` keeps V8 from allocating RWX pages / using the JIT, which
-        // is what makes it compatible with the jail's future seccomp policy.
-        // `--single-threaded` avoids V8 background compiler/GC threads (also a
-        // seccomp win). The leading argv[0] is ignored by V8.
-        // `--jitless` already disables the WASM/JIT tiers, so we don't add a
-        // separate wasm flag (V8 rejects `--no-expose-wasm` in this build).
+        // JIT is ON (see module docs): SPA hydration is hot JS and `--jitless`
+        // ran it 3–10× slower — slow enough to blow the capture/on-demand
+        // budgets and fail to extract content. Containment is the infra layer +
+        // an isolate with no host bindings, not W^X. `--single-threaded` keeps
+        // V8 from spawning background compiler/GC threads (JIT runs on the main
+        // thread), keeping the jailed child's syscall surface small. argv[0] is
+        // ignored by V8.
         let flags = vec![
             "draco".to_string(),
-            "--jitless".to_string(),
             "--single-threaded".to_string(),
         ];
         let unrecognized = deno_core::v8_set_flags(flags);
