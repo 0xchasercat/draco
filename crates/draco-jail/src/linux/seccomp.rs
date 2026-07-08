@@ -10,7 +10,7 @@
 //!   it, and it needs **zero per-host tuning**. This is the real, cross-platform
 //!   default containment layer for Tier 2 on Linux.
 //! * **Strict allowlist (opt-in).** The historical maximalist filter: default
-//!   action `KillProcess`, allowing only the exact syscall set that a jitless V8
+//!   action `KillProcess`, allowing only the exact syscall set that a V8
 //!   heap and a current-thread tokio time driver need (see
 //!   [`strict_runtime_program`]). Selected by `Config::strict_sandbox` /
 //!   `--strict-sandbox`. It is the tightest possible policy but, being
@@ -25,9 +25,10 @@
 //! now rests on the filter itself, not on the network namespace. It also kills
 //! `execve`/`execveat` (no new program image), `ptrace`/`process_vm_*` (no
 //! cross-process memory access), the module/kexec/`bpf`/keyring/`reboot` families,
-//! namespace-escape calls (`setns`/`unshare`/`pivot_root`/`chroot`/`mount`), and
-//! `mprotect`/`pkey_mprotect` **when `PROT_EXEC` is set** (W^X / JIT-spray guard,
-//! safe under V8 `--jitless`). It deliberately does **not** touch `clone`/`fork`/
+//! and namespace-escape calls (`setns`/`unshare`/`pivot_root`/`chroot`/`mount`).
+//! It deliberately does **not** touch `mprotect`/`pkey_mprotect` — V8's JIT needs
+//! executable code pages, and W^X is not our containment (the killed socket/exec
+//! set + Landlock is) — nor `clone`/`fork`/
 //! `clone3` (V8/tokio/libc may spawn threads; a cloned task can exec nothing
 //! because `execve` is killed and inherits this same filter) or `open`/`openat`
 //! (the filesystem is covered by Landlock, not seccomp — killing file-opens is
@@ -48,8 +49,7 @@
 use std::collections::BTreeMap;
 
 use seccompiler::{
-    apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
-    SeccompFilter, SeccompRule, TargetArch,
+    apply_filter, BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch,
 };
 
 /// Error type for filter construction/installation.
@@ -87,32 +87,11 @@ fn rule_any(map: &mut BTreeMap<i64, Rules>, sys: libc::c_long) {
 // Denylist model (default) — default Allow, KILL a curated breakout set.
 // ===========================================================================
 
-/// Add the conditional `PROT_EXEC` kill rule for a memory-protection syscall:
-/// **kill only when** the `prot` argument (arg index 2) has `PROT_EXEC` set. A
-/// request with `PROT_EXEC` clear falls through to the filter's default `Allow`,
-/// so ordinary RW mappings work while an attempt to make memory executable
-/// (JIT-spray / W^X violation) is killed. Safe under V8 `--jitless`, which never
-/// needs an executable mapping.
-fn kill_prot_exec(map: &mut BTreeMap<i64, Rules>, sys: libc::c_long) -> Result<(), SeccompError> {
-    // (arg2 & PROT_EXEC) != 0  <=>  MaskedEq(PROT_EXEC) against value PROT_EXEC.
-    let cond = SeccompCondition::new(
-        2,
-        SeccompCmpArgLen::Qword,
-        SeccompCmpOp::MaskedEq(libc::PROT_EXEC as u64),
-        libc::PROT_EXEC as u64,
-    )?;
-    let rule = SeccompRule::new(vec![cond])?;
-    map.insert(nr(sys), vec![rule]);
-    Ok(())
-}
-
 /// Build the denylist kill-map: the curated set of breakout syscalls that are
 /// `KILL_PROCESS`ed while everything else is allowed. See the module docs for the
 /// rationale of each group and for what is deliberately **not** here
-/// (`clone`/`fork`, `open`/`openat`).
-///
-/// `mprotect`/`pkey_mprotect` are added by [`kill_prot_exec`] (conditional on
-/// `PROT_EXEC`), not here, so RW mappings still work.
+/// (`clone`/`fork`, `open`/`openat`, and `mprotect`/`pkey_mprotect` — V8's JIT
+/// needs executable code pages).
 fn denylist_map() -> Result<BTreeMap<i64, Rules>, SeccompError> {
     let mut map: BTreeMap<i64, Rules> = BTreeMap::new();
 
@@ -177,9 +156,10 @@ fn denylist_map() -> Result<BTreeMap<i64, Rules>, SeccompError> {
     rule_any(&mut map, libc::SYS_setresuid);
     rule_any(&mut map, libc::SYS_setresgid);
 
-    // --- W^X: kill mprotect/pkey_mprotect only when PROT_EXEC is requested. ---
-    kill_prot_exec(&mut map, libc::SYS_mprotect)?;
-    kill_prot_exec(&mut map, libc::SYS_pkey_mprotect)?;
+    // mprotect/pkey_mprotect are intentionally NOT killed: V8's JIT must map
+    // executable code pages. Containment is the killed socket/connect (network
+    // air-gap) + no execve/ptrace + Landlock FS lockdown; W^X added nothing given
+    // page JS has no host bindings, and forbidding it only broke JIT.
 
     Ok(map)
 }
@@ -223,7 +203,7 @@ fn allow_any(map: &mut BTreeMap<i64, Rules>, sys: libc::c_long) {
 }
 
 /// Build the shared core of *allowed* syscalls used by both strict phases:
-/// everything a jitless, single-threaded V8 isolate + a current-thread tokio time
+/// everything a single-threaded V8 isolate + a current-thread tokio time
 /// driver need to speak IPC over fd 3, manage the V8 heap, keep time, and exit.
 ///
 /// ## Bare-metal validation (strict mode only)
@@ -233,7 +213,8 @@ fn allow_any(map: &mut BTreeMap<i64, Rules>, sys: libc::c_long) {
 /// observe any `SIGSYS` (`dmesg`/`SECCOMP` audit shows the offending syscall nr),
 /// add exactly that syscall, and repeat until a real page hydrates cleanly. The
 /// deliberately-omitted breakout syscalls (`socket`/`connect`, `execve`,
-/// `ptrace`, `mprotect` with `PROT_EXEC`, …) must stay omitted. The **denylist**
+/// `ptrace`, …) must stay omitted (`mprotect` with `PROT_EXEC` is now allowed for
+/// V8's JIT). The **denylist**
 /// default needs none of this — prefer it unless you specifically want the
 /// tightest surface.
 fn strict_core_allow() -> BTreeMap<i64, Rules> {
@@ -307,20 +288,13 @@ fn strict_core_allow() -> BTreeMap<i64, Rules> {
     map
 }
 
-/// Add the conditional `mprotect` **allow** rule for strict mode: allow only when
-/// the `prot` argument (arg index 2) has `PROT_EXEC` clear. A request that sets
-/// `PROT_EXEC` falls through to the default `KillProcess`, enforcing W^X.
-fn add_mprotect_no_exec(map: &mut BTreeMap<i64, Rules>) -> Result<(), SeccompError> {
-    // (arg2 & PROT_EXEC) == 0  <=>  MaskedEq(PROT_EXEC) against value 0.
-    let cond = SeccompCondition::new(
-        2,
-        SeccompCmpArgLen::Qword,
-        SeccompCmpOp::MaskedEq(libc::PROT_EXEC as u64),
-        0,
-    )?;
-    let rule = SeccompRule::new(vec![cond])?;
-    map.insert(nr(libc::SYS_mprotect), vec![rule]);
-    Ok(())
+/// Allow `mprotect`/`pkey_mprotect` unconditionally (including `PROT_EXEC`) so
+/// V8's JIT can map executable code pages. W^X is not the containment — the strict
+/// allowlist still omits `socket`/`connect`/`execve`/`ptrace`/… and Landlock locks
+/// the FS — so permitting executable memory does not widen the reachable surface.
+fn add_mprotect_jittable(map: &mut BTreeMap<i64, Rules>) {
+    allow_any(map, libc::SYS_mprotect);
+    allow_any(map, libc::SYS_pkey_mprotect);
 }
 
 /// Compile an allowlist rule map into an installable BPF program: default
@@ -339,7 +313,7 @@ fn compile_allowlist(rules: BTreeMap<i64, Rules>) -> Result<BpfProgram, SeccompE
 /// core allow + the setup-only syscalls, dropped in phase 2).
 fn strict_bootstrap_program() -> Result<BpfProgram, SeccompError> {
     let mut map = strict_core_allow();
-    add_mprotect_no_exec(&mut map)?;
+    add_mprotect_jittable(&mut map);
 
     // Setup-only extras, dropped in phase 2 so the armed payload cannot use them.
     allow_any(&mut map, libc::SYS_openat);
@@ -353,11 +327,11 @@ fn strict_bootstrap_program() -> Result<BpfProgram, SeccompError> {
 
 /// Build (but do not install) the strict phase-2 runtime program — the tight
 /// filter the jailed payload runs under. NO open/openat, NO socket/connect, NO
-/// clone/fork/execve, NO prctl/seccomp, NO ptrace; `mprotect` only with
-/// `PROT_EXEC` clear.
+/// clone/fork/execve, NO prctl/seccomp, NO ptrace; `mprotect`/`pkey_mprotect`
+/// allowed (incl. `PROT_EXEC`) so V8's JIT can map executable code.
 pub fn strict_runtime_program() -> Result<BpfProgram, SeccompError> {
     let mut map = strict_core_allow();
-    add_mprotect_no_exec(&mut map)?;
+    add_mprotect_jittable(&mut map);
     compile_allowlist(map)
 }
 
@@ -494,21 +468,18 @@ mod tests {
     }
 
     #[test]
-    fn denylist_mprotect_is_conditional_on_prot_exec() {
-        // mprotect/pkey_mprotect appear in the kill-map but only via a rule that
-        // matches PROT_EXEC — a plain RW mprotect falls through to Allow.
+    fn denylist_allows_executable_mprotect_for_jit() {
+        // JIT is enabled: mprotect/pkey_mprotect must NOT be in the kill-map, so V8
+        // can map executable code. Containment is the killed socket/exec set +
+        // Landlock, not W^X.
         let map = denylist_map().expect("denylist map builds");
-        let m = map.get(&nr(libc::SYS_mprotect)).expect("mprotect present");
         assert!(
-            !m.is_empty(),
-            "mprotect kill must be conditional on PROT_EXEC, not unconditional"
+            !map.contains_key(&nr(libc::SYS_mprotect)),
+            "denylist must not kill mprotect (V8 JIT needs executable pages)"
         );
-        let pk = map
-            .get(&nr(libc::SYS_pkey_mprotect))
-            .expect("pkey_mprotect present");
         assert!(
-            !pk.is_empty(),
-            "pkey_mprotect kill must be conditional on PROT_EXEC"
+            !map.contains_key(&nr(libc::SYS_pkey_mprotect)),
+            "denylist must not kill pkey_mprotect"
         );
     }
 
@@ -535,7 +506,7 @@ mod tests {
         // bootstrap (bootstrap is a superset), plus the setup-only syscalls.
         let boot = {
             let mut m = strict_core_allow();
-            add_mprotect_no_exec(&mut m).unwrap();
+            add_mprotect_jittable(&mut m);
             allow_any(&mut m, libc::SYS_openat);
             #[cfg(target_arch = "x86_64")]
             allow_any(&mut m, libc::SYS_open);
@@ -545,7 +516,7 @@ mod tests {
         };
         let run = {
             let mut m = strict_core_allow();
-            add_mprotect_no_exec(&mut m).unwrap();
+            add_mprotect_jittable(&mut m);
             m
         };
         for key in run.keys() {
@@ -561,7 +532,7 @@ mod tests {
     #[test]
     fn strict_dangerous_syscalls_are_never_allowed_at_runtime() {
         let mut m = strict_core_allow();
-        add_mprotect_no_exec(&mut m).unwrap();
+        add_mprotect_jittable(&mut m);
         // These must fall through to the default KillProcess.
         assert!(!m.contains_key(&nr(libc::SYS_connect)));
         assert!(!m.contains_key(&nr(libc::SYS_socket)));
@@ -577,19 +548,22 @@ mod tests {
     }
 
     #[test]
-    fn strict_mprotect_rule_is_conditional_not_unconditional() {
+    fn strict_allows_executable_mprotect_for_jit() {
         let mut m = strict_core_allow();
-        add_mprotect_no_exec(&mut m).unwrap();
-        let rules = m.get(&nr(libc::SYS_mprotect)).expect("mprotect present");
+        add_mprotect_jittable(&mut m);
         assert!(
-            !rules.is_empty(),
-            "mprotect must be conditional (PROT_EXEC clear), not an unconditional allow"
+            m.contains_key(&nr(libc::SYS_mprotect)),
+            "strict mode must allow mprotect (incl. PROT_EXEC) for V8 JIT"
+        );
+        assert!(
+            m.contains_key(&nr(libc::SYS_pkey_mprotect)),
+            "strict mode must allow pkey_mprotect for V8 JIT"
         );
     }
 
     #[test]
     fn strict_v8_and_tokio_syscalls_are_allowed_at_runtime() {
-        // A jitless V8 heap + GC and a tokio time driver need these; if any
+        // A V8 heap + GC and a tokio time driver need these; if any
         // regress out of the allowlist the jailed isolate would SIGSYS on metal.
         let m = strict_core_allow();
         for (name, nr_val) in [
@@ -629,8 +603,8 @@ mod tests {
 
     #[test]
     fn strict_mprotect_is_present_but_not_in_the_plain_core_map() {
-        // The plain core map must NOT unconditionally allow mprotect; only the
-        // PROT_EXEC-clear conditional (added by add_mprotect_no_exec) may.
+        // The plain core map must NOT allow mprotect on its own; only
+        // add_mprotect_jittable adds it.
         let core = strict_core_allow();
         assert!(
             !core.contains_key(&nr(libc::SYS_mprotect)),
