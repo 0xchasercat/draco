@@ -50,8 +50,9 @@ url = "2"
 async-trait = "0.1"
 # tier2-only: the production capture seam offloads the blocking jail spawn + IPC
 # onto `tokio::task::spawn_blocking`. Optional + tier2-gated so the lean build
-# does not require a tokio dependency here.
-tokio = { workspace = true, optional = true }
+# does not require a tokio dependency here. `sync` adds `OnceCell`, used by the
+# on-demand chunk prewarmer to dedup + share concurrent per-URL fetches.
+tokio = { workspace = true, optional = true, features = ["sync"] }
 # tier2-only: extract `<script src>` from the page HTML (regex) and ES-module
 # import specifiers from fetched JS (Oxc parse-once AST) so the supervisor can
 # pre-fetch the script subresources for the isolate.

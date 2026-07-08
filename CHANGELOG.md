@@ -3,7 +3,25 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
-## [Unreleased]
+## [0.13.14] — 2026-07-08
+
+### Fixed
+- **On-demand chunk loading no longer pays N sequential round-trips.** When a
+  Tier 2 SPA pulls a code-split chunk the up-front prefetch didn't cover, the
+  isolate requests it over a synchronous `LoadScript` IPC frame that the
+  supervisor services one at a time (the isolate's `op_raze_load_script` is a
+  blocking op on the single V8 thread) — so a page needing *N* on-demand chunks
+  paid *N* back-to-back ~250 ms fetches. A browser doesn't: its network stack is
+  async, so `import()`s fan out concurrently. A new per-job **prewarmer**
+  (`draco-core` `prewarm.rs`) restores that without letting the air-gapped
+  isolate touch the network: when a requested chunk lands, its dependency
+  closure — static ES-module imports plus webpack/Next chunk-loader candidates
+  parsed from its body — is fetched **concurrently in the background** into a
+  per-job cache on a small multi-thread runtime, so the child's next
+  `LoadScript` resolves from the warm cache in ~0 ms. Fetches carry the job's
+  shared cookie jar (v0.13.13), so Cloudflare's `__cf_bm` is reused. Best-effort
+  and bounded (file-count + total-byte caps, the cache doubling as the visited
+  set); a cold miss falls back to a direct fetch — never worse than before.
 
 ### Added
 - `scripts/gate.sh` — the sandbox-safe way to run the CI gates. It refuses to
