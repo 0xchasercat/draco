@@ -37,6 +37,54 @@
     } catch (_) {}
   };
 
+  // --- DOMException (subclassable; bare deno_core V8 lacks it) --------------
+  // fake-indexeddb's IDB error classes `extends DOMException` at class-definition
+  // (snapshot-eval) time and construct `new DOMException(message, name)` at
+  // runtime, so this must be a real, subclassable class — not an object stub.
+  try {
+    if (typeof g.DOMException === "undefined") {
+      const CODES = {
+        IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
+        InvalidCharacterError: 5, NoModificationAllowedError: 7, NotFoundError: 8,
+        NotSupportedError: 9, InUseAttributeError: 10, InvalidStateError: 11,
+        SyntaxError: 12, InvalidModificationError: 13, NamespaceError: 14,
+        InvalidAccessError: 15, SecurityError: 18, NetworkError: 19,
+        AbortError: 20, URLMismatchError: 21, QuotaExceededError: 22,
+        TimeoutError: 23, InvalidNodeTypeError: 24, DataCloneError: 25,
+      };
+      class DOMException extends Error {
+        constructor(message = "", name = "Error") {
+          super(message);
+          Object.defineProperty(this, "name", {
+            value: name,
+            writable: true,
+            configurable: true,
+          });
+          Object.defineProperty(this, "code", {
+            value: CODES[name] || 0,
+            writable: true,
+            configurable: true,
+          });
+        }
+      }
+      def("DOMException", DOMException);
+    }
+  } catch (_) {}
+
+  // --- setImmediate / clearImmediate (Node-ism a few libs reach for) -------
+  // Defining it short-circuits fake-indexeddb's scheduler chain to a safe path
+  // (it otherwise probes a `new Function("return setImmediate")` trick). Backed
+  // by the base's real op_sleep timer at call time.
+  def("setImmediate", function (fn) {
+    const args = Array.prototype.slice.call(arguments, 1);
+    return setTimeout(function () {
+      fn.apply(undefined, args);
+    }, 0);
+  });
+  def("clearImmediate", function (id) {
+    clearTimeout(id);
+  });
+
   // --- Storage: localStorage / sessionStorage (in-memory) ------------------
   try {
     if (typeof g.localStorage === "undefined") {
