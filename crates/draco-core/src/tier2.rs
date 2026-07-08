@@ -523,10 +523,12 @@ mod prod {
                 .enable_time()
                 .build()
                 .map_err(|e| {
-                    jail_error(JailKind::Protocol, format!("prewarm runtime unavailable: {e}"))
+                    jail_error(
+                        JailKind::Protocol,
+                        format!("prewarm runtime unavailable: {e}"),
+                    )
                 })?;
-            let prewarmer =
-                crate::prewarm::Prewarmer::for_job(prewarm_rt.handle().clone(), opts);
+            let prewarmer = crate::prewarm::Prewarmer::for_job(prewarm_rt.handle().clone(), opts);
 
             let ipc = self.handle.ipc_stream();
 
