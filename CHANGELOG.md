@@ -3,6 +3,27 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.13.15] — 2026-07-08
+
+### Changed
+- **JIT enabled — SPA hydration is no longer throttled by an app-layer safety
+  flag.** The Tier 2 V8 isolate ran with `--jitless`. But real SPA hydration is
+  hot JS (React/SvelteKit reconcilers), and jitless ran it 3–10× slower — slow
+  enough that a page's boot exceeded the 4 s on-demand chunk budget, so the
+  chunk it needed was refused, hydration threw, and a scrape burned 4–5 s to
+  return *empty* content (measured: bluff.com 10.3 s→208 chars, thrill.com
+  5.1 s→0 chars). Draco's isolation is solved at the infrastructure layer
+  (stateless, ephemeral, unidirectional workers) and, in-process, by an isolate
+  with **no host-capability bindings** — page JS cannot do I/O regardless of
+  JIT. So JIT is now ON (`--single-threaded` kept, so V8 spawns no background
+  threads; JIT runs synchronously on the main thread).
+- **draco-jail: W^X guard lifted so JIT can map executable code.** The seccomp
+  denylist no longer kills `mprotect`/`pkey_mprotect` with `PROT_EXEC`, and the
+  strict allowlist now permits them. The real containment is unchanged: the
+  network air-gap (killed `socket`/`connect`), no `execve`/`ptrace`, and
+  Landlock FS lockdown all stay. (Strict mode may need the usual bare-metal
+  syscall tuning for JIT; the default denylist needs none.)
+
 ## [0.13.14] — 2026-07-08
 
 ### Fixed
