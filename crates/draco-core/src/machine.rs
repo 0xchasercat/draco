@@ -1335,7 +1335,7 @@ fn html_attr_value(tag: &str, name: &str) -> Option<String> {
 /// often builds `<script src>` URLs from numeric chunk ids plus chunk-name/hash maps
 /// rather than leaving literal module specifiers in the source.
 #[cfg(feature = "tier2")]
-fn extract_chunk_candidates(src: &str) -> Vec<String> {
+pub(crate) fn extract_chunk_candidates(src: &str) -> Vec<String> {
     use std::sync::LazyLock;
     static DIRECT_CHUNK_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r#"["']((?:\./|/)?(?:_next/static/)?chunks/[^"']+?\.js)["']"#).unwrap()
@@ -1427,9 +1427,9 @@ fn looks_like_hash_part(value: &str) -> bool {
 /// then the on-demand path's own budget expired before it could recover it).
 #[cfg(feature = "tier2")]
 #[derive(Default)]
-struct ModuleImports {
-    statik: Vec<String>,
-    dynamic: Vec<String>,
+pub(crate) struct ModuleImports {
+    pub(crate) statik: Vec<String>,
+    pub(crate) dynamic: Vec<String>,
 }
 
 /// Extract ES-module import/export specifiers from JS source via the **Oxc**
@@ -1441,7 +1441,7 @@ struct ModuleImports {
 /// recovers from syntax errors, so a partial/odd bundle still yields whatever
 /// specifiers it could parse.
 #[cfg(feature = "tier2")]
-fn extract_imports(src: &str) -> ModuleImports {
+pub(crate) fn extract_imports(src: &str) -> ModuleImports {
     use oxc_allocator::Allocator;
     use oxc_parser::Parser;
     use oxc_span::SourceType;
