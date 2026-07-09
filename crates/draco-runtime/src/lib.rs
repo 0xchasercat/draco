@@ -304,6 +304,12 @@ struct CaptureState {
     /// page is still pulling code concurrently — the async analogue of the old
     /// blocking loader keeping the single thread busy.
     inflight: Rc<Cell<u32>>,
+    /// Monotonically-increasing count of **content** requests (non-tracker
+    /// `fetch`/XHR). The capture window measures its quiesce streak against THIS
+    /// rather than the raw request count, so analytics/session-replay/ad beacons
+    /// that fire after the content has settled cannot keep the window open. They
+    /// are still recorded (discovery) — they just don't count as progress.
+    content_activity: Rc<Cell<u32>>,
     /// The hydrated DOM serialized after the capture window (via `op_raze_dom`),
     /// for the render-then-Markdown escalation. `None` until serialization runs.
     rendered_html: Option<String>,
@@ -359,6 +365,78 @@ struct RawRequest {
     body: Option<String>,
 }
 
+/// Known third-party analytics / session-replay / ad / tag-manager / bot-detection
+/// hosts that never contribute page **content**. A request to one is still recorded
+/// (so `discover` sees it) and still fetched live (so page hydration behaves
+/// normally), but it does **not** hold the capture window open or reset its quiesce
+/// streak. Without this, a tracker beacon firing seconds after the content settled
+/// pins the window to the hard cap — e.g. target.com's main content lands at ~1.8s
+/// but FullStory (257 KB), DoubleVerify, googlesyndication, Attentive and Medallia
+/// keep firing until ~3.5s, tripling the render time for zero extra content.
+///
+/// Matched as a case-insensitive substring of the request URL's host. Deliberately
+/// conservative: only unambiguous non-content vendors, so a first-party data host is
+/// never misclassified.
+fn is_tracker(url: &str) -> bool {
+    // Host = between "://" and the next '/', '?' or '#'. Falls back to the whole
+    // string (matching still works; we simply didn't isolate the host).
+    let host = url
+        .split_once("://")
+        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(rest))
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    const TRACKERS: &[&str] = &[
+        "fullstory.com",
+        "doubleverify.com",
+        "doubleclick.net",
+        "googlesyndication.com",
+        "google-analytics.com",
+        "googletagmanager.com",
+        "analytics.google.com",
+        "amplitude.com",
+        "segment.io",
+        "segment.com",
+        "attentivemobile.com",
+        "attn.tv",
+        "medallia.com",
+        "intercomcdn.com",
+        "intercom.io",
+        "api-iam.intercom",
+        "px-cloud.net",
+        "perimeterx",
+        "zeronaught.com",
+        "hotjar.com",
+        "hotjar.io",
+        "mixpanel.com",
+        "heapanalytics.com",
+        "sentry.io",
+        "bugsnag.com",
+        "datadoghq.com",
+        "nr-data.net",
+        "newrelic.com",
+        "optimizely.com",
+        "criteo.com",
+        "criteo.net",
+        "taboola.com",
+        "outbrain.com",
+        "connect.facebook.net",
+        "bat.bing.com",
+        "clarity.ms",
+        "onetrust.com",
+        "cookielaw.org",
+        "branch.io",
+        "appsflyer.com",
+        "adjust.com",
+        "quantserve.com",
+        "scorecardresearch.com",
+        "launchdarkly.com",
+        "mouseflow.com",
+        "analytics.tiktok.com",
+        "ads.linkedin.com",
+    ];
+    TRACKERS.iter().any(|t| host.contains(t))
+}
+
 // ===================================================================
 // Ops
 // ===================================================================
@@ -391,7 +469,7 @@ async fn op_raze_fetch(
 
     // Record the request + enforce the cap + snapshot what we need, all under a
     // short borrow that ends before the `.await` (no `Ref` may cross it).
-    let (api_fetcher, inflight, stub_body, api_req) = {
+    let (api_fetcher, inflight, stub_body, api_req, tracker) = {
         let op_state = state.borrow();
         let cap = op_state.borrow::<Rc<RefCell<CaptureState>>>().clone();
         let mut cs = cap.borrow_mut();
@@ -404,6 +482,7 @@ async fn op_raze_fetch(
             "xhr" => InterceptVia::Xhr,
             _ => InterceptVia::Fetch,
         };
+        let tracker = is_tracker(&raw.url);
         let body = raw.body.map(|b| b.into_bytes());
         cs.requests.push(CapturedRequest {
             method: raw.method.clone(),
@@ -412,6 +491,11 @@ async fn op_raze_fetch(
             body: body.clone(),
             via,
         });
+        // A non-tracker request is content progress → advance the quiesce clock.
+        // Trackers are recorded above (discovery) but deliberately do not count.
+        if !tracker {
+            cs.content_activity.set(cs.content_activity.get() + 1);
+        }
         let api_req = ApiRequest {
             method: raw.method,
             url: raw.url,
@@ -423,6 +507,7 @@ async fn op_raze_fetch(
             cs.inflight.clone(),
             cs.stub_body.clone(),
             api_req,
+            tracker,
         )
     };
 
@@ -431,9 +516,16 @@ async fn op_raze_fetch(
     let render_mode = api_fetcher.is_some();
     let live = match api_fetcher {
         Some(f) => {
-            inflight.set(inflight.get() + 1);
+            // A non-tracker fetch holds the capture window open while it's in flight
+            // (content may still be arriving); a tracker is fetched live so the page
+            // behaves normally, but must not pin the window past content-settle.
+            if !tracker {
+                inflight.set(inflight.get() + 1);
+            }
             let r = f.fetch(&api_req).await;
-            inflight.set(inflight.get().saturating_sub(1));
+            if !tracker {
+                inflight.set(inflight.get().saturating_sub(1));
+            }
             r
         }
         None => None,
@@ -774,6 +866,7 @@ async fn run_capture_inner(
         fetcher: fetcher.clone(),
         api_fetcher,
         inflight: inflight.clone(),
+        content_activity: Rc::new(Cell::new(0)),
         rendered_html: None,
         logs: Vec::new(),
         started: Instant::now(),
@@ -1008,8 +1101,12 @@ async fn drive_capture_window(
     // Small tick so we re-check the wall clock even while timers are pending.
     let tick = Duration::from_millis(quiesce_tick_ms(cfg.quiesce_ms));
 
-    // Count at which we last saw activity, to measure the quiesce streak.
-    let mut last_count = cap.borrow().requests.len();
+    // Content-activity count at which we last saw progress, to measure the quiesce
+    // streak. Uses the non-tracker request counter (see `CaptureState`), so tracker
+    // beacons firing after the content settled do not reset the streak and cannot
+    // pin the window open.
+    let content_activity = cap.borrow().content_activity.clone();
+    let mut last_count = content_activity.get();
     let mut last_activity = Instant::now();
     let mut loop_threw = false;
     // Shared in-flight-load counter: while the page is still pulling script/module
@@ -1050,8 +1147,8 @@ async fn drive_capture_window(
             }
         }
 
-        // Refresh activity tracking.
-        let now_count = cap.borrow().requests.len();
+        // Refresh activity tracking (content requests only; trackers excluded).
+        let now_count = content_activity.get();
         if now_count != last_count {
             last_count = now_count;
             last_activity = Instant::now();
@@ -2112,6 +2209,7 @@ mod tests {
             fetcher: null_fetcher(),
             api_fetcher: None,
             inflight: Rc::new(Cell::new(0)),
+            content_activity: Rc::new(Cell::new(0)),
             rendered_html: None,
             logs: Vec::new(),
             started: Instant::now(),
@@ -2127,6 +2225,37 @@ mod tests {
             cs.logs
         );
         assert!(cs.logs[1].contains("animate"), "{:?}", cs.logs);
+    }
+
+    #[test]
+    fn is_tracker_flags_known_vendors_but_not_first_party_content() {
+        // Non-content vendors observed pinning the capture window (the target.com
+        // tail: FullStory, DoubleVerify, googlesyndication, Medallia, Attentive,
+        // PerimeterX/px-cloud, zeronaught, amplitude) must be classified trackers.
+        for u in [
+            "https://edge.fullstory.com/s/settings/o-x/v1/web",
+            "https://pub.doubleverify.com/dvtag/signals/bsc/pub.json",
+            "https://pagead2.googlesyndication.com/pagead/ping?e=1",
+            "https://resources.digital-cloud.medallia.com/wdcus/onsiteData.json",
+            "https://target.attn.tv/unrenderedCreative?v=1",
+            "https://ift.px-cloud.net/ns?c=x",
+            "https://ponos.zeronaught.com/2?a=x",
+            "https://api.eu.amplitude.com/2/httpapi",
+        ] {
+            assert!(is_tracker(u), "should be a tracker: {u}");
+        }
+        // First-party / content endpoints must NEVER be misclassified — these hold
+        // the capture window open until the content has actually rendered.
+        for u in [
+            "https://thrill.com/api/v2/games/providers",
+            "https://games-state.thrill.com/snapshots/09-07-2026.json",
+            "https://api.bluff.com/promotions",
+            "https://redoak.target.com/content-publish/pages/v1?url=/",
+            "https://www.target.com/",
+            "https://example.com/data.json",
+        ] {
+            assert!(!is_tracker(u), "must NOT be a tracker: {u}");
+        }
     }
 }
 
