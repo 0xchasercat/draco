@@ -1061,7 +1061,8 @@ async fn drive_capture_window(
         // new intercepts — otherwise a `setInterval` would pin the window open
         // to the hard cap.
         if last_activity.elapsed() >= quiesce {
-            close_reason = "quiesce";
+            // Quiesce is the default exit — leave `close_reason` at its initial
+            // "quiesce" (reassigning would make that initializer dead code).
             break;
         }
 

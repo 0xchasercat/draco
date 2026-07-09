@@ -315,13 +315,37 @@ impl Tier2Capture for DisabledCapture {
 #[cfg(feature = "tier2")]
 const MAX_INTERCEPTS: u32 = 64;
 
-/// Derive the quiesce window from the capture window: ~1/6th, clamped to a
-/// sensible `[150, 500]` ms band so a short capture window still gets a chance to
-/// idle-detect while a long one does not wait excessively.
+/// Observe/discover capture-window ceiling. The API calls discovery ranks fire
+/// early in hydration, so a tight cap keeps capture bounded and a hung chunk CDN
+/// cannot pin the job (see [`SUBRESOURCE_FETCH_TIMEOUT_MS`]).
 const MAX_SUPERVISOR_CAPTURE_WINDOW_MS: u64 = 2_500;
 
-fn effective_capture_window_ms(requested: u64) -> u64 {
-    requested.min(MAX_SUPERVISOR_CAPTURE_WINDOW_MS)
+/// Render-mode capture window (the render-then-Markdown escalation). A heavy
+/// client-rendered SPA must hydrate, mount **lazily-imported route components**,
+/// fetch their data, and re-render before the content exists — a chain that runs
+/// past the ~1 s mark even in a real browser and slower in a cold isolate. The
+/// 2.5 s observe cap truncated it: thrill.com's game-grid query fires from a route
+/// component that had not mounted when the window closed (capture ended with a
+/// chunk still in flight — 5 of 6 first-party calls fired, the lazy 6th did not).
+/// Render therefore gets a far larger budget. This is a *ceiling*, not a fixed
+/// wait: the window still ends early via quiesce once the page goes idle, so a
+/// light SPA that finishes fast is not penalized — only a page that keeps working
+/// uses the extra time.
+const RENDER_CAPTURE_WINDOW_MS: u64 = 8_000;
+
+/// Hard ceiling for a render capture even if a caller requests more — bounds the
+/// worst-case job time for a page that never idles (heartbeats/polling).
+const MAX_RENDER_CAPTURE_WINDOW_MS: u64 = 15_000;
+
+/// Clamp the requested capture window to the mode's budget: Observe stays tight
+/// (early-firing API capture); Render is lifted to the hydrate-and-settle budget.
+fn effective_capture_window_ms(requested: u64, mode: CaptureMode) -> u64 {
+    match mode {
+        CaptureMode::Observe => requested.min(MAX_SUPERVISOR_CAPTURE_WINDOW_MS),
+        CaptureMode::Render => requested
+            .max(RENDER_CAPTURE_WINDOW_MS)
+            .min(MAX_RENDER_CAPTURE_WINDOW_MS),
+    }
 }
 
 /// Per-fetch timeout clamp for script **subresources** (the isolate's on-demand
@@ -522,8 +546,8 @@ mod prod {
     /// requested capture window is clamped ([`effective_capture_window_ms`]); the
     /// stub body is `"[]"` (an empty JSON array — the shape most page code
     /// `.flatMap`/`.map`s over without throwing, so hydration proceeds).
-    fn capture_config(config: &Config) -> draco_runtime::CaptureConfig {
-        let capture_window_ms = effective_capture_window_ms(config.capture_window_ms);
+    fn capture_config(config: &Config, mode: CaptureMode) -> draco_runtime::CaptureConfig {
+        let capture_window_ms = effective_capture_window_ms(config.capture_window_ms, mode);
         draco_runtime::CaptureConfig {
             capture_window_ms,
             quiesce_ms: default_quiesce_ms(capture_window_ms),
@@ -577,7 +601,7 @@ mod prod {
                 cache: ChunkCache::shared(),
             });
         let html = String::from_utf8_lossy(html);
-        let cfg = capture_config(config);
+        let cfg = capture_config(config, mode);
         let report = match mode {
             // Observe: data requests are stubbed (discover; SSR/hybrid fast path).
             CaptureMode::Observe => {
@@ -818,8 +842,29 @@ mod tests {
         // tier2-gated, so guard the assertion behind the same cfg.
         #[cfg(feature = "tier2")]
         {
-            assert_eq!(effective_capture_window_ms(2_000), 2_000);
-            assert_eq!(effective_capture_window_ms(60_000), 2_500);
+            // Observe stays tightly capped (API calls fire early in hydration).
+            assert_eq!(
+                effective_capture_window_ms(2_000, CaptureMode::Observe),
+                2_000
+            );
+            assert_eq!(
+                effective_capture_window_ms(60_000, CaptureMode::Observe),
+                2_500
+            );
+            // Render is lifted to the hydrate-and-settle budget: the 2 s default
+            // rises to the render floor, and an over-large request is ceiled.
+            assert_eq!(
+                effective_capture_window_ms(2_000, CaptureMode::Render),
+                8_000
+            );
+            assert_eq!(
+                effective_capture_window_ms(60_000, CaptureMode::Render),
+                15_000
+            );
+            assert_eq!(
+                effective_capture_window_ms(10_000, CaptureMode::Render),
+                10_000
+            );
             assert_eq!(default_quiesce_ms(0), 150);
             assert_eq!(default_quiesce_ms(600), 150); // 100 → floored at 150
             assert_eq!(default_quiesce_ms(1_800), 300); // 300
