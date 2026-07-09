@@ -654,13 +654,6 @@ async fn run_capture_inner(
 
     let mut threw_in_page = false;
     for (i, script) in scripts.into_iter().enumerate() {
-        // Point document.currentScript at a fresh <script> for this block
-        // (analytics/tag scripts read currentScript.parentElement); best-effort.
-        let _ = runtime.execute_script(
-            "draco:currentScript",
-            "try { globalThis.__dracoSetCurrentScript(); } catch (_) {}",
-        );
-
         // Resolve the source + its module specifier. Inline scripts use their body
         // verbatim and a synthetic per-index URL (based on the page URL, so
         // relative imports resolve against the page). External scripts use the
@@ -675,6 +668,25 @@ async fn run_capture_inner(
                 None => continue,
             }
         };
+
+        // Point document.currentScript at the REAL parsed <script> node for this
+        // block — matched by inline source text or external src — so a bootstrap
+        // that reads `currentScript.parentElement` (SvelteKit's mount target)
+        // resolves to the true parent in the document tree (the app's mount <div>)
+        // instead of a synthetic node grafted onto <head>, which silently
+        // misdirects the mount. Best-effort; the glue falls back to an inert node.
+        let set_cs = if script.inline {
+            format!(
+                "try {{ globalThis.__dracoSetCurrentScript({}, null); }} catch (_) {{}}",
+                json_string_literal(&source)
+            )
+        } else {
+            format!(
+                "try {{ globalThis.__dracoSetCurrentScript(null, {}); }} catch (_) {{}}",
+                json_string_literal(&spec_str)
+            )
+        };
+        let _ = runtime.execute_script("draco:currentScript", set_cs);
 
         if script.module {
             // ES module: register the entry source under its specifier (so its own
@@ -1601,5 +1613,40 @@ mod tests {
         assert_eq!(quiesce_tick_ms(0), 5);
         assert_eq!(quiesce_tick_ms(40), 10);
         assert_eq!(quiesce_tick_ms(10_000), 50);
+    }
+
+    #[test]
+    fn current_script_parent_is_real_mount_node() {
+        // A SvelteKit-style client bootstrap locates its mount target via
+        // `document.currentScript.parentElement`. The inline <script> is parsed
+        // inside <div id="app">, so currentScript.parentElement must resolve to
+        // that div — id "app" — not <head> (the old synthetic-node-in-head bug,
+        // which mounted the app into the wrong node) and not null. We prove it by
+        // recording a fetch whose query encodes the resolved parent's id.
+        let html = r#"<html><head></head><body>
+            <div id="app"><script>
+                var el = document.currentScript && document.currentScript.parentElement;
+                fetch("/mounted?parent=" + (el ? el.id : "NONE"));
+            </script></div>
+        </body></html>"#;
+        let report = run_capture(
+            "https://sk.example.com/",
+            html,
+            &CaptureConfig {
+                capture_window_ms: 500,
+                quiesce_ms: 20,
+                max_intercepts: 8,
+                stub_response_json: "{}".to_string(),
+            },
+            null_fetcher(),
+        );
+        assert!(
+            report
+                .requests
+                .iter()
+                .any(|r| r.url == "https://sk.example.com/mounted?parent=app"),
+            "currentScript.parentElement must be the real mount <div id=app>; got {:?}",
+            report.requests.iter().map(|r| &r.url).collect::<Vec<_>>()
+        );
     }
 }
