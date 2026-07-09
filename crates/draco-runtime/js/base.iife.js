@@ -85,7 +85,7 @@
 					cur.cb.apply(g, cur.args);
 				} catch (e) {
 					try {
-						Deno.core.print("[timer] " + (e && e.stack || e) + "\n", true);
+						try { Deno.core.ops.op_raze_log("[timer] " + (e && e.stack || e)); } catch (_) { Deno.core.print("[timer] " + (e && e.stack || e) + "\n", true); }
 					} catch (_) {}
 				}
 				var still = live.get(id);
@@ -132,7 +132,7 @@
 		g.cancelAnimationFrame = g.clearTimeout;
 		function _safeErr(e) {
 			try {
-				Deno.core.print("[msgport] " + (e && e.stack || e) + "\n", true);
+				try { Deno.core.ops.op_raze_log("[msgport] " + (e && e.stack || e)); } catch (_) { Deno.core.print("[msgport] " + (e && e.stack || e) + "\n", true); }
 			} catch (_) {}
 		}
 		function MessagePort() {
