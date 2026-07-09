@@ -167,6 +167,14 @@ const ANALYTICS_MARKERS: &[&str] = &[
     "nr-data.net",
 ];
 
+/// Does `url` match a known analytics / telemetry / ad-beacon marker? Shared by
+/// scoring (the −100 penalty) and the Render-mode live-fetch policy, which must
+/// never actually execute a tracking beacon (wasted round-trip + a privacy leak).
+pub fn is_analytics_url(url: &str) -> bool {
+    let url_lc = url.to_ascii_lowercase();
+    ANALYTICS_MARKERS.iter().any(|m| url_lc.contains(m))
+}
+
 /// API path segments that signal a data endpoint.
 const API_MARKERS: &[&str] = &[
     "/api/", "/api.", "/graphql", "/gql", "/rest/", "/rpc", "/query",

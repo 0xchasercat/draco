@@ -161,6 +161,42 @@ pub trait ScriptFetcher {
     fn fetch<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, Option<Vec<u8>>>;
 }
 
+/// A page-side network request the isolate wants to make (`window.fetch` /
+/// `XMLHttpRequest` / an SSE/WebSocket open), carried in full so the caller can
+/// issue it faithfully.
+#[derive(Debug, Clone)]
+pub struct ApiRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+}
+
+/// The response handed back to the page for an [`ApiRequest`] — the *real* status,
+/// headers, and body when the caller fetched it live, so a framework router runs
+/// its native success/error paths (a genuine 403-JSON renders the logged-out view
+/// instead of throwing on a synthetic 404).
+#[derive(Debug, Clone)]
+pub struct ApiResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// Async, in-process responder for the page's own data requests (`fetch`/XHR).
+///
+/// Distinct from [`ScriptFetcher`] (code loads are `url -> bytes`); a data request
+/// needs full fidelity both ways: method + headers + body in, real status +
+/// headers + body out. `draco-core` implements this over its pooled `draco-net`
+/// client under a stub-vs-live **policy** — a pure-CSR SPA's content only exists
+/// after its data fetches resolve, so `scrape` runs the safe ones live while
+/// `discover` stubs. Returning `None` means "no live response — use the built-in
+/// synthetic stub" (Observe mode, or a request the policy declined). The runtime
+/// records the request for `discover` regardless of what this returns.
+pub trait ApiFetcher {
+    fn fetch<'a>(&'a self, req: &'a ApiRequest) -> LocalBoxFuture<'a, Option<ApiResponse>>;
+}
+
 /// Boot an isolate, evaluate `html`'s scripts under `url`, run the capture window,
 /// and return everything the page tried to fetch plus the hydrated DOM.
 ///
@@ -179,12 +215,39 @@ pub fn run_capture(
     cfg: &CaptureConfig,
     fetcher: Rc<dyn ScriptFetcher>,
 ) -> CaptureReport {
+    run_capture_impl(url, html, cfg, fetcher, None)
+}
+
+/// As [`run_capture`], but in **Render mode**: the page's own data requests
+/// (`fetch`/XHR) are answered by `api_fetcher`, which `draco-core` routes to the
+/// live network (`draco-net`) for the requests its policy deems safe — so a
+/// pure-CSR shell's content actually materializes before the DOM is serialized.
+/// Requests the policy declines fall back to the same synthetic stub
+/// [`run_capture`] always uses.
+pub fn run_capture_render(
+    url: &str,
+    html: &str,
+    cfg: &CaptureConfig,
+    fetcher: Rc<dyn ScriptFetcher>,
+    api_fetcher: Rc<dyn ApiFetcher>,
+) -> CaptureReport {
+    run_capture_impl(url, html, cfg, fetcher, Some(api_fetcher))
+}
+
+fn run_capture_impl(
+    url: &str,
+    html: &str,
+    cfg: &CaptureConfig,
+    fetcher: Rc<dyn ScriptFetcher>,
+    api_fetcher: Option<Rc<dyn ApiFetcher>>,
+) -> CaptureReport {
     ensure_v8_flags();
 
     // Current-thread tokio runtime with the FULL driver set. The isolate's async
-    // ops (`op_raze_load_script`) and module loader `.await` real `draco-net`
-    // fetches, which need the I/O reactor; `enable_all()` also provides the time
-    // driver that backs `op_sleep`. Current-thread because `JsRuntime` is `!Send`.
+    // ops (`op_raze_load_script`, `op_raze_fetch`) and module loader `.await` real
+    // `draco-net` fetches, which need the I/O reactor; `enable_all()` also provides
+    // the time driver that backs `op_sleep`. Current-thread because `JsRuntime` is
+    // `!Send`.
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -202,7 +265,7 @@ pub fn run_capture(
         }
     };
 
-    rt.block_on(async move { run_capture_inner(url, html, cfg, fetcher).await })
+    rt.block_on(async move { run_capture_inner(url, html, cfg, fetcher, api_fetcher).await })
 }
 
 /// Thin legacy entry retained from the stub. Not used by the jail directly (Slice
@@ -231,11 +294,22 @@ struct CaptureState {
     /// awaited by `op_raze_load_script` for dynamic `<script src>` chunks. The
     /// module loader holds its own clone for `import` / `import()`.
     fetcher: Rc<dyn ScriptFetcher>,
+    /// Optional in-process responder for the page's own data requests (fetch/XHR),
+    /// awaited by `op_raze_fetch`. `Some` in Render mode (live data via draco-net
+    /// under a stub-vs-live policy); `None` in Observe mode (built-in synthetic
+    /// stub, the default that `discover` and SSR/hybrid `scrape` use).
+    api_fetcher: Option<Rc<dyn ApiFetcher>>,
     /// Count of script/module loads currently in flight. The capture-window driver
     /// treats a non-zero count as activity so the window cannot quiesce while the
     /// page is still pulling code concurrently — the async analogue of the old
     /// blocking loader keeping the single thread busy.
     inflight: Rc<Cell<u32>>,
+    /// Monotonically-increasing count of **content** requests (non-tracker
+    /// `fetch`/XHR). The capture window measures its quiesce streak against THIS
+    /// rather than the raw request count, so analytics/session-replay/ad beacons
+    /// that fire after the content has settled cannot keep the window open. They
+    /// are still recorded (discovery) — they just don't count as progress.
+    content_activity: Rc<Cell<u32>>,
     /// The hydrated DOM serialized after the capture window (via `op_raze_dom`),
     /// for the render-then-Markdown escalation. `None` until serialization runs.
     rendered_html: Option<String>,
@@ -243,18 +317,26 @@ struct CaptureState {
     /// `op_raze_log` (glue) and the Rust-side script-throw sites; bounded by
     /// [`CaptureState::push_log`].
     logs: Vec<String>,
+    /// Monotonic clock for this capture, started at isolate construction. The
+    /// `[raze.*]` diagnostics stamp `[+{ms}]` off it so `--runtime-log` reads as a
+    /// timeline — when each fetch/chunk resolved and when the window closed — the
+    /// raw material for tuning the capture-window early-exit.
+    started: Instant,
 }
 
 /// Hard bounds on collected diagnostic log lines, so a pathological page (e.g. a
 /// `console.error` in a render loop) cannot balloon the report or the IPC frames
 /// that carry it.
-const MAX_RUNTIME_LOGS: usize = 32;
+const MAX_RUNTIME_LOGS: usize = 96;
 const MAX_LOG_CHARS: usize = 1_024;
 
 impl CaptureState {
-    /// Append one diagnostic line, enforcing the count cap and truncating overlong
-    /// lines on a char boundary. Silently drops lines past the cap — the first
-    /// failures are the diagnostic signal; a flood repeats them.
+    /// Append one diagnostic line, enforcing the count cap, truncating overlong
+    /// lines on a char boundary, and **deduplicating exact repeats**. A framework
+    /// warning emitted once per component (e.g. a CSS-variable warn ×25) would
+    /// otherwise exhaust the line budget and evict the one error that explains the
+    /// failure; each distinct line carries all the diagnostic signal its repeats
+    /// would. Silently drops lines past the cap.
     fn push_log(&mut self, line: &str) {
         if self.logs.len() >= MAX_RUNTIME_LOGS {
             return;
@@ -262,6 +344,10 @@ impl CaptureState {
         let mut s: String = line.chars().take(MAX_LOG_CHARS).collect();
         if s.len() < line.len() {
             s.push('…');
+        }
+        // Bounded scan (≤ MAX_RUNTIME_LOGS entries): an exact repeat adds nothing.
+        if self.logs.contains(&s) {
+            return;
         }
         self.logs.push(s);
     }
@@ -279,52 +365,216 @@ struct RawRequest {
     body: Option<String>,
 }
 
+/// Known third-party analytics / session-replay / ad / tag-manager / bot-detection
+/// hosts that never contribute page **content**. A request to one is still recorded
+/// (so `discover` sees it) and still fetched live (so page hydration behaves
+/// normally), but it does **not** hold the capture window open or reset its quiesce
+/// streak. Without this, a tracker beacon firing seconds after the content settled
+/// pins the window to the hard cap — e.g. target.com's main content lands at ~1.8s
+/// but FullStory (257 KB), DoubleVerify, googlesyndication, Attentive and Medallia
+/// keep firing until ~3.5s, tripling the render time for zero extra content.
+///
+/// Matched as a case-insensitive substring of the request URL's host. Deliberately
+/// conservative: only unambiguous non-content vendors, so a first-party data host is
+/// never misclassified.
+fn is_tracker(url: &str) -> bool {
+    // Host = between "://" and the next '/', '?' or '#'. Falls back to the whole
+    // string (matching still works; we simply didn't isolate the host).
+    let host = url
+        .split_once("://")
+        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(rest))
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    const TRACKERS: &[&str] = &[
+        "fullstory.com",
+        "doubleverify.com",
+        "doubleclick.net",
+        "googlesyndication.com",
+        "google-analytics.com",
+        "googletagmanager.com",
+        "analytics.google.com",
+        "amplitude.com",
+        "segment.io",
+        "segment.com",
+        "attentivemobile.com",
+        "attn.tv",
+        "medallia.com",
+        "intercomcdn.com",
+        "intercom.io",
+        "api-iam.intercom",
+        "px-cloud.net",
+        "perimeterx",
+        "zeronaught.com",
+        "hotjar.com",
+        "hotjar.io",
+        "mixpanel.com",
+        "heapanalytics.com",
+        "sentry.io",
+        "bugsnag.com",
+        "datadoghq.com",
+        "nr-data.net",
+        "newrelic.com",
+        "optimizely.com",
+        "criteo.com",
+        "criteo.net",
+        "taboola.com",
+        "outbrain.com",
+        "connect.facebook.net",
+        "bat.bing.com",
+        "clarity.ms",
+        "onetrust.com",
+        "cookielaw.org",
+        "branch.io",
+        "appsflyer.com",
+        "adjust.com",
+        "quantserve.com",
+        "scorecardresearch.com",
+        "launchdarkly.com",
+        "mouseflow.com",
+        "analytics.tiktok.com",
+        "ads.linkedin.com",
+    ];
+    TRACKERS.iter().any(|t| host.contains(t))
+}
+
 // ===================================================================
 // Ops
 // ===================================================================
 
-/// Record an intercepted request and return a synthetic stub-response JSON
-/// string: `{"status":u16,"headers":[[k,v]],"body":"..."}`.
+/// Record an intercepted request, then return the response JSON the page should
+/// see: `{"status":u16,"headers":[[k,v]],"body":"..."}`.
 ///
-/// Returning a value (rather than blocking) is deliberate: the page's fetch
-/// resolves immediately with our stub, so hydration proceeds and more endpoints
-/// surface. Enforces `max_intercepts` by throwing once the cap is exceeded (the
-/// JS side swallows the throw and falls back to an empty `{}` response).
+/// **Async.** Recording (and the `max_intercepts` cap) happens synchronously up
+/// front — so `discover` sees every endpoint regardless of the response — then the
+/// op consults the optional [`ApiFetcher`]. In Render mode a safe request is
+/// fetched live and its REAL status/headers/body are returned (so a framework
+/// router runs its native success/error paths — a genuine 403-JSON renders the
+/// logged-out view instead of throwing on a synthetic 404). With no fetcher, or
+/// when the policy declines a request (Observe mode, unsafe method, streaming,
+/// analytics), it falls back to the synthetic stub so the page's fetch still
+/// resolves and hydration proceeds. A live fetch bumps the in-flight counter so
+/// the capture window stays open while it is outstanding.
+///
+/// NOTE: `async` is inferred from the `async fn` with a bare `#[op2]` (matching
+/// `op_sleep`); state is taken as `Rc<RefCell<OpState>>` and every borrow is
+/// dropped before the `.await`.
 #[deno_core::op2]
 #[string]
-fn op_raze_fetch(
-    state: &mut OpState,
+async fn op_raze_fetch(
+    state: Rc<RefCell<OpState>>,
     #[string] request_json: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     let raw: RawRequest = serde_json::from_str(&request_json)
         .map_err(|e| deno_error::JsErrorBox::generic(format!("op_raze_fetch bad payload: {e}")))?;
 
-    let cap = state.borrow::<Rc<RefCell<CaptureState>>>().clone();
-    let mut cs = cap.borrow_mut();
+    // Record the request + enforce the cap + snapshot what we need, all under a
+    // short borrow that ends before the `.await` (no `Ref` may cross it).
+    let (api_fetcher, inflight, stub_body, api_req, tracker) = {
+        let op_state = state.borrow();
+        let cap = op_state.borrow::<Rc<RefCell<CaptureState>>>().clone();
+        let mut cs = cap.borrow_mut();
 
-    if cs.requests.len() as u32 >= cs.max_intercepts {
-        return Err(deno_error::JsErrorBox::generic("max_intercepts exceeded"));
+        if cs.requests.len() as u32 >= cs.max_intercepts {
+            return Err(deno_error::JsErrorBox::generic("max_intercepts exceeded"));
+        }
+
+        let via = match raw.via.as_str() {
+            "xhr" => InterceptVia::Xhr,
+            _ => InterceptVia::Fetch,
+        };
+        let tracker = is_tracker(&raw.url);
+        let body = raw.body.map(|b| b.into_bytes());
+        cs.requests.push(CapturedRequest {
+            method: raw.method.clone(),
+            url: raw.url.clone(),
+            headers: raw.headers.clone(),
+            body: body.clone(),
+            via,
+        });
+        // A non-tracker request is content progress → advance the quiesce clock.
+        // Trackers are recorded above (discovery) but deliberately do not count.
+        if !tracker {
+            cs.content_activity.set(cs.content_activity.get() + 1);
+        }
+        let api_req = ApiRequest {
+            method: raw.method,
+            url: raw.url,
+            headers: raw.headers,
+            body,
+        };
+        (
+            cs.api_fetcher.clone(),
+            cs.inflight.clone(),
+            cs.stub_body.clone(),
+            api_req,
+            tracker,
+        )
+    };
+
+    // Render mode: try a live response. `None` (Observe mode, or a request the
+    // policy declined) falls through to the synthetic stub below.
+    let render_mode = api_fetcher.is_some();
+    let live = match api_fetcher {
+        Some(f) => {
+            // A non-tracker fetch holds the capture window open while it's in flight
+            // (content may still be arriving); a tracker is fetched live so the page
+            // behaves normally, but must not pin the window past content-settle.
+            if !tracker {
+                inflight.set(inflight.get() + 1);
+            }
+            let r = f.fetch(&api_req).await;
+            if !tracker {
+                inflight.set(inflight.get().saturating_sub(1));
+            }
+            r
+        }
+        None => None,
+    };
+
+    // Observability (surfaced under `--runtime-log`): record what the broker did
+    // with THIS request — the one signal that says whether a data-driven page's
+    // fetch actually fired and what came back. `live` = a real draco-net response
+    // (Render mode, request allowed by policy); `stub(declined/failed)` = Render
+    // mode but the policy withheld it or the live fetch failed; `stub(observe)` =
+    // Observe mode's built-in synthetic stub. Logged in a short borrow that opens
+    // and closes after every `.await` above.
+    let (log_status, log_len, log_kind) = match &live {
+        Some(r) => (r.status, r.body.len(), "live"),
+        None if render_mode => (200u16, stub_body.len(), "stub(declined/failed)"),
+        None => (200u16, stub_body.len(), "stub(observe)"),
+    };
+    {
+        let op_state = state.borrow();
+        let cap = op_state.borrow::<Rc<RefCell<CaptureState>>>().clone();
+        let mut cs = cap.borrow_mut();
+        let t = cs.started.elapsed().as_millis();
+        let line = format!(
+            "[+{t}ms] [raze.fetch] {} {} → {log_status} ({log_len}b, {log_kind})",
+            api_req.method, api_req.url
+        );
+        cs.push_log(&line);
     }
 
-    let via = match raw.via.as_str() {
-        "xhr" => InterceptVia::Xhr,
-        _ => InterceptVia::Fetch,
+    let resp = match live {
+        Some(r) => {
+            // Real response bytes are lossy-decoded to a JS string (API data is
+            // text/JSON). Headers → a JSON array of [k,v] pairs `makeResponse` reads.
+            let headers =
+                serde_json::to_value(&r.headers).unwrap_or_else(|_| serde_json::json!([]));
+            serde_json::json!({
+                "status": r.status,
+                "headers": headers,
+                "body": String::from_utf8_lossy(&r.body).into_owned(),
+            })
+        }
+        // Synthetic stub: always 200 + the configured body + a JSON content-type
+        // so `res.json()` works page-side and hydration keeps moving.
+        None => serde_json::json!({
+            "status": 200,
+            "headers": [["content-type", "application/json"]],
+            "body": stub_body,
+        }),
     };
-    cs.requests.push(CapturedRequest {
-        method: raw.method,
-        url: raw.url,
-        headers: raw.headers,
-        body: raw.body.map(|b| b.into_bytes()),
-        via,
-    });
-
-    // Build the stub response. We always answer 200 with the configured body and
-    // a JSON content-type so `res.json()` works on the page side.
-    let resp = serde_json::json!({
-        "status": 200,
-        "headers": [["content-type", "application/json"]],
-        "body": cs.stub_body,
-    });
     Ok(resp.to_string())
 }
 
@@ -351,6 +601,17 @@ async fn op_raze_load_script(state: Rc<RefCell<OpState>>, #[string] url: String)
     inflight.set(inflight.get() + 1);
     let bytes = fetcher.fetch(&url).await;
     inflight.set(inflight.get().saturating_sub(1));
+    // A dynamic `<script src>` chunk that couldn't be fetched fires the page-side
+    // `onerror` — but from the outside that looks like a silent stall. Surface the
+    // miss so `--runtime-log` shows a failed chunk that would break hydration.
+    if bytes.is_none() {
+        let op_state = state.borrow();
+        let cap = op_state.borrow::<Rc<RefCell<CaptureState>>>().clone();
+        let mut cs = cap.borrow_mut();
+        let t = cs.started.elapsed().as_millis();
+        let line = format!("[+{t}ms] [raze.chunk] MISS {url}");
+        cs.push_log(&line);
+    }
     bytes.map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
@@ -488,6 +749,8 @@ struct MapModuleLoader {
     fetcher: Rc<dyn ScriptFetcher>,
     /// Shared in-flight-load counter (see [`CaptureState::inflight`]).
     inflight: Rc<Cell<u32>>,
+    /// Capture state, for surfacing module-load misses as diagnostics.
+    cap: Rc<RefCell<CaptureState>>,
 }
 
 impl ModuleLoader for MapModuleLoader {
@@ -509,6 +772,7 @@ impl ModuleLoader for MapModuleLoader {
         let modules = self.modules.clone();
         let fetcher = self.fetcher.clone();
         let inflight = self.inflight.clone();
+        let cap = self.cap.clone();
         let spec = module_specifier.clone();
 
         ModuleLoadResponse::Async(
@@ -532,7 +796,15 @@ impl ModuleLoader for MapModuleLoader {
                 }
 
                 // 3. Genuinely unavailable: reject THIS import honestly instead of
-                //    poisoning the graph with a silent empty module.
+                //    poisoning the graph with a silent empty module. Surface the
+                //    miss — a route/entry chunk that fails to load stalls hydration
+                //    and would otherwise look like an unexplained empty render.
+                {
+                    let mut cs = cap.borrow_mut();
+                    let t = cs.started.elapsed().as_millis();
+                    let line = format!("[+{t}ms] [raze.module] MISS {key}");
+                    cs.push_log(&line);
+                }
                 Err(JsErrorBox::generic(format!(
                     "draco: failed to load module (no on-demand fetch could \
                      retrieve it): {key}"
@@ -571,6 +843,7 @@ async fn run_capture_inner(
     html: &str,
     cfg: &CaptureConfig,
     fetcher: Rc<dyn ScriptFetcher>,
+    api_fetcher: Option<Rc<dyn ApiFetcher>>,
 ) -> CaptureReport {
     let stub_body = normalize_stub_body(&cfg.stub_response_json);
 
@@ -588,9 +861,12 @@ async fn run_capture_inner(
         max_intercepts: cfg.max_intercepts,
         stub_body: stub_body.clone(),
         fetcher: fetcher.clone(),
+        api_fetcher,
         inflight: inflight.clone(),
+        content_activity: Rc::new(Cell::new(0)),
         rendered_html: None,
         logs: Vec::new(),
+        started: Instant::now(),
     }));
 
     // Restore the DOM-engine snapshot and register the ops for this isolate.
@@ -601,6 +877,7 @@ async fn run_capture_inner(
             modules: modules.clone(),
             fetcher: fetcher.clone(),
             inflight: inflight.clone(),
+            cap: cap.clone(),
         })),
         ..Default::default()
     });
@@ -733,6 +1010,16 @@ async fn run_capture_inner(
         "try { globalThis.__dracoClearCurrentScript(); } catch (_) {}",
     );
 
+    // Parsing-finished moment: the document-order scripts have all evaluated.
+    // Fire the document lifecycle (readyState transitions, DOMContentLoaded,
+    // window load) so boot code gated on those signals proceeds — a real browser
+    // fires both events here, BEFORE dynamic import()s settle, and late-running
+    // chunk code then observes readyState === "complete" (see glue §7).
+    let _ = runtime.execute_script(
+        "draco:lifecycle",
+        "try { globalThis.__dracoFireLifecycle(); } catch (_) {}",
+    );
+
     // 3. Capture window: pump the event loop until quiescence or the hard cap.
     let outcome = drive_capture_window(&mut runtime, &cap, cfg, threw_in_page).await;
 
@@ -810,14 +1097,24 @@ async fn drive_capture_window(
     // Small tick so we re-check the wall clock even while timers are pending.
     let tick = Duration::from_millis(quiesce_tick_ms(cfg.quiesce_ms));
 
-    // Count at which we last saw activity, to measure the quiesce streak.
-    let mut last_count = cap.borrow().requests.len();
+    // Content-activity count at which we last saw progress, to measure the quiesce
+    // streak. Uses the non-tracker request counter (see `CaptureState`), so tracker
+    // beacons firing after the content settled do not reset the streak and cannot
+    // pin the window open.
+    let content_activity = cap.borrow().content_activity.clone();
+    let mut last_count = content_activity.get();
     let mut last_activity = Instant::now();
     let mut loop_threw = false;
     // Shared in-flight-load counter: while the page is still pulling script/module
     // chunks concurrently, the window must not quiesce (the async analogue of the
     // old blocking loader keeping the single thread busy).
     let inflight = cap.borrow().inflight.clone();
+    // Why the window ended (surfaced as a `[raze.window]` diagnostic): "drained"
+    // (event loop empty — no pending ops/timers/promises), "quiesce" (no new
+    // activity for quiesce_ms), "hard-cap" (hit capture_window_ms), or
+    // "loop-error". Distinguishes a timing stall (window closed before a late
+    // async fetch fired) from a genuine run to the cap.
+    let mut close_reason: &'static str = "quiesce";
 
     loop {
         // Poll one tick of the event loop with a self-contained waker.
@@ -827,6 +1124,7 @@ async fn drive_capture_window(
             Poll::Ready(Ok(())) => {
                 // Event loop fully drained: no pending ops/timers/promises.
                 // This is a clean, natural quiesce.
+                close_reason = "drained";
                 break;
             }
             Poll::Ready(Err(e)) => {
@@ -835,6 +1133,7 @@ async fn drive_capture_window(
                 eprintln!("draco-runtime: {line}");
                 cap.borrow_mut().push_log(&line);
                 loop_threw = true;
+                close_reason = "loop-error";
                 break;
             }
             Poll::Pending => {
@@ -844,8 +1143,8 @@ async fn drive_capture_window(
             }
         }
 
-        // Refresh activity tracking.
-        let now_count = cap.borrow().requests.len();
+        // Refresh activity tracking (content requests only; trackers excluded).
+        let now_count = content_activity.get();
         if now_count != last_count {
             last_count = now_count;
             last_activity = Instant::now();
@@ -859,7 +1158,8 @@ async fn drive_capture_window(
 
         // Hard cap first.
         if start.elapsed() >= hard_cap {
-            return classify_window_close(cap, threw_in_page, loop_threw, /*hard_cap=*/ true);
+            close_reason = "hard-cap";
+            break;
         }
 
         // Quiesce: only start counting the streak once *something* has been
@@ -870,13 +1170,33 @@ async fn drive_capture_window(
         // new intercepts — otherwise a `setInterval` would pin the window open
         // to the hard cap.
         if last_activity.elapsed() >= quiesce {
+            // Quiesce is the default exit — leave `close_reason` at its initial
+            // "quiesce" (reassigning would make that initializer dead code).
             break;
         }
 
         tokio::time::sleep(tick).await;
     }
 
-    classify_window_close(cap, threw_in_page, loop_threw, /*hard_cap=*/ false)
+    // Summarize the window close (surfaced under `--runtime-log`): the reason, the
+    // wall-clock spent, how many fetch/XHR requests were captured, and whether any
+    // script/module load was still outstanding when we stopped. A "drained"/
+    // "quiesce" close with 0 requests and a late-firing page is the fingerprint of
+    // an event-loop stall before the data fetch dispatched.
+    let elapsed_ms = start.elapsed().as_millis();
+    {
+        let mut cs = cap.borrow_mut();
+        let n = cs.requests.len();
+        let infl = inflight.get();
+        let t = cs.started.elapsed().as_millis();
+        let line = format!(
+            "[+{t}ms] [raze.window] closed via {close_reason} (window {elapsed_ms}ms); \
+             {n} request(s) captured, {infl} load(s) inflight"
+        );
+        cs.push_log(&line);
+    }
+
+    classify_window_close(cap, threw_in_page, loop_threw, close_reason == "hard-cap")
 }
 
 /// Poll the deno_core event loop exactly once using a no-op-ish waker. We drive
@@ -1249,6 +1569,23 @@ mod tests {
     /// A fetcher serving a fixed `{ url -> bytes }` set.
     fn map_fetcher(entries: HashMap<String, Vec<u8>>) -> Rc<dyn ScriptFetcher> {
         Rc::new(MapFetcher(entries))
+    }
+
+    /// Test [`ApiFetcher`] serving a fixed `{ url -> (status, json_body) }` map as
+    /// real responses (Render mode) — the offline stand-in for the net-backed one.
+    struct MapApiFetcher(HashMap<String, (u16, String)>);
+    impl ApiFetcher for MapApiFetcher {
+        fn fetch<'a>(&'a self, req: &'a ApiRequest) -> LocalBoxFuture<'a, Option<ApiResponse>> {
+            let hit = self.0.get(&req.url).map(|(status, body)| ApiResponse {
+                status: *status,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: body.clone().into_bytes(),
+            });
+            Box::pin(async move { hit })
+        }
+    }
+    fn api_fetcher(entries: HashMap<String, (u16, String)>) -> Rc<dyn ApiFetcher> {
+        Rc::new(MapApiFetcher(entries))
     }
 
     #[test]
@@ -1648,5 +1985,272 @@ mod tests {
             "currentScript.parentElement must be the real mount <div id=app>; got {:?}",
             report.requests.iter().map(|r| &r.url).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn render_mode_feeds_live_data_into_the_dom() {
+        // A pure-CSR page: an inline script fetches data and writes it into the
+        // mounted DOM. In RENDER mode the ApiFetcher answers with real JSON, so the
+        // serialized DOM carries the fetched content. (In Observe mode the fetch is
+        // stubbed with `[]` and the DOM stays empty — that is the thrill.com class
+        // of failure this whole path fixes.)
+        let html = r#"<html><body><div id="app"></div><script>
+            fetch("/api/title")
+                .then(function (r) { return r.json(); })
+                .then(function (d) { document.getElementById("app").textContent = d.title; });
+        </script></body></html>"#;
+        let mut api = HashMap::new();
+        api.insert(
+            "https://csr.example.com/api/title".to_string(),
+            (200u16, r#"{"title":"LIVE DATA"}"#.to_string()),
+        );
+        let report = run_capture_render(
+            "https://csr.example.com/",
+            html,
+            &CaptureConfig {
+                capture_window_ms: 500,
+                quiesce_ms: 20,
+                max_intercepts: 8,
+                stub_response_json: "[]".to_string(),
+            },
+            null_fetcher(),
+            api_fetcher(api),
+        );
+        let dom = report.rendered_html.unwrap_or_default();
+        assert!(
+            dom.contains("LIVE DATA"),
+            "Render mode must feed the live fetch response into the DOM; dom={dom:?}, logs={:?}",
+            report.logs
+        );
+        // The data request was still recorded (discover works in Render mode too).
+        assert!(
+            report
+                .requests
+                .iter()
+                .any(|r| r.url == "https://csr.example.com/api/title"),
+            "the live data request must still be recorded: {:?}",
+            report.requests.iter().map(|r| &r.url).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn web_animations_shim_lets_transition_code_complete() {
+        // Svelte 5 transitions call element.animate() inside the effect flush and
+        // continue only when the animation finishes; the pre-shim TypeError
+        // aborted the mount mid-tree (thrill.com rendered only its footer). The
+        // shim must (a) exist, (b) fire onfinish (completion-biased), and
+        // (c) answer getAnimations() — proven by fetches gated on each.
+        let html = r#"<html><body><div id="app"></div><script>
+            var el = document.getElementById("app");
+            if (typeof el.getAnimations === "function" && el.getAnimations().length === 0) {
+                fetch("/api/get-animations-ok");
+            }
+            var a = el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 200 });
+            a.onfinish = function () { fetch("/api/after-animate"); };
+        </script></body></html>"#;
+        let report = run_capture(
+            "https://anim.example.com/",
+            html,
+            &CaptureConfig {
+                capture_window_ms: 800,
+                quiesce_ms: 100,
+                max_intercepts: 8,
+                stub_response_json: "{}".to_string(),
+            },
+            null_fetcher(),
+        );
+        let urls: Vec<&str> = report.requests.iter().map(|r| r.url.as_str()).collect();
+        assert!(
+            urls.contains(&"https://anim.example.com/api/get-animations-ok"),
+            "getAnimations() must exist and return []: {urls:?}, logs={:?}",
+            report.logs
+        );
+        assert!(
+            urls.contains(&"https://anim.example.com/api/after-animate"),
+            "animate().onfinish must fire (completion-biased shim): {urls:?}, logs={:?}",
+            report.logs
+        );
+    }
+
+    #[test]
+    fn injected_module_script_runs_via_import_not_happydom() {
+        // A dynamically inserted <script type="module" src=…> (e.g. thrill.com's
+        // game-loader) must be loaded + evaluated as an ES module through our
+        // MapModuleLoader — not fall through to happy-dom's disabled module loader
+        // (a NotSupportedError) or be classic-eval'd (breaks on import/export). We
+        // prove the module ran by capturing a fetch its top-level body makes.
+        let html = r#"<html><body><script>
+            var s = document.createElement("script");
+            s.type = "module";
+            s.src = "/mod/game-loader.js";
+            document.head.appendChild(s);
+        </script></body></html>"#;
+        let mut resources = HashMap::new();
+        resources.insert(
+            "https://ex.example.com/mod/game-loader.js".to_string(),
+            // Module-only syntax (export) proves it's evaluated as a module, not eval'd.
+            br#"export const loaded = true; fetch("/from-module");"#.to_vec(),
+        );
+        let report = run_capture(
+            "https://ex.example.com/",
+            html,
+            &CaptureConfig {
+                capture_window_ms: 500,
+                quiesce_ms: 20,
+                max_intercepts: 8,
+                stub_response_json: "{}".to_string(),
+            },
+            map_fetcher(resources),
+        );
+        assert!(
+            report
+                .requests
+                .iter()
+                .any(|r| r.url == "https://ex.example.com/from-module"),
+            "injected module script must load+evaluate via import(); got {:?}, logs={:?}",
+            report.requests.iter().map(|r| &r.url).collect::<Vec<_>>(),
+            report.logs
+        );
+    }
+
+    #[test]
+    fn intersection_observer_fires_so_lazy_content_loads() {
+        // Modern SPAs lazy-load a section's data when it scrolls into view via
+        // IntersectionObserver (thrill.com's game rows). A no-op observer never
+        // fires its callback, so the section stays a skeleton and its data fetch
+        // never happens. Our completion-biased observer reports the element
+        // intersecting once — proven by capturing the fetch the callback makes.
+        let html = r#"<html><body><div id="section"></div><script>
+            var io = new IntersectionObserver(function (entries) {
+                for (var i = 0; i < entries.length; i++) {
+                    if (entries[i].isIntersecting) fetch("/api/lazy-section-data");
+                }
+            });
+            io.observe(document.getElementById("section"));
+        </script></body></html>"#;
+        let report = run_capture(
+            "https://lazy.example.com/",
+            html,
+            &CaptureConfig {
+                capture_window_ms: 500,
+                quiesce_ms: 20,
+                max_intercepts: 8,
+                stub_response_json: "[]".to_string(),
+            },
+            null_fetcher(),
+        );
+        assert!(
+            report
+                .requests
+                .iter()
+                .any(|r| r.url == "https://lazy.example.com/api/lazy-section-data"),
+            "IntersectionObserver must fire so lazy-load-on-visible content triggers: {:?}, logs={:?}",
+            report.requests.iter().map(|r| &r.url).collect::<Vec<_>>(),
+            report.logs
+        );
+    }
+
+    #[test]
+    fn document_lifecycle_events_fire_after_script_eval() {
+        // The classic boot gates: framework/data code runs immediately when the
+        // document already finished loading, else waits for DOMContentLoaded /
+        // load / readystatechange. happy-dom never runs the loading lifecycle for
+        // our document.write path, so without glue §7 these gates stall forever
+        // and the shell hydrates without its data (thrill.com's providers/
+        // geolocation/license calls). All three canonical forms must fire, and
+        // during script evaluation readyState must read "loading" (browser-
+        // faithful: scripts execute during parse), flipping to "complete" after.
+        let html = r#"<html><body><script>
+            if (document.readyState === "loading") fetch("/api/was-loading");
+            document.addEventListener("DOMContentLoaded", function () { fetch("/api/dcl"); });
+            window.addEventListener("load", function () { fetch("/api/load"); });
+            document.addEventListener("readystatechange", function () {
+                if (document.readyState === "complete") fetch("/api/ready-complete");
+            });
+        </script></body></html>"#;
+        let report = run_capture(
+            "https://boot.example.com/",
+            html,
+            &CaptureConfig {
+                capture_window_ms: 500,
+                quiesce_ms: 20,
+                max_intercepts: 8,
+                stub_response_json: "{}".to_string(),
+            },
+            null_fetcher(),
+        );
+        let urls: Vec<&str> = report.requests.iter().map(|r| r.url.as_str()).collect();
+        for want in [
+            "https://boot.example.com/api/was-loading",
+            "https://boot.example.com/api/dcl",
+            "https://boot.example.com/api/load",
+            "https://boot.example.com/api/ready-complete",
+        ] {
+            assert!(
+                urls.contains(&want),
+                "lifecycle gate {want} did not fire; got {urls:?}, logs={:?}",
+                report.logs
+            );
+        }
+    }
+
+    #[test]
+    fn push_log_dedupes_exact_repeats() {
+        // A framework warn repeated per-component must not exhaust the log budget
+        // and evict the one distinct error that explains a failure.
+        let mut cs = CaptureState {
+            requests: Vec::new(),
+            max_intercepts: 8,
+            stub_body: "{}".to_string(),
+            fetcher: null_fetcher(),
+            api_fetcher: None,
+            inflight: Rc::new(Cell::new(0)),
+            content_activity: Rc::new(Cell::new(0)),
+            rendered_html: None,
+            logs: Vec::new(),
+            started: Instant::now(),
+        };
+        for _ in 0..50 {
+            cs.push_log("[console.warn] No --breakpoint-sm value found in CSS variables");
+        }
+        cs.push_log("[exception] TypeError: e.animate is not a function");
+        assert_eq!(
+            cs.logs.len(),
+            2,
+            "repeats deduped, distinct line retained: {:?}",
+            cs.logs
+        );
+        assert!(cs.logs[1].contains("animate"), "{:?}", cs.logs);
+    }
+
+    #[test]
+    fn is_tracker_flags_known_vendors_but_not_first_party_content() {
+        // Non-content vendors observed pinning the capture window (the target.com
+        // tail: FullStory, DoubleVerify, googlesyndication, Medallia, Attentive,
+        // PerimeterX/px-cloud, zeronaught, amplitude) must be classified trackers.
+        for u in [
+            "https://edge.fullstory.com/s/settings/o-x/v1/web",
+            "https://pub.doubleverify.com/dvtag/signals/bsc/pub.json",
+            "https://pagead2.googlesyndication.com/pagead/ping?e=1",
+            "https://resources.digital-cloud.medallia.com/wdcus/onsiteData.json",
+            "https://target.attn.tv/unrenderedCreative?v=1",
+            "https://ift.px-cloud.net/ns?c=x",
+            "https://ponos.zeronaught.com/2?a=x",
+            "https://api.eu.amplitude.com/2/httpapi",
+        ] {
+            assert!(is_tracker(u), "should be a tracker: {u}");
+        }
+        // First-party / content endpoints must NEVER be misclassified — these hold
+        // the capture window open until the content has actually rendered.
+        for u in [
+            "https://thrill.com/api/v2/games/providers",
+            "https://games-state.thrill.com/snapshots/09-07-2026.json",
+            "https://api.bluff.com/promotions",
+            "https://redoak.target.com/content-publish/pages/v1?url=/",
+            "https://www.target.com/",
+            "https://example.com/data.json",
+        ] {
+            assert!(!is_tracker(u), "must NOT be a tracker: {u}");
+        }
     }
 }

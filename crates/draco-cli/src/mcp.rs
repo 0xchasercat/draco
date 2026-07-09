@@ -470,6 +470,7 @@ mod tests {
 
     fn defaults() -> Config {
         Config {
+            force_render: false,
             tier_max: 0,
             respect_robots: false,
             ..Config::default()

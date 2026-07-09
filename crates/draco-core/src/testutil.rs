@@ -19,7 +19,7 @@ use draco_types::{DracoError, ExtractedData, HttpRequestSpec, HttpResponseMeta};
 use crate::fetcher::PageFetcher;
 use crate::machine::StaticEngine;
 use crate::ranking::Candidate;
-use crate::tier2::{CaptureResult, Tier2Capture};
+use crate::tier2::{CaptureMode, CaptureResult, Tier2Capture};
 use draco_types::RuntimeOutcome;
 
 /// A scripted [`PageFetcher`]: `fetch` returns one canned response (or error),
@@ -355,6 +355,7 @@ impl Tier2Capture for MockCapture {
         _html: &[u8],
         _config: &crate::Config,
         _opts: &draco_net::SessionOpts,
+        _mode: CaptureMode,
     ) -> Result<CaptureResult, DracoError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.result.clone()

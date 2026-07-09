@@ -180,6 +180,12 @@ enum Command {
         /// nothing. Implies the JSON envelope output (the trace carries them).
         #[arg(long)]
         runtime_log: bool,
+        /// Force the Tier 2 render-then-Markdown escalation (Render mode — the
+        /// page's safe data requests hit the live network so a client-rendered
+        /// shell's content materializes) even when the static shell isn't flagged
+        /// thin/skeleton. Hidden; for exercising Render mode in testing.
+        #[arg(long, hide = true)]
+        force_render: bool,
         /// Strip boilerplate (nav/header/footer/ads) to the main content
         /// (Firecrawl's `onlyMainContent`). On by default; pass this to get
         /// the full page instead.
@@ -511,6 +517,7 @@ async fn async_main() {
             allow_unsafe_replay,
             ignore_robots,
             runtime_log,
+            force_render,
             no_main_content,
             include_tag,
             exclude_tag,
@@ -536,6 +543,7 @@ async fn async_main() {
                 strict_sandbox,
                 allow_unsafe_replay,
                 runtime_log,
+                force_render,
             };
             let mut result = extract(&url, &config).await;
             if let Some(expr) = extract_expr.as_deref() {
@@ -564,6 +572,7 @@ async fn async_main() {
             // `Config` construction). `endpoints` forces the Tier 2 capture;
             // `json` carries the replayed winner.
             let config = Config {
+                force_render: false,
                 formats: FormatSet {
                     json: true,
                     endpoints: true,
@@ -616,6 +625,7 @@ async fn async_main() {
             // same helper `map_handler` uses); the rest of `Config` is unused
             // by `map_site`.
             let config = Config {
+                force_render: false,
                 proxy,
                 timeout_ms: timeout,
                 respect_robots: true,
@@ -682,6 +692,7 @@ async fn async_main() {
                 allow_unsafe_replay: false,
                 // Per-request opt-in (`runtimeLog`); no server-wide default.
                 runtime_log: false,
+                force_render: false,
             };
             // Pool size 0 → auto: the available parallelism (CPU count), a sane
             // cap on concurrent isolates. Fall back to 4 if it can't be probed.
@@ -732,6 +743,7 @@ async fn async_main() {
                 allow_unsafe_replay: false,
                 // Per-request opt-in (`runtimeLog`); no server-wide default.
                 runtime_log: false,
+                force_render: false,
             };
             if let Err(e) = mcp::run_stdio(defaults).await {
                 eprintln!("draco mcp: {e}");
