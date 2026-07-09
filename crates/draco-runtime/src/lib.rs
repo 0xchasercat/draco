@@ -1928,6 +1928,43 @@ mod tests {
     }
 
     #[test]
+    fn intersection_observer_fires_so_lazy_content_loads() {
+        // Modern SPAs lazy-load a section's data when it scrolls into view via
+        // IntersectionObserver (thrill.com's game rows). A no-op observer never
+        // fires its callback, so the section stays a skeleton and its data fetch
+        // never happens. Our completion-biased observer reports the element
+        // intersecting once — proven by capturing the fetch the callback makes.
+        let html = r#"<html><body><div id="section"></div><script>
+            var io = new IntersectionObserver(function (entries) {
+                for (var i = 0; i < entries.length; i++) {
+                    if (entries[i].isIntersecting) fetch("/api/lazy-section-data");
+                }
+            });
+            io.observe(document.getElementById("section"));
+        </script></body></html>"#;
+        let report = run_capture(
+            "https://lazy.example.com/",
+            html,
+            &CaptureConfig {
+                capture_window_ms: 500,
+                quiesce_ms: 20,
+                max_intercepts: 8,
+                stub_response_json: "[]".to_string(),
+            },
+            null_fetcher(),
+        );
+        assert!(
+            report
+                .requests
+                .iter()
+                .any(|r| r.url == "https://lazy.example.com/api/lazy-section-data"),
+            "IntersectionObserver must fire so lazy-load-on-visible content triggers: {:?}, logs={:?}",
+            report.requests.iter().map(|r| &r.url).collect::<Vec<_>>(),
+            report.logs
+        );
+    }
+
+    #[test]
     fn push_log_dedupes_exact_repeats() {
         // A framework warn repeated per-component must not exhaust the log budget
         // and evict the one distinct error that explains a failure.

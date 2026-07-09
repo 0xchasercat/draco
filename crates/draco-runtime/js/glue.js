@@ -259,6 +259,74 @@
     }
   })();
 
+  // Completion-biased IntersectionObserver + ResizeObserver. happy-dom and our
+  // snapshot polyfills stub these as INERT no-ops that never fire their callback —
+  // which silently breaks the most common lazy-content pattern on modern SPAs: a
+  // section observes itself and fetches/renders its data only once it scrolls into
+  // view (IntersectionObserver) or is measured (ResizeObserver). With a no-op
+  // observer the callback never fires, so those sections stay in their initial
+  // (skeleton) state forever — the shell hydrates but the data-driven sections
+  // never load (exactly thrill.com's game rows). We don't render pixels, so the
+  // right bias for a content extractor is "everything is visible/measured, once":
+  // report each observed element as fully intersecting on the next tick, which
+  // triggers the lazy load. Fire ONCE per observe() — no repeat loop — and the
+  // capture window + max_intercepts still bound any infinite-scroll fan-out.
+  (function installObservers() {
+    function rectOf(el) {
+      try {
+        const r = el && el.getBoundingClientRect && el.getBoundingClientRect();
+        if (r) return r;
+      } catch (_) {}
+      return { x: 0, y: 0, top: 0, left: 0, bottom: 0, right: 0, width: 0, height: 0 };
+    }
+    const now = () => { try { return g.performance && g.performance.now ? g.performance.now() : 0; } catch (_) { return 0; } };
+    class DracoIntersectionObserver {
+      constructor(cb) { this._cb = typeof cb === "function" ? cb : function () {}; this._els = new Set(); }
+      observe(el) {
+        if (!el || this._els.has(el)) return;
+        this._els.add(el);
+        setTimeout(() => {
+          if (!this._els.has(el)) return; // unobserved/disconnected before firing
+          const rect = rectOf(el);
+          try {
+            this._cb([{
+              target: el, isIntersecting: true, intersectionRatio: 1,
+              boundingClientRect: rect, intersectionRect: rect, rootBounds: rect, time: now(),
+            }], this);
+          } catch (_) {}
+        }, 0);
+      }
+      unobserve(el) { this._els.delete(el); }
+      disconnect() { this._els.clear(); }
+      takeRecords() { return []; }
+    }
+    class DracoResizeObserver {
+      constructor(cb) { this._cb = typeof cb === "function" ? cb : function () {}; this._els = new Set(); }
+      observe(el) {
+        if (!el || this._els.has(el)) return;
+        this._els.add(el);
+        setTimeout(() => {
+          if (!this._els.has(el)) return;
+          const rect = rectOf(el);
+          const box = [{ inlineSize: rect.width || 0, blockSize: rect.height || 0 }];
+          try {
+            this._cb([{
+              target: el, contentRect: rect,
+              borderBoxSize: box, contentBoxSize: box, devicePixelContentBoxSize: box,
+            }], this);
+          } catch (_) {}
+        }, 0);
+      }
+      unobserve(el) { this._els.delete(el); }
+      disconnect() { this._els.clear(); }
+      takeRecords() { return []; }
+    }
+    try { g.IntersectionObserver = DracoIntersectionObserver; } catch (_) {}
+    try { w.IntersectionObserver = DracoIntersectionObserver; } catch (_) {}
+    try { g.ResizeObserver = DracoResizeObserver; } catch (_) {}
+    try { w.ResizeObserver = DracoResizeObserver; } catch (_) {}
+  })();
+
   // 3. fetch / XHR interceptor → op_raze_fetch. Reuse happy-dom's Headers when
   //    present; otherwise a tiny shim below.
   function headersToPairs(h) {
