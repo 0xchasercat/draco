@@ -867,6 +867,16 @@ async fn run_capture_inner(
         "try { globalThis.__dracoClearCurrentScript(); } catch (_) {}",
     );
 
+    // Parsing-finished moment: the document-order scripts have all evaluated.
+    // Fire the document lifecycle (readyState transitions, DOMContentLoaded,
+    // window load) so boot code gated on those signals proceeds — a real browser
+    // fires both events here, BEFORE dynamic import()s settle, and late-running
+    // chunk code then observes readyState === "complete" (see glue §7).
+    let _ = runtime.execute_script(
+        "draco:lifecycle",
+        "try { globalThis.__dracoFireLifecycle(); } catch (_) {}",
+    );
+
     // 3. Capture window: pump the event loop until quiescence or the hard cap.
     let outcome = drive_capture_window(&mut runtime, &cap, cfg, threw_in_page).await;
 
@@ -1962,6 +1972,50 @@ mod tests {
             report.requests.iter().map(|r| &r.url).collect::<Vec<_>>(),
             report.logs
         );
+    }
+
+    #[test]
+    fn document_lifecycle_events_fire_after_script_eval() {
+        // The classic boot gates: framework/data code runs immediately when the
+        // document already finished loading, else waits for DOMContentLoaded /
+        // load / readystatechange. happy-dom never runs the loading lifecycle for
+        // our document.write path, so without glue §7 these gates stall forever
+        // and the shell hydrates without its data (thrill.com's providers/
+        // geolocation/license calls). All three canonical forms must fire, and
+        // during script evaluation readyState must read "loading" (browser-
+        // faithful: scripts execute during parse), flipping to "complete" after.
+        let html = r#"<html><body><script>
+            if (document.readyState === "loading") fetch("/api/was-loading");
+            document.addEventListener("DOMContentLoaded", function () { fetch("/api/dcl"); });
+            window.addEventListener("load", function () { fetch("/api/load"); });
+            document.addEventListener("readystatechange", function () {
+                if (document.readyState === "complete") fetch("/api/ready-complete");
+            });
+        </script></body></html>"#;
+        let report = run_capture(
+            "https://boot.example.com/",
+            html,
+            &CaptureConfig {
+                capture_window_ms: 500,
+                quiesce_ms: 20,
+                max_intercepts: 8,
+                stub_response_json: "{}".to_string(),
+            },
+            null_fetcher(),
+        );
+        let urls: Vec<&str> = report.requests.iter().map(|r| r.url.as_str()).collect();
+        for want in [
+            "https://boot.example.com/api/was-loading",
+            "https://boot.example.com/api/dcl",
+            "https://boot.example.com/api/load",
+            "https://boot.example.com/api/ready-complete",
+        ] {
+            assert!(
+                urls.contains(&want),
+                "lifecycle gate {want} did not fire; got {urls:?}, logs={:?}",
+                report.logs
+            );
+        }
     }
 
     #[test]

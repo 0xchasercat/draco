@@ -709,6 +709,74 @@
     try { Object.defineProperty(w.document, "currentScript", { value: null, configurable: true }); } catch (_) {}
   };
 
+  // 7. Document lifecycle: readyState / readystatechange / DOMContentLoaded /
+  //    window load. We load the HTML via document.write() and evaluate the page's
+  //    scripts ourselves, and happy-dom never runs the loading lifecycle in that
+  //    path — readyState never advances and neither event dispatches. Framework
+  //    boot code commonly gates its DATA loading on exactly these signals (the
+  //    classic `document.readyState === "complete" ? run() :
+  //    window.addEventListener("load", run)`), so without them the shell hydrates
+  //    but the gated data fetches never fire (thrill.com: player/tickets fired,
+  //    while the load-gated providers/geolocation/license calls never did). A
+  //    real browser fires BOTH events almost immediately after parsing — before
+  //    dynamic import()s settle — so late-running chunk code observes
+  //    readyState === "complete" and proceeds.
+  //
+  //    While our page scripts run, the browser-faithful state is "loading"
+  //    (scripts execute during parse), so we shadow readyState now and the
+  //    runtime calls __dracoFireLifecycle() once the document-order scripts have
+  //    evaluated — the parsing-finished moment. Window-level dispatch is
+  //    self-adapting: page code registers listeners on globalThis (the page's
+  //    `window`), whose listener registry may or may not be shared with the
+  //    happy-dom Window, so probes detect whether a dispatch reached the other
+  //    target and fire a synthetic one only when it did not (never double-fires
+  //    a shared registry).
+  let dracoRs = "loading";
+  try {
+    Object.defineProperty(w.document, "readyState", {
+      configurable: true,
+      get: function () { return dracoRs; },
+    });
+  } catch (_) {}
+  let gDclSeen = false, wLoadSeen = false;
+  try { if (g !== w && typeof g.addEventListener === "function") g.addEventListener("DOMContentLoaded", function () { gDclSeen = true; }); } catch (_) {}
+  try { w.addEventListener("load", function () { wLoadSeen = true; }); } catch (_) {}
+  function mkEvent(name, opts) {
+    try { return new (w.Event || g.Event)(name, opts || {}); } catch (_) { return { type: name }; }
+  }
+  let lifecycleFired = false;
+  g.__dracoFireLifecycle = function () {
+    if (lifecycleFired) return;
+    lifecycleFired = true;
+    try {
+      dracoRs = "interactive";
+      try { w.document.dispatchEvent(mkEvent("readystatechange")); } catch (_) {}
+      // DOMContentLoaded targets the document and bubbles to window.
+      try { w.document.dispatchEvent(mkEvent("DOMContentLoaded", { bubbles: true })); } catch (_) {}
+      // If the bubble did not reach globalThis-registered listeners (separate
+      // registry), fire a synthetic window-level DCL there.
+      if (!gDclSeen && g !== w && typeof g.dispatchEvent === "function") {
+        try { g.dispatchEvent(mkEvent("DOMContentLoaded")); } catch (_) {}
+      }
+      dracoRs = "complete";
+      try { w.document.dispatchEvent(mkEvent("readystatechange")); } catch (_) {}
+      // load targets the window. Page code's `window` is globalThis; dispatch
+      // there first, then cover the happy-dom Window if it was not reached.
+      let gLoadOk = false;
+      if (g !== w && typeof g.dispatchEvent === "function") {
+        try { g.dispatchEvent(mkEvent("load")); gLoadOk = true; } catch (_) {}
+      }
+      if (!wLoadSeen) {
+        try { w.dispatchEvent(mkEvent("load")); } catch (_) {}
+      }
+      // Direct handler properties (onload) assigned but not reached by either
+      // dispatch (e.g. assigned on the alias without a wired registry).
+      if (!gLoadOk && !wLoadSeen && typeof g.onload === "function") {
+        try { g.onload(mkEvent("load")); } catch (_) {}
+      }
+    } catch (_) {}
+  };
+
   // Expose the serializer the Rust side calls after the capture window.
   g.__dracoSerialize = function () {
     try { return w.document.documentElement.outerHTML; } catch (_) { return ""; }
