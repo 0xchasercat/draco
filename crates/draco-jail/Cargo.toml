@@ -16,6 +16,12 @@ draco-types = { workspace = true }
 draco-runtime = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+# Async IPC transport (Option B): tokio::net::UnixStream + the async frame codec
+# so the child runs a reactor and the supervisor serves concurrently. Portable
+# (the child + supervisor run on macOS too). `net` = UnixStream, `io-util` =
+# AsyncRead/WriteExt, `sync` = oneshot/Mutex for the request/reply correlation,
+# `time` = per-fetch timeouts.
+tokio = { workspace = true, features = ["net", "io-util", "sync", "time"] }
 
 # Linux-only jail mechanics (spec §7 & §14). cfg-gated so non-Linux hosts build
 # the isolate-mode path without pulling these in.
