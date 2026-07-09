@@ -468,15 +468,49 @@
   try { hookConsole(g.console); } catch (_) {}
   try { if (w.console && w.console !== g.console) hookConsole(w.console); } catch (_) {}
 
-  // 6. Per-inline-script `document.currentScript`. When WE evaluate page scripts
-  //    (rather than happy-dom's own runner) currentScript is null; analytics/tag
-  //    scripts commonly read `document.currentScript.parentElement`. Point it at a
-  //    fresh <script> appended to <head> for the currently running inline script.
-  g.__dracoSetCurrentScript = function () {
+  // 6. Per-script `document.currentScript`. happy-dom's own script runner is
+  //    disabled, so WE evaluate page scripts and currentScript would otherwise be
+  //    null. Frameworks read `document.currentScript.parentElement` to locate
+  //    their mount node — SvelteKit's client bootstrap mounts into exactly that —
+  //    so we point currentScript at the REAL parsed <script> node for the block
+  //    being run, matched by inline source text (or external src). That node is
+  //    correctly parented in the document tree (e.g. inside the app's mount <div>),
+  //    so the mount lands where the framework expects. Grafting a synthetic
+  //    <script> onto <head> (the previous behavior) gave a NON-null but WRONG
+  //    parent, silently misdirecting the mount into <head> — worse than null.
+  const csClaimed = new WeakSet();
+  g.__dracoSetCurrentScript = function (inlineSrc, externalUrl) {
     try {
-      const s = w.document.createElement("script");
-      w.document.head.appendChild(s);
-      Object.defineProperty(w.document, "currentScript", { value: s, configurable: true });
+      let node = null;
+      const scripts = w.document.getElementsByTagName("script");
+      if (externalUrl != null) {
+        for (let i = 0; i < scripts.length; i++) {
+          const s = scripts[i];
+          if (csClaimed.has(s)) continue;
+          const raw = s.getAttribute && s.getAttribute("src");
+          if (!raw) continue;
+          if (s.src === externalUrl || absolutize(raw) === externalUrl) { node = s; break; }
+        }
+      } else if (inlineSrc != null) {
+        const want = String(inlineSrc).trim();
+        for (let i = 0; i < scripts.length; i++) {
+          const s = scripts[i];
+          if (csClaimed.has(s)) continue;
+          if (s.src) continue; // inline only
+          if ((s.textContent || "").trim() === want) { node = s; break; }
+        }
+      }
+      if (node) {
+        csClaimed.add(node);
+      } else {
+        // Real node not found (shouldn't happen for a parsed inline script): an
+        // inert synthetic node parented to <body>, never <head>, so a
+        // currentScript.parentElement read lands on a plausible container rather
+        // than misdirecting a mount into the document head.
+        node = w.document.createElement("script");
+        try { (w.document.body || w.document.documentElement || w.document.head).appendChild(node); } catch (_) {}
+      }
+      Object.defineProperty(w.document, "currentScript", { value: node, configurable: true });
     } catch (_) {}
   };
   g.__dracoClearCurrentScript = function () {
