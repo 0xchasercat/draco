@@ -1887,6 +1887,47 @@ mod tests {
     }
 
     #[test]
+    fn injected_module_script_runs_via_import_not_happydom() {
+        // A dynamically inserted <script type="module" src=…> (e.g. thrill.com's
+        // game-loader) must be loaded + evaluated as an ES module through our
+        // MapModuleLoader — not fall through to happy-dom's disabled module loader
+        // (a NotSupportedError) or be classic-eval'd (breaks on import/export). We
+        // prove the module ran by capturing a fetch its top-level body makes.
+        let html = r#"<html><body><script>
+            var s = document.createElement("script");
+            s.type = "module";
+            s.src = "/mod/game-loader.js";
+            document.head.appendChild(s);
+        </script></body></html>"#;
+        let mut resources = HashMap::new();
+        resources.insert(
+            "https://ex.example.com/mod/game-loader.js".to_string(),
+            // Module-only syntax (export) proves it's evaluated as a module, not eval'd.
+            br#"export const loaded = true; fetch("/from-module");"#.to_vec(),
+        );
+        let report = run_capture(
+            "https://ex.example.com/",
+            html,
+            &CaptureConfig {
+                capture_window_ms: 500,
+                quiesce_ms: 20,
+                max_intercepts: 8,
+                stub_response_json: "{}".to_string(),
+            },
+            map_fetcher(resources),
+        );
+        assert!(
+            report
+                .requests
+                .iter()
+                .any(|r| r.url == "https://ex.example.com/from-module"),
+            "injected module script must load+evaluate via import(); got {:?}, logs={:?}",
+            report.requests.iter().map(|r| &r.url).collect::<Vec<_>>(),
+            report.logs
+        );
+    }
+
+    #[test]
     fn push_log_dedupes_exact_repeats() {
         // A framework warn repeated per-component must not exhaust the log budget
         // and evict the one distinct error that explains a failure.

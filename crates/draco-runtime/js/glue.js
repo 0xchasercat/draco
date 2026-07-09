@@ -463,12 +463,31 @@
     const u = scriptSrc(node);
     if (!u || node.__dracoLoaded) return false;
     node.__dracoLoaded = true;
-    // Kick off the chunk fetch ASYNCHRONOUSLY and return true (handled) at once —
-    // a dynamically inserted <script src> loads off-thread in a browser, so we must
-    // not block insertion. op_raze_load_script is an async op (returns a Promise):
-    // eval + fire `load` when it resolves, fire `error` on a miss/throw. Because we
-    // return immediately, a burst of appended chunks fetches CONCURRENTLY on the
-    // event loop instead of serializing one blocking round-trip at a time.
+    let type = "";
+    try { type = String((node.type || (node.getAttribute && node.getAttribute("type")) || "")).toLowerCase(); } catch (_) {}
+    if (type === "module") {
+      // A dynamically inserted <script type="module" src=…> must be loaded AND
+      // evaluated as an ES module — indirect eval() can't run import/export
+      // syntax. Route it through native dynamic import(), which resolves via the
+      // same MapModuleLoader (→ ScriptFetcher) the page's own import()s use.
+      // Returning true skips happy-dom's own (disabled) module loader, which only
+      // logs a NotSupportedError. The src is absolute, so resolution is
+      // base-independent; failure fires `error` (non-fatal), never aborts.
+      let ip = null;
+      try { ip = import(u); } catch (_) { ip = null; }
+      if (!ip || typeof ip.then !== "function") { fireScriptEvent(node, "error", u); return true; }
+      ip.then(
+        function () { fireScriptEvent(node, "load", u); },
+        function (e) { logSwallowed("module-script", e); fireScriptEvent(node, "error", u); },
+      );
+      return true;
+    }
+    // Classic <script src>: kick off the chunk fetch ASYNCHRONOUSLY and return true
+    // (handled) at once — a dynamically inserted <script src> loads off-thread in a
+    // browser, so we must not block insertion. op_raze_load_script is an async op
+    // (returns a Promise): eval + fire `load` when it resolves, fire `error` on a
+    // miss/throw. Because we return immediately, a burst of appended chunks fetches
+    // CONCURRENTLY on the event loop instead of serializing one round-trip at a time.
     let p = null;
     try { p = ops.op_raze_load_script(u); } catch (_) { p = null; }
     if (!p || typeof p.then !== "function") { fireScriptEvent(node, "error", u); return true; }
