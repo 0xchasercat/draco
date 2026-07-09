@@ -751,11 +751,10 @@ where
 {
     use crate::tier2::{discover_endpoints, rank_and_replay};
 
-    let capture_result =
-        match run_tier2_capture(run, url, body, config, opts, capture).await {
-            Ok(c) => c,
-            Err(term) => return term,
-        };
+    let capture_result = match run_tier2_capture(run, url, body, config, opts, capture).await {
+        Ok(c) => c,
+        Err(term) => return term,
+    };
 
     // The ranked catalog — the discovery product.
     let endpoints = discover_endpoints(&capture_result, url, config.allow_unsafe_replay);
@@ -841,11 +840,10 @@ where
 
     // Prefetch subresources, spawn/reuse the isolate, capture — shared with the
     // discovery path.
-    let capture_result =
-        match run_tier2_capture(run, url, body, config, opts, capture).await {
-            Ok(c) => c,
-            Err(term) => return Some(term),
-        };
+    let capture_result = match run_tier2_capture(run, url, body, config, opts, capture).await {
+        Ok(c) => c,
+        Err(term) => return Some(term),
+    };
 
     // --- Rank + replay the winner -----------------------------------------
     // Mutation-safety (see `ranking::best_replayable`) is applied here at replay
@@ -1915,7 +1913,11 @@ mod tests {
             .find(|t| t.action == "runtime.spawn")
             .unwrap();
         assert_eq!(spawn.outcome, StepOutcome::Failed);
-        assert_eq!(fetcher.replay_calls(), 0, "no replay after a capture failure");
+        assert_eq!(
+            fetcher.replay_calls(),
+            0,
+            "no replay after a capture failure"
+        );
     }
 
     #[tokio::test]
