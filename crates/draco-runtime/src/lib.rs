@@ -311,6 +311,11 @@ struct CaptureState {
     /// `op_raze_log` (glue) and the Rust-side script-throw sites; bounded by
     /// [`CaptureState::push_log`].
     logs: Vec<String>,
+    /// Monotonic clock for this capture, started at isolate construction. The
+    /// `[raze.*]` diagnostics stamp `[+{ms}]` off it so `--runtime-log` reads as a
+    /// timeline — when each fetch/chunk resolved and when the window closed — the
+    /// raw material for tuning the capture-window early-exit.
+    started: Instant,
 }
 
 /// Hard bounds on collected diagnostic log lines, so a pathological page (e.g. a
@@ -449,10 +454,13 @@ async fn op_raze_fetch(
     {
         let op_state = state.borrow();
         let cap = op_state.borrow::<Rc<RefCell<CaptureState>>>().clone();
-        cap.borrow_mut().push_log(&format!(
-            "[raze.fetch] {} {} → {log_status} ({log_len}b, {log_kind})",
+        let mut cs = cap.borrow_mut();
+        let t = cs.started.elapsed().as_millis();
+        let line = format!(
+            "[+{t}ms] [raze.fetch] {} {} → {log_status} ({log_len}b, {log_kind})",
             api_req.method, api_req.url
-        ));
+        );
+        cs.push_log(&line);
     }
 
     let resp = match live {
@@ -510,7 +518,10 @@ async fn op_raze_load_script(
     if bytes.is_none() {
         let op_state = state.borrow();
         let cap = op_state.borrow::<Rc<RefCell<CaptureState>>>().clone();
-        cap.borrow_mut().push_log(&format!("[raze.chunk] MISS {url}"));
+        let mut cs = cap.borrow_mut();
+        let t = cs.started.elapsed().as_millis();
+        let line = format!("[+{t}ms] [raze.chunk] MISS {url}");
+        cs.push_log(&line);
     }
     bytes.map(|b| String::from_utf8_lossy(&b).into_owned())
 }
@@ -699,8 +710,12 @@ impl ModuleLoader for MapModuleLoader {
                 //    poisoning the graph with a silent empty module. Surface the
                 //    miss — a route/entry chunk that fails to load stalls hydration
                 //    and would otherwise look like an unexplained empty render.
-                cap.borrow_mut()
-                    .push_log(&format!("[raze.module] MISS {key}"));
+                {
+                    let mut cs = cap.borrow_mut();
+                    let t = cs.started.elapsed().as_millis();
+                    let line = format!("[+{t}ms] [raze.module] MISS {key}");
+                    cs.push_log(&line);
+                }
                 Err(JsErrorBox::generic(format!(
                     "draco: failed to load module (no on-demand fetch could \
                      retrieve it): {key}"
@@ -761,6 +776,7 @@ async fn run_capture_inner(
         inflight: inflight.clone(),
         rendered_html: None,
         logs: Vec::new(),
+        started: Instant::now(),
     }));
 
     // Restore the DOM-engine snapshot and register the ops for this isolate.
@@ -1076,12 +1092,15 @@ async fn drive_capture_window(
     // an event-loop stall before the data fetch dispatched.
     let elapsed_ms = start.elapsed().as_millis();
     {
-        let n = cap.borrow().requests.len();
+        let mut cs = cap.borrow_mut();
+        let n = cs.requests.len();
         let infl = inflight.get();
-        cap.borrow_mut().push_log(&format!(
-            "[raze.window] closed via {close_reason} after {elapsed_ms}ms; \
+        let t = cs.started.elapsed().as_millis();
+        let line = format!(
+            "[+{t}ms] [raze.window] closed via {close_reason} (window {elapsed_ms}ms); \
              {n} request(s) captured, {infl} load(s) inflight"
-        ));
+        );
+        cs.push_log(&line);
     }
 
     classify_window_close(cap, threw_in_page, loop_threw, close_reason == "hard-cap")
@@ -2095,6 +2114,7 @@ mod tests {
             inflight: Rc::new(Cell::new(0)),
             rendered_html: None,
             logs: Vec::new(),
+            started: Instant::now(),
         };
         for _ in 0..50 {
             cs.push_log("[console.warn] No --breakpoint-sm value found in CSS variables");
