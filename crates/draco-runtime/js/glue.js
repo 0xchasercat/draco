@@ -162,6 +162,171 @@
     try { w.PerformanceObserver = g.PerformanceObserver; } catch (_) {}
   }
 
+  // Web Animations API shim (Element.animate / getAnimations). happy-dom ships
+  // neither, and Svelte 5's transition runtime calls `element.animate(...)`
+  // inside its effect flush — the TypeError aborts the component tree MID-MOUNT,
+  // so everything transition-wrapped (typically the page's main content) never
+  // renders while transition-free regions (footers) do. The shim is inert and
+  // COMPLETION-BIASED: we don't render pixels, so every animation reports
+  // "finished" almost immediately and hydration proceeds at full speed.
+  //
+  // Timing contract: finish is scheduled ~20ms out (one rAF tick — our rAF is
+  // setTimeout(16) — plus slack), so handlers attached right after `animate()`
+  // returns AND handlers attached inside a first rAF both land before finish.
+  // `onfinish` is an accessor: assigned AFTER finish already fired → invoked
+  // async immediately, so late subscribers cannot hang a transition. `finished`
+  // is a promise resolving with the animation. cancel()/finish() settle early;
+  // cancel resolves `finished` too (spec rejects, but an inert shim must never
+  // hang a transition chain or spray unhandled rejections into the logs).
+  (function installWebAnimations() {
+    const ElementCtor = g.Element || (w && w.Element);
+    if (!ElementCtor || !ElementCtor.prototype) return;
+    if (typeof ElementCtor.prototype.animate === "function") return; // real impl wins
+    function makeAnimation(effectTarget) {
+      const a = {
+        effect: { target: effectTarget },
+        playState: "running",
+        currentTime: 0,
+        startTime: 0,
+        playbackRate: 1,
+        pending: false,
+        _onfinish: null,
+        _oncancel: null,
+        _listeners: Object.create(null),
+        _finished: false,
+        _resolveFinished: null,
+      };
+      a.finished = new Promise((resolve) => { a._resolveFinished = resolve; });
+      const fire = (type) => {
+        const ev = { type, target: a, currentTarget: a, timelineTime: 0 };
+        const h = type === "finish" ? a._onfinish : type === "cancel" ? a._oncancel : null;
+        if (typeof h === "function") { try { h.call(a, ev); } catch (_) {} }
+        const ls = a._listeners[type];
+        if (ls) for (const fn of ls.slice()) { try { fn.call(a, ev); } catch (_) {} }
+      };
+      const settle = (state) => {
+        if (a._finished) return;
+        a._finished = true;
+        a.playState = state;
+        try { a._resolveFinished(a); } catch (_) {}
+        fire(state === "finished" ? "finish" : "cancel");
+        // A cancel still settles `finished` so awaiting code never hangs.
+        if (state !== "finished") { /* resolved above */ }
+      };
+      Object.defineProperty(a, "onfinish", {
+        configurable: true,
+        get() { return a._onfinish; },
+        set(fn) {
+          a._onfinish = fn;
+          // Late subscription after finish: invoke async so the caller's
+          // transition chain still completes.
+          if (a._finished && a.playState === "finished" && typeof fn === "function") {
+            setTimeout(() => { try { fn.call(a, { type: "finish", target: a }); } catch (_) {} }, 0);
+          }
+        },
+      });
+      Object.defineProperty(a, "oncancel", {
+        configurable: true,
+        get() { return a._oncancel; },
+        set(fn) { a._oncancel = fn; },
+      });
+      a.addEventListener = function (t, fn) { if (typeof fn === "function") (a._listeners[t] || (a._listeners[t] = [])).push(fn); };
+      a.removeEventListener = function (t, fn) { const ls = a._listeners[t]; if (!ls) return; const i = ls.indexOf(fn); if (i >= 0) ls.splice(i, 1); };
+      a.play = function () { if (!a._finished) a.playState = "running"; };
+      a.pause = function () { if (!a._finished) a.playState = "paused"; };
+      a.reverse = function () {};
+      a.updatePlaybackRate = function () {};
+      a.commitStyles = function () {};
+      a.persist = function () {};
+      a.finish = function () { settle("finished"); };
+      a.cancel = function () { settle("idle"); };
+      // Auto-finish shortly after creation (see timing contract above).
+      setTimeout(() => settle("finished"), 20);
+      return a;
+    }
+    ElementCtor.prototype.animate = function () { return makeAnimation(this); };
+    if (typeof ElementCtor.prototype.getAnimations !== "function") {
+      ElementCtor.prototype.getAnimations = function () { return []; };
+    }
+    const DocCtor = g.Document || (w && w.Document);
+    if (DocCtor && DocCtor.prototype && typeof DocCtor.prototype.getAnimations !== "function") {
+      try { DocCtor.prototype.getAnimations = function () { return []; }; } catch (_) {}
+    }
+    if (typeof g.Animation === "undefined") {
+      // Bare-constructor form (`new Animation(effect)`) some motion libs probe.
+      g.Animation = function Animation() { return makeAnimation(null); };
+      try { w.Animation = g.Animation; } catch (_) {}
+    }
+  })();
+
+  // Completion-biased IntersectionObserver + ResizeObserver. happy-dom and our
+  // snapshot polyfills stub these as INERT no-ops that never fire their callback —
+  // which silently breaks the most common lazy-content pattern on modern SPAs: a
+  // section observes itself and fetches/renders its data only once it scrolls into
+  // view (IntersectionObserver) or is measured (ResizeObserver). With a no-op
+  // observer the callback never fires, so those sections stay in their initial
+  // (skeleton) state forever — the shell hydrates but the data-driven sections
+  // never load (exactly thrill.com's game rows). We don't render pixels, so the
+  // right bias for a content extractor is "everything is visible/measured, once":
+  // report each observed element as fully intersecting on the next tick, which
+  // triggers the lazy load. Fire ONCE per observe() — no repeat loop — and the
+  // capture window + max_intercepts still bound any infinite-scroll fan-out.
+  (function installObservers() {
+    function rectOf(el) {
+      try {
+        const r = el && el.getBoundingClientRect && el.getBoundingClientRect();
+        if (r) return r;
+      } catch (_) {}
+      return { x: 0, y: 0, top: 0, left: 0, bottom: 0, right: 0, width: 0, height: 0 };
+    }
+    const now = () => { try { return g.performance && g.performance.now ? g.performance.now() : 0; } catch (_) { return 0; } };
+    class DracoIntersectionObserver {
+      constructor(cb) { this._cb = typeof cb === "function" ? cb : function () {}; this._els = new Set(); }
+      observe(el) {
+        if (!el || this._els.has(el)) return;
+        this._els.add(el);
+        setTimeout(() => {
+          if (!this._els.has(el)) return; // unobserved/disconnected before firing
+          const rect = rectOf(el);
+          try {
+            this._cb([{
+              target: el, isIntersecting: true, intersectionRatio: 1,
+              boundingClientRect: rect, intersectionRect: rect, rootBounds: rect, time: now(),
+            }], this);
+          } catch (_) {}
+        }, 0);
+      }
+      unobserve(el) { this._els.delete(el); }
+      disconnect() { this._els.clear(); }
+      takeRecords() { return []; }
+    }
+    class DracoResizeObserver {
+      constructor(cb) { this._cb = typeof cb === "function" ? cb : function () {}; this._els = new Set(); }
+      observe(el) {
+        if (!el || this._els.has(el)) return;
+        this._els.add(el);
+        setTimeout(() => {
+          if (!this._els.has(el)) return;
+          const rect = rectOf(el);
+          const box = [{ inlineSize: rect.width || 0, blockSize: rect.height || 0 }];
+          try {
+            this._cb([{
+              target: el, contentRect: rect,
+              borderBoxSize: box, contentBoxSize: box, devicePixelContentBoxSize: box,
+            }], this);
+          } catch (_) {}
+        }, 0);
+      }
+      unobserve(el) { this._els.delete(el); }
+      disconnect() { this._els.clear(); }
+      takeRecords() { return []; }
+    }
+    try { g.IntersectionObserver = DracoIntersectionObserver; } catch (_) {}
+    try { w.IntersectionObserver = DracoIntersectionObserver; } catch (_) {}
+    try { g.ResizeObserver = DracoResizeObserver; } catch (_) {}
+    try { w.ResizeObserver = DracoResizeObserver; } catch (_) {}
+  })();
+
   // 3. fetch / XHR interceptor → op_raze_fetch. Reuse happy-dom's Headers when
   //    present; otherwise a tiny shim below.
   function headersToPairs(h) {
@@ -186,10 +351,13 @@
     const base = (w.location && w.location.href) || url;
     try { return ops.op_resolve_url(base, String(u)); } catch (_) { return String(u); }
   }
-  function record(via, method, u, headers, bodyStr) {
+  // Async: op_raze_fetch records the request (always) and, in Render mode, may
+  // fetch it live via draco-net and return the REAL {status,headers,body}. Awaits
+  // that op and parses its JSON; on any failure falls back to the synthetic stub.
+  async function record(via, method, u, headers, bodyStr) {
     const req = { via, method: (method || "GET").toUpperCase(), url: absolutize(u), headers: headers || [], body: bodyStr == null ? null : String(bodyStr) };
     let respJson;
-    try { respJson = ops.op_raze_fetch(JSON.stringify(req)); } catch (_) { respJson = null; }
+    try { respJson = await ops.op_raze_fetch(JSON.stringify(req)); } catch (_) { respJson = null; }
     if (!respJson) return { status: 200, headers: [["content-type", "application/json"]], body: stubBody };
     try { return JSON.parse(respJson); } catch (_) { return { status: 200, headers: [["content-type", "application/json"]], body: stubBody }; }
   }
@@ -230,7 +398,7 @@
       clone() { return makeResponse(stub, finalUrl); },
     };
   }
-  const doFetch = function fetch(input, init) {
+  const doFetch = async function fetch(input, init) {
     init = init || {};
     let u, method = init.method || "GET", headers = headersToPairs(init.headers), body = init.body;
     if (input && typeof input === "object" && "url" in input) {
@@ -239,8 +407,8 @@
       if ((!init.headers || headers.length === 0) && input.headers) headers = headersToPairs(input.headers);
       if (init.body == null && input.body != null) body = input.body;
     } else { u = String(input); }
-    const stub = record("fetch", method, u, headers, bodyToString(body));
-    return Promise.resolve(makeResponse(stub, absolutize(u)));
+    const stub = await record("fetch", method, u, headers, bodyToString(body));
+    return makeResponse(stub, absolutize(u));
   };
   g.fetch = doFetch;
   try { w.fetch = doFetch; } catch (_) {}
@@ -259,8 +427,10 @@
     abort() { this._ab = true; this._emit("abort"); }
     send(body) {
       if (this._ab) return;
-      const stub = record("xhr", this._m, this._u, this._h, body == null ? null : bodyToString(body));
-      queueMicrotask(() => {
+      // record() is async (it may fetch live in Render mode); deliver on resolve.
+      // The arrow callback preserves `this`; delivery is a microtask/turn later,
+      // same observable ordering as the old queueMicrotask path.
+      record("xhr", this._m, this._u, this._h, body == null ? null : bodyToString(body)).then((stub) => {
         if (this._ab) return;
         this.status = (stub && stub.status) || 200; this.statusText = this.status === 200 ? "OK" : "";
         this._rh = (stub && stub.headers) || [];
@@ -296,7 +466,10 @@
       this.onclose = null;
       this._l = Object.create(null);
       try {
-        record("fetch", defaultMethod, u, [["accept", "text/event-stream"]], null);
+        // Fire-and-forget: record the streaming endpoint (discover cares about it).
+        // record() is async now; swallow any rejection since the stream is inert.
+        const p = record("fetch", defaultMethod, u, [["accept", "text/event-stream"]], null);
+        if (p && typeof p.then === "function") p.catch(function () {});
       } catch (_) {}
     };
     Ctor.prototype.addEventListener = function (t, fn) {
@@ -358,12 +531,31 @@
     const u = scriptSrc(node);
     if (!u || node.__dracoLoaded) return false;
     node.__dracoLoaded = true;
-    // Kick off the chunk fetch ASYNCHRONOUSLY and return true (handled) at once —
-    // a dynamically inserted <script src> loads off-thread in a browser, so we must
-    // not block insertion. op_raze_load_script is an async op (returns a Promise):
-    // eval + fire `load` when it resolves, fire `error` on a miss/throw. Because we
-    // return immediately, a burst of appended chunks fetches CONCURRENTLY on the
-    // event loop instead of serializing one blocking round-trip at a time.
+    let type = "";
+    try { type = String((node.type || (node.getAttribute && node.getAttribute("type")) || "")).toLowerCase(); } catch (_) {}
+    if (type === "module") {
+      // A dynamically inserted <script type="module" src=…> must be loaded AND
+      // evaluated as an ES module — indirect eval() can't run import/export
+      // syntax. Route it through native dynamic import(), which resolves via the
+      // same MapModuleLoader (→ ScriptFetcher) the page's own import()s use.
+      // Returning true skips happy-dom's own (disabled) module loader, which only
+      // logs a NotSupportedError. The src is absolute, so resolution is
+      // base-independent; failure fires `error` (non-fatal), never aborts.
+      let ip = null;
+      try { ip = import(u); } catch (_) { ip = null; }
+      if (!ip || typeof ip.then !== "function") { fireScriptEvent(node, "error", u); return true; }
+      ip.then(
+        function () { fireScriptEvent(node, "load", u); },
+        function (e) { logSwallowed("module-script", e); fireScriptEvent(node, "error", u); },
+      );
+      return true;
+    }
+    // Classic <script src>: kick off the chunk fetch ASYNCHRONOUSLY and return true
+    // (handled) at once — a dynamically inserted <script src> loads off-thread in a
+    // browser, so we must not block insertion. op_raze_load_script is an async op
+    // (returns a Promise): eval + fire `load` when it resolves, fire `error` on a
+    // miss/throw. Because we return immediately, a burst of appended chunks fetches
+    // CONCURRENTLY on the event loop instead of serializing one round-trip at a time.
     let p = null;
     try { p = ops.op_raze_load_script(u); } catch (_) { p = null; }
     if (!p || typeof p.then !== "function") { fireScriptEvent(node, "error", u); return true; }
@@ -515,6 +707,74 @@
   };
   g.__dracoClearCurrentScript = function () {
     try { Object.defineProperty(w.document, "currentScript", { value: null, configurable: true }); } catch (_) {}
+  };
+
+  // 7. Document lifecycle: readyState / readystatechange / DOMContentLoaded /
+  //    window load. We load the HTML via document.write() and evaluate the page's
+  //    scripts ourselves, and happy-dom never runs the loading lifecycle in that
+  //    path — readyState never advances and neither event dispatches. Framework
+  //    boot code commonly gates its DATA loading on exactly these signals (the
+  //    classic `document.readyState === "complete" ? run() :
+  //    window.addEventListener("load", run)`), so without them the shell hydrates
+  //    but the gated data fetches never fire (thrill.com: player/tickets fired,
+  //    while the load-gated providers/geolocation/license calls never did). A
+  //    real browser fires BOTH events almost immediately after parsing — before
+  //    dynamic import()s settle — so late-running chunk code observes
+  //    readyState === "complete" and proceeds.
+  //
+  //    While our page scripts run, the browser-faithful state is "loading"
+  //    (scripts execute during parse), so we shadow readyState now and the
+  //    runtime calls __dracoFireLifecycle() once the document-order scripts have
+  //    evaluated — the parsing-finished moment. Window-level dispatch is
+  //    self-adapting: page code registers listeners on globalThis (the page's
+  //    `window`), whose listener registry may or may not be shared with the
+  //    happy-dom Window, so probes detect whether a dispatch reached the other
+  //    target and fire a synthetic one only when it did not (never double-fires
+  //    a shared registry).
+  let dracoRs = "loading";
+  try {
+    Object.defineProperty(w.document, "readyState", {
+      configurable: true,
+      get: function () { return dracoRs; },
+    });
+  } catch (_) {}
+  let gDclSeen = false, wLoadSeen = false;
+  try { if (g !== w && typeof g.addEventListener === "function") g.addEventListener("DOMContentLoaded", function () { gDclSeen = true; }); } catch (_) {}
+  try { w.addEventListener("load", function () { wLoadSeen = true; }); } catch (_) {}
+  function mkEvent(name, opts) {
+    try { return new (w.Event || g.Event)(name, opts || {}); } catch (_) { return { type: name }; }
+  }
+  let lifecycleFired = false;
+  g.__dracoFireLifecycle = function () {
+    if (lifecycleFired) return;
+    lifecycleFired = true;
+    try {
+      dracoRs = "interactive";
+      try { w.document.dispatchEvent(mkEvent("readystatechange")); } catch (_) {}
+      // DOMContentLoaded targets the document and bubbles to window.
+      try { w.document.dispatchEvent(mkEvent("DOMContentLoaded", { bubbles: true })); } catch (_) {}
+      // If the bubble did not reach globalThis-registered listeners (separate
+      // registry), fire a synthetic window-level DCL there.
+      if (!gDclSeen && g !== w && typeof g.dispatchEvent === "function") {
+        try { g.dispatchEvent(mkEvent("DOMContentLoaded")); } catch (_) {}
+      }
+      dracoRs = "complete";
+      try { w.document.dispatchEvent(mkEvent("readystatechange")); } catch (_) {}
+      // load targets the window. Page code's `window` is globalThis; dispatch
+      // there first, then cover the happy-dom Window if it was not reached.
+      let gLoadOk = false;
+      if (g !== w && typeof g.dispatchEvent === "function") {
+        try { g.dispatchEvent(mkEvent("load")); gLoadOk = true; } catch (_) {}
+      }
+      if (!wLoadSeen) {
+        try { w.dispatchEvent(mkEvent("load")); } catch (_) {}
+      }
+      // Direct handler properties (onload) assigned but not reached by either
+      // dispatch (e.g. assigned on the alias without a wired registry).
+      if (!gLoadOk && !wLoadSeen && typeof g.onload === "function") {
+        try { g.onload(mkEvent("load")); } catch (_) {}
+      }
+    } catch (_) {}
   };
 
   // Expose the serializer the Rust side calls after the capture window.

@@ -580,6 +580,7 @@ mod tests {
     fn test_state() -> Arc<AppState> {
         Arc::new(AppState {
             defaults: Config {
+                force_render: false,
                 tier_max: 0,
                 respect_robots: false,
                 ..Config::default()

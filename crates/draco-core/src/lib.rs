@@ -193,6 +193,13 @@ pub struct Config {
     /// length-bounded child-side regardless. Set via the CLI `--runtime-log`
     /// flag or the daemon's `runtimeLog` request field (Draco extension).
     pub runtime_log: bool,
+    /// Force the render-then-Markdown escalation (Tier 2 **Render mode** — the
+    /// page's safe data requests hit the live network so a pure-CSR shell's
+    /// content materializes) even when the static shell isn't detected as
+    /// thin/skeleton. Hidden CLI knob (`--force-render`) for exercising Render mode
+    /// on demand; off by default and not exposed on the daemon, which relies on the
+    /// automatic thin-shell escalation.
+    pub force_render: bool,
 }
 
 impl Default for Config {
@@ -213,6 +220,7 @@ impl Default for Config {
             strict_sandbox: false,
             allow_unsafe_replay: false,
             runtime_log: false,
+            force_render: false,
         }
     }
 }
