@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.13.15"
+version = "0.14.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Draco — browserless, tiered data-extraction engine."
@@ -20,7 +20,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 draco-types = { path = "crates/draco-types" }
 draco-net = { path = "crates/draco-net" }
 draco-static = { path = "crates/draco-static" }
-draco-jail = { path = "crates/draco-jail" }
 draco-runtime = { path = "crates/draco-runtime" }
 draco-core = { path = "crates/draco-core" }
 

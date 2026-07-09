@@ -254,7 +254,7 @@ impl StaticEngine for MockStatic {
 // ---------------------------------------------------------------------------
 
 /// A [`Tier2Capture`] double that returns a canned set of intercepts (never
-/// spawns a real child). Lets ladder tests exercise the full Tier 2 rank/replay
+/// boots a real isolate). Lets ladder tests exercise the full Tier 2 rank/replay
 /// path offline. Records a call count so a test can assert capture was reached.
 pub struct MockCapture {
     result: Result<CaptureResult, DracoError>,
@@ -262,9 +262,9 @@ pub struct MockCapture {
 }
 
 impl MockCapture {
-    /// A representative sandbox level the mock child "reports", so ladder tests
-    /// can assert the `runtime.sandbox` trace step is recorded.
-    pub const MOCK_LEVEL: &'static str = "hardened: seccomp+netns+landlock";
+    /// A representative containment posture the mock capture "reports", so
+    /// ladder tests can assert the `runtime.sandbox` trace step is recorded.
+    pub const MOCK_LEVEL: &'static str = "isolate: in-process v8 (no host bindings)";
 
     /// Capture yields the given candidates (no request bodies) with a
     /// `Quiesced` outcome.
@@ -300,8 +300,8 @@ impl MockCapture {
 
     /// Capture yields no intercepts but *does* report page-side diagnostics
     /// (`CaptureResult::logs`) — the "page hydrated to nothing, and here is
-    /// why" case. Drives the `runtime.log` trace-step tests without forking a
-    /// child.
+    /// why" case. Drives the `runtime.log` trace-step tests without booting an
+    /// isolate.
     pub fn with_logs(logs: Vec<String>) -> Self {
         Self {
             result: Ok(CaptureResult {
@@ -319,7 +319,7 @@ impl MockCapture {
     /// Capture yields no interceptable requests but *does* return a serialized
     /// hydrated DOM — the render-then-Markdown case (a thin shell that hydrates
     /// its content without any data fetch, or whose fetch was inlined). Drives the
-    /// `runtime.render` escalation in ladder tests without forking a child.
+    /// `runtime.render` escalation in ladder tests without booting an isolate.
     pub fn rendered(dom: impl Into<String>) -> Self {
         Self {
             result: Ok(CaptureResult {
@@ -334,7 +334,7 @@ impl MockCapture {
         }
     }
 
-    /// Capture fails with the given jail error (spawn/protocol/killed).
+    /// Capture fails with the given error (spawn/protocol/killed).
     pub fn failing(e: DracoError) -> Self {
         Self {
             result: Err(e),
@@ -353,7 +353,6 @@ impl Tier2Capture for MockCapture {
         &self,
         _url: &str,
         _html: &[u8],
-        _resources: &[crate::tier2::ScriptResource],
         _config: &crate::Config,
         _opts: &draco_net::SessionOpts,
     ) -> Result<CaptureResult, DracoError> {
@@ -364,8 +363,8 @@ impl Tier2Capture for MockCapture {
 
 /// The default capture double for ladder tests that don't care about Tier 2:
 /// reaching Tier 2 with this seam yields no intercepts, so the ladder falls
-/// through to `Unsupported` exactly as the pre-Slice-4 skip did — without forking
-/// a child.
+/// through to `Unsupported` exactly as the pre-Slice-4 skip did — without
+/// booting an isolate.
 pub fn noop_capture() -> MockCapture {
     MockCapture::empty()
 }

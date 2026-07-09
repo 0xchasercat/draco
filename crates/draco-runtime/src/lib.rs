@@ -12,12 +12,14 @@
 //! stub so the page keeps hydrating and reveals more endpoints; when the window
 //! closes the hydrated DOM is serialized for the render-then-Markdown escalation.
 //!
-//! This crate is **self-contained**: no IPC lives here. `draco-jail` calls
-//! [`run_capture`] from the jailed child and maps each [`CapturedRequest`] to
-//! `draco_types::JailToSupervisor::Intercept` and [`CaptureReport::outcome`] to a
-//! `Result`. The frozen contract is `draco-types` (we reuse its
-//! [`draco_types::InterceptVia`] and [`draco_types::RuntimeOutcome`]); this
-//! crate's own API is designed for that wiring but is not itself frozen.
+//! This crate hosts the isolate **in-process**: `draco-core` calls [`run_capture`]
+//! directly (from a dedicated `spawn_blocking` thread, since `JsRuntime` is
+//! `!Send`) and maps each [`CapturedRequest`] and [`CaptureReport::outcome`] into
+//! its ladder. There is no separate process and no IPC: script, module, and chunk
+//! bytes are pulled by an async [`ScriptFetcher`] the caller supplies (backed by
+//! the pooled `draco-net` client + the immutable chunk cache) and awaited directly
+//! on the event loop. The shared contract is `draco-types` (we reuse its
+//! [`draco_types::InterceptVia`] and [`draco_types::RuntimeOutcome`]).
 //!
 //! ## Implementation notes
 //!
@@ -28,35 +30,41 @@
 //!   heap + compiled code only — ops are registered per-isolate and resolved
 //!   lazily by the baked JS (`Deno.core.ops.op_*`) after restore.
 //!
+//! * **Concurrent, non-blocking chunk loading.** The module loader and the
+//!   dynamic-`<script>` op are async: each `import` / injected chunk `.await`s the
+//!   [`ScriptFetcher`], so a code-split SPA's chunks fan out concurrently over the
+//!   event loop (the reactor drives many `draco-net` sockets in parallel) instead
+//!   of paying one blocking round-trip at a time — the whole point of the
+//!   in-process rewrite. An in-flight-load counter keeps the capture window from
+//!   quiescing while loads are still outstanding.
+//!
 //! * **JIT enabled; `--single-threaded`.** We pass `--single-threaded` via
 //!   `deno_core::v8_set_flags` *before* the first isolate is created; V8's JIT is
 //!   left ON. Real SPA hydration is hot JS (React/SvelteKit reconcilers, not just
-//!   snapshot restore + DOM construction), and `--jitless` ran it 3–10× slower —
-//!   slow enough to blow the capture/on-demand budgets and fail to extract
-//!   content. Containment does not rest on W^X: page JS has no host-capability
-//!   bindings (no I/O regardless of JIT), and on Linux the jail's seccomp still
-//!   kills the network/exec/ptrace breakout set while Landlock locks the FS.
-//!   `--single-threaded` keeps V8 from spawning background compiler/GC threads
-//!   (JIT still runs synchronously on the main thread). Flags V8 rejects are
-//!   reported and skipped (best-effort).
+//!   snapshot restore + DOM construction), and `--jitless` ran it 3–10× slower.
+//!   Containment does not rest on W^X: the page JS runs in an isolate with **no
+//!   host-capability bindings** — it cannot reach the network, filesystem, or
+//!   process regardless of JIT; the only I/O it can cause is the script fetches we
+//!   explicitly broker through the [`ScriptFetcher`]. `--single-threaded` keeps V8
+//!   from spawning background compiler/GC threads (JIT still runs on the main
+//!   thread). Flags V8 rejects are reported and skipped (best-effort).
 //!
-//! * **Timers / event-loop driver.** deno_core 0.406.0's only timer reactor is
-//!   tokio-based (`tokio::time::sleep_until`), so the event loop must run under a
-//!   tokio time driver — a pure `futures::executor::block_on` would panic the
-//!   moment a timer future is polled. Honoring the spec's *intent* (keep the
-//!   jailed child's syscall surface small), we use a **current-thread** tokio
-//!   runtime with **`enable_time()` only** — no worker pool, no I/O reactor. The
-//!   base bundle's `setTimeout`/`setInterval` scheduler is backed by the
-//!   `op_sleep` async op (tokio sleep); a pending `op_sleep` keeps
+//! * **Timers / event-loop driver.** deno_core 0.406.0's timer reactor is
+//!   tokio-based, and the isolate now performs real async network I/O, so
+//!   [`run_capture`] drives the event loop under a **current-thread** tokio runtime
+//!   built with **`enable_all()`** (I/O + time). Current-thread because `JsRuntime`
+//!   is `!Send`; the full driver set because `draco-net` sockets and `op_sleep`
+//!   both need it. The base bundle's `setTimeout`/`setInterval` scheduler is backed
+//!   by the `op_sleep` async op; a pending `op_sleep` (or an in-flight fetch) keeps
 //!   `poll_event_loop` returning `Pending`, which is exactly the "loop is busy"
 //!   signal the driver watches.
 
 #![allow(clippy::type_complexity)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{Arc, Once};
+use std::sync::Once;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -66,6 +74,7 @@ use deno_core::{
     ModuleType, OpState, PollEventLoopOptions, ResolutionKind, RuntimeOptions,
 };
 use deno_error::JsErrorBox;
+use futures::future::LocalBoxFuture;
 use futures::FutureExt;
 use serde::Deserialize;
 
@@ -136,49 +145,48 @@ pub struct CaptureReport {
     pub logs: Vec<String>,
 }
 
-/// Synchronous supervisor-backed script loader used for dynamically appended
-/// script chunks. The runtime stays network-free; production implementations route
-/// this through jail IPC to draco-core/draco-net.
-pub type ScriptLoader = dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static;
+/// Async, in-process source of script / module / chunk bytes for the isolate.
+///
+/// The runtime itself stays network-agnostic: `draco-core` implements this over
+/// its pooled `draco-net` client (plus the immutable chunk cache), and the isolate
+/// `.await`s it directly on the event loop. Because the module loader *and* the
+/// dynamic-`<script>` op both await this, V8 fans out concurrent chunk loads
+/// natively — no prefetch, no IPC, no blocking round-trip. `None` rejects exactly
+/// that one load, the way a browser treats a 404'd chunk.
+///
+/// The future is `!Send` on purpose: the whole capture is single-threaded (V8 is
+/// thread-bound), so loads are driven on the isolate's own event loop as a
+/// [`LocalBoxFuture`], matching deno_core's `boxed_local` module-loader idiom.
+pub trait ScriptFetcher {
+    fn fetch<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, Option<Vec<u8>>>;
+}
 
-/// Boot an isolate, evaluate `html`'s inline scripts under `url`, run the capture
-/// window, and return everything the page tried to fetch.
+/// Boot an isolate, evaluate `html`'s scripts under `url`, run the capture window,
+/// and return everything the page tried to fetch plus the hydrated DOM.
+///
+/// Runs **in-process**: the caller owns the thread (V8 is thread-bound and `!Send`,
+/// so `draco-core` invokes this from a dedicated `spawn_blocking` thread), and this
+/// function owns a current-thread tokio runtime with the full I/O + time drivers so
+/// the isolate's async script/chunk loads — served by `fetcher` over `draco-net` —
+/// make progress and fan out concurrently on the event loop.
 ///
 /// Never panics on page-author errors: a script that throws yields
 /// [`RuntimeOutcome::Threw`] (with whatever was captured before the throw), and
 /// the isolate is always torn down cleanly.
-pub fn run_capture(url: &str, html: &str, cfg: &CaptureConfig) -> CaptureReport {
-    run_capture_with_resources(url, html, cfg, HashMap::new())
-}
-
-/// As [`run_capture`], but with the page's script subresources pre-fetched by the
-/// (air-gapped) supervisor: a `{ url -> source }` map used to run external
-/// `<script src>` and to resolve `import` / `import()` for `type="module"` apps.
-/// The isolate itself never fetches — this is how ES-module SPAs hydrate while
-/// the child stays network-isolated.
-pub fn run_capture_with_resources(
+pub fn run_capture(
     url: &str,
     html: &str,
     cfg: &CaptureConfig,
-    resources: HashMap<String, Vec<u8>>,
-) -> CaptureReport {
-    run_capture_with_resources_and_loader(url, html, cfg, resources, None)
-}
-
-/// As [`run_capture_with_resources`], but with a supervisor-backed dynamic script
-/// loader for chunk URLs not present in the initial resource map.
-pub fn run_capture_with_resources_and_loader(
-    url: &str,
-    html: &str,
-    cfg: &CaptureConfig,
-    resources: HashMap<String, Vec<u8>>,
-    script_loader: Option<Arc<ScriptLoader>>,
+    fetcher: Rc<dyn ScriptFetcher>,
 ) -> CaptureReport {
     ensure_v8_flags();
 
-    // Current-thread tokio runtime, time driver only (see module docs).
+    // Current-thread tokio runtime with the FULL driver set. The isolate's async
+    // ops (`op_raze_load_script`) and module loader `.await` real `draco-net`
+    // fetches, which need the I/O reactor; `enable_all()` also provides the time
+    // driver that backs `op_sleep`. Current-thread because `JsRuntime` is `!Send`.
     let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_time()
+        .enable_all()
         .build()
     {
         Ok(rt) => rt,
@@ -194,9 +202,7 @@ pub fn run_capture_with_resources_and_loader(
         }
     };
 
-    rt.block_on(async move {
-        run_capture_inner_with_resources(url, html, cfg, resources, script_loader).await
-    })
+    rt.block_on(async move { run_capture_inner(url, html, cfg, fetcher).await })
 }
 
 /// Thin legacy entry retained from the stub. Not used by the jail directly (Slice
@@ -221,13 +227,15 @@ struct CaptureState {
     max_intercepts: u32,
     /// Verbatim stub body (already normalized; never empty).
     stub_body: String,
-    /// Prefetched script/module/chunk resources keyed by absolute URL. Exposed to
-    /// the page-side glue so dynamic `<script src>` chunk loaders can execute
-    /// already-fetched chunks without giving the isolate network access.
-    resources: Rc<RefCell<HashMap<String, Vec<u8>>>>,
-    /// Optional supervisor-backed loader for dynamic chunks not present in the
-    /// initial resource map.
-    script_loader: Option<Arc<ScriptLoader>>,
+    /// In-process async source of script/module/chunk bytes (net + chunk cache),
+    /// awaited by `op_raze_load_script` for dynamic `<script src>` chunks. The
+    /// module loader holds its own clone for `import` / `import()`.
+    fetcher: Rc<dyn ScriptFetcher>,
+    /// Count of script/module loads currently in flight. The capture-window driver
+    /// treats a non-zero count as activity so the window cannot quiesce while the
+    /// page is still pulling code concurrently — the async analogue of the old
+    /// blocking loader keeping the single thread busy.
+    inflight: Rc<Cell<u32>>,
     /// The hydrated DOM serialized after the capture window (via `op_raze_dom`),
     /// for the render-then-Markdown escalation. `None` until serialization runs.
     rendered_html: Option<String>,
@@ -320,35 +328,30 @@ fn op_raze_fetch(
     Ok(resp.to_string())
 }
 
-/// Return a prefetched script/module/chunk resource by absolute URL. Used by the
-/// glue's dynamic `<script src>` hook (webpack/Next chunk loader path). Missing
-/// resources return `None` so the page-side loader can fire `onerror` exactly like
-/// a failed network load.
+/// Load a dynamic script chunk on demand — in-process and asynchronously — through
+/// the [`ScriptFetcher`] (pooled `draco-net` + immutable chunk cache). Awaited by
+/// the glue's dynamic `<script src>` hook; because it is a real async op, many
+/// chunk loads kicked off in a burst fan out concurrently on the event loop rather
+/// than serializing. A miss returns `None` so the page-side loader fires `onerror`
+/// like a failed network load. Bumps the in-flight counter for the duration so the
+/// capture window stays open while the fetch is outstanding.
+///
+/// NOTE: `async` is inferred from the `async fn` with a bare `#[op2]` (matching
+/// `op_sleep`); state is taken as `Rc<RefCell<OpState>>` and every borrow is
+/// dropped before the `.await` (no `Ref` may be held across it).
 #[deno_core::op2]
 #[string]
-fn op_raze_resource(state: &mut OpState, #[string] url: String) -> Option<String> {
-    let cap = state.borrow::<Rc<RefCell<CaptureState>>>().clone();
-    let resources = cap.borrow().resources.clone();
-    let out = resources
-        .borrow()
-        .get(&url)
-        .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
-    out
-}
-
-/// Load a dynamic script chunk on demand through the supervisor-backed loader. The
-/// isolate still has no network access: production routes this op through IPC to
-/// the supervisor, which fetches with draco-net and returns source bytes.
-#[deno_core::op2]
-#[string]
-fn op_raze_load_script(state: &mut OpState, #[string] url: String) -> Option<String> {
-    let cap = state.borrow::<Rc<RefCell<CaptureState>>>().clone();
-    let loader = cap.borrow().script_loader.clone();
-    let bytes = loader.and_then(|load| load(&url))?;
-    // Cache successful on-demand loads so repeated chunk requests don't re-fetch.
-    let resources = cap.borrow().resources.clone();
-    resources.borrow_mut().insert(url, bytes.clone());
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+async fn op_raze_load_script(state: Rc<RefCell<OpState>>, #[string] url: String) -> Option<String> {
+    let (fetcher, inflight) = {
+        let op_state = state.borrow();
+        let cap = op_state.borrow::<Rc<RefCell<CaptureState>>>().clone();
+        let cs = cap.borrow();
+        (cs.fetcher.clone(), cs.inflight.clone())
+    };
+    inflight.set(inflight.get() + 1);
+    let bytes = fetcher.fetch(&url).await;
+    inflight.set(inflight.get().saturating_sub(1));
+    bytes.map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
 /// Record one page-side diagnostic line (glue-swallowed exception/rejection,
@@ -417,7 +420,6 @@ deno_core::extension!(
         op_raze_fetch,
         op_sleep,
         op_resolve_url,
-        op_raze_resource,
         op_raze_load_script,
         op_raze_dom,
         op_raze_log,
@@ -449,19 +451,17 @@ const GLUE_JS: &str = include_str!("../js/glue.js");
 // ES-module support: in-isolate module loader + script model
 // ===================================================================
 
-/// Module loader backed by the supervisor-prefetched `{url -> source}` map, with
-/// an on-demand fallback to the same supervisor loader that `op_raze_load_script`
-/// uses for dynamic `<script src>` chunks.
+/// Module loader for every `import` / `import()` the isolate makes, backed by the
+/// in-process async [`ScriptFetcher`] (pooled `draco-net` + immutable chunk cache).
 ///
-/// Resolution order for every `import` / `import()` the isolate makes:
-///   1. **Prefetch map** — the subresources the air-gapped supervisor fetched up
-///      front. The common case; served directly.
-///   2. **On-demand loader** — a chunk missing from the prefetch set (a lazy
-///      route/chunk whose URL the static prefetch scanner didn't discover — e.g.
-///      a *minified* `import{x}from"../chunks/HASH.js"` the heuristics missed) is
-///      fetched through the supervisor (draco-net) and cached back into the map.
-///   3. **Honest failure** — a module that is neither prefetched nor fetchable
-///      rejects the import with a real *load* error.
+/// Resolution order:
+///   1. **In-capture registry** — an entry source registered before evaluation, or
+///      a module already fetched earlier this capture (dedup).
+///   2. **Async fetch** — otherwise pulled via `fetcher`, concurrently with any
+///      sibling imports the event loop is driving, then cached back into the
+///      registry so a later `import` of the same URL is a hit.
+///   3. **Honest failure** — a module that cannot be fetched rejects the import
+///      with a real *load* error.
 ///
 /// Returning an **empty module** on a miss (the pre-v0.13.8 behavior) is a trap:
 /// a chunk served as empty satisfies the load but then fails V8 *linking* with a
@@ -474,15 +474,20 @@ const GLUE_JS: &str = include_str!("../js/glue.js");
 ///
 /// `load` returns [`ModuleLoadResponse::Async`] so module fetching is driven on
 /// the event loop rather than compiled synchronously inside V8's dynamic-import
-/// host callback — the whole graph is pulled and registered before evaluation, so
-/// a re-entrant `import()` during evaluation resolves against an already-loaded
-/// module (deno_core's fast path) instead of forcing a fresh recursive load from
-/// inside the callback.
+/// host callback: the whole graph is pulled concurrently and registered before
+/// evaluation, so a re-entrant `import()` during evaluation resolves against an
+/// already-loaded module (deno_core's fast path) instead of forcing a fresh
+/// recursive load from inside the callback. THIS is the concurrency that makes
+/// code-split SPAs load their chunks in parallel instead of one blocking IPC round
+/// trip at a time.
 struct MapModuleLoader {
+    /// In-capture module registry + dedup cache: entry sources registered before
+    /// evaluation, plus the bytes of modules already fetched this capture.
     modules: Rc<RefCell<HashMap<String, Vec<u8>>>>,
-    /// On-demand loader for chunks absent from the prefetch map (same supervisor
-    /// path `op_raze_load_script` uses). `None` in resource-only capture modes.
-    script_loader: Option<Arc<ScriptLoader>>,
+    /// In-process async source for `import` / `import()` chunk bytes (net + cache).
+    fetcher: Rc<dyn ScriptFetcher>,
+    /// Shared in-flight-load counter (see [`CaptureState::inflight`]).
+    inflight: Rc<Cell<u32>>,
 }
 
 impl ModuleLoader for MapModuleLoader {
@@ -502,35 +507,35 @@ impl ModuleLoader for MapModuleLoader {
         _options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
         let modules = self.modules.clone();
-        let script_loader = self.script_loader.clone();
+        let fetcher = self.fetcher.clone();
+        let inflight = self.inflight.clone();
         let spec = module_specifier.clone();
 
         ModuleLoadResponse::Async(
             async move {
                 let key = spec.as_str();
 
-                // 1. Prefetched subresource.
+                // 1. Already registered or fetched earlier this capture.
                 if let Some(bytes) = modules.borrow().get(key).cloned() {
                     return Ok(js_module_source(&bytes, &spec));
                 }
 
-                // 2. On-demand fetch through the supervisor loader; cache the
-                //    result so a later static/dynamic import of the same URL is a
-                //    map hit. The loader is a blocking IPC round-trip; that is the
-                //    same cost `op_raze_load_script` pays and is acceptable on the
-                //    single-threaded capture runtime.
-                if let Some(load) = &script_loader {
-                    if let Some(bytes) = load(key) {
-                        modules.borrow_mut().insert(key.to_string(), bytes.clone());
-                        return Ok(js_module_source(&bytes, &spec));
-                    }
+                // 2. Fetch it in-process/async (net + chunk cache), concurrently
+                //    with any sibling imports the event loop is driving; cache the
+                //    result so a later import of the same URL is a registry hit.
+                inflight.set(inflight.get() + 1);
+                let fetched = fetcher.fetch(key).await;
+                inflight.set(inflight.get().saturating_sub(1));
+                if let Some(bytes) = fetched {
+                    modules.borrow_mut().insert(key.to_string(), bytes.clone());
+                    return Ok(js_module_source(&bytes, &spec));
                 }
 
                 // 3. Genuinely unavailable: reject THIS import honestly instead of
                 //    poisoning the graph with a silent empty module.
                 Err(JsErrorBox::generic(format!(
-                    "draco: failed to load module (not prefetched and no on-demand \
-                     loader could fetch it): {key}"
+                    "draco: failed to load module (no on-demand fetch could \
+                     retrieve it): {key}"
                 )))
             }
             .boxed_local(),
@@ -561,27 +566,29 @@ struct PageScript {
     payload: String,
 }
 
-async fn run_capture_inner_with_resources(
+async fn run_capture_inner(
     url: &str,
     html: &str,
     cfg: &CaptureConfig,
-    resources: HashMap<String, Vec<u8>>,
-    script_loader: Option<Arc<ScriptLoader>>,
+    fetcher: Rc<dyn ScriptFetcher>,
 ) -> CaptureReport {
     let stub_body = normalize_stub_body(&cfg.stub_response_json);
 
-    // Module loader + script-injection hook are backed by the supervisor-prefetched
-    // script sources, so `<script type="module">`, `import()`, and webpack/Next
-    // dynamic `<script src>` chunks resolve without the (air-gapped) isolate ever
-    // touching the network.
-    let modules = Rc::new(RefCell::new(resources));
+    // In-capture module registry + dedup cache (starts empty — no prefetch). The
+    // module loader fills it on demand via `fetcher`; `<script type="module">`,
+    // `import()`, and webpack/Next dynamic `<script src>` chunks all resolve through
+    // the same in-process async fetch path.
+    let modules: Rc<RefCell<HashMap<String, Vec<u8>>>> = Rc::new(RefCell::new(HashMap::new()));
+    // Shared in-flight-load counter: keeps the capture window open while chunks or
+    // modules are still being pulled concurrently.
+    let inflight: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
     let cap = Rc::new(RefCell::new(CaptureState {
         requests: Vec::new(),
         max_intercepts: cfg.max_intercepts,
         stub_body: stub_body.clone(),
-        resources: modules.clone(),
-        script_loader,
+        fetcher: fetcher.clone(),
+        inflight: inflight.clone(),
         rendered_html: None,
         logs: Vec::new(),
     }));
@@ -592,7 +599,8 @@ async fn run_capture_inner_with_resources(
         extensions: vec![draco_runtime_ext::init(cap.clone())],
         module_loader: Some(Rc::new(MapModuleLoader {
             modules: modules.clone(),
-            script_loader: cap.borrow().script_loader.clone(),
+            fetcher: fetcher.clone(),
+            inflight: inflight.clone(),
         })),
         ..Default::default()
     });
@@ -625,6 +633,25 @@ async fn run_capture_inner_with_resources(
     //    surface intercepts — but if it happens before anything is captured we
     //    remember it so the outcome is `Threw`.
     let scripts = extract_scripts(html);
+
+    // Kick off every external-script fetch CONCURRENTLY (resolved against the page
+    // URL) and collect the bytes by document index. A browser's preload scanner
+    // fetches parser-inserted scripts in parallel but runs them in order; we mirror
+    // that — fan the network out here, then execute in document order below.
+    let external: Vec<(usize, String)> = scripts
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.inline)
+        .map(|(i, s)| (i, resolve_script_url(url, &s.payload)))
+        .collect();
+    let fetched = futures::future::join_all(external.iter().map(|(_, u)| fetcher.fetch(u))).await;
+    let mut ext_bytes: HashMap<usize, Vec<u8>> = HashMap::new();
+    for ((i, _), bytes) in external.iter().zip(fetched) {
+        if let Some(b) = bytes {
+            ext_bytes.insert(*i, b);
+        }
+    }
+
     let mut threw_in_page = false;
     for (i, script) in scripts.into_iter().enumerate() {
         // Point document.currentScript at a fresh <script> for this block
@@ -634,18 +661,17 @@ async fn run_capture_inner_with_resources(
             "try { globalThis.__dracoSetCurrentScript(); } catch (_) {}",
         );
 
-        // Resolve the source + its module specifier. Inline scripts use their
-        // body verbatim and a synthetic per-index URL (based on the page URL, so
-        // relative imports resolve against the page). External scripts use their
-        // prefetched source, looked up by resolved URL; one we couldn't prefetch
-        // is simply skipped (nothing to run).
+        // Resolve the source + its module specifier. Inline scripts use their body
+        // verbatim and a synthetic per-index URL (based on the page URL, so
+        // relative imports resolve against the page). External scripts use the
+        // bytes fetched concurrently above; one we couldn't fetch is skipped.
         let (source, spec_str) = if script.inline {
             let base = url.split('#').next().unwrap_or(url);
             (script.payload.clone(), format!("{base}#draco-inline-{i}"))
         } else {
             let resolved = resolve_script_url(url, &script.payload);
-            match modules.borrow().get(&resolved) {
-                Some(bytes) => (String::from_utf8_lossy(bytes).into_owned(), resolved),
+            match ext_bytes.remove(&i) {
+                Some(bytes) => (String::from_utf8_lossy(&bytes).into_owned(), resolved),
                 None => continue,
             }
         };
@@ -776,6 +802,10 @@ async fn drive_capture_window(
     let mut last_count = cap.borrow().requests.len();
     let mut last_activity = Instant::now();
     let mut loop_threw = false;
+    // Shared in-flight-load counter: while the page is still pulling script/module
+    // chunks concurrently, the window must not quiesce (the async analogue of the
+    // old blocking loader keeping the single thread busy).
+    let inflight = cap.borrow().inflight.clone();
 
     loop {
         // Poll one tick of the event loop with a self-contained waker.
@@ -806,6 +836,12 @@ async fn drive_capture_window(
         let now_count = cap.borrow().requests.len();
         if now_count != last_count {
             last_count = now_count;
+            last_activity = Instant::now();
+        }
+        // In-flight script/module loads count as activity: keep the window open
+        // (and reset the quiesce streak) so a page can't be truncated mid-load, and
+        // so hydration triggered by a just-arrived chunk still gets its quiesce_ms.
+        if inflight.get() > 0 {
             last_activity = Instant::now();
         }
 
@@ -1185,6 +1221,24 @@ fn quiesce_tick_ms(quiesce_ms: u64) -> u64 {
 mod tests {
     use super::*;
 
+    /// Test [`ScriptFetcher`] backed by a fixed `{ url -> bytes }` map, returning a
+    /// ready future per lookup — the offline stand-in for the net+cache fetcher.
+    struct MapFetcher(HashMap<String, Vec<u8>>);
+    impl ScriptFetcher for MapFetcher {
+        fn fetch<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, Option<Vec<u8>>> {
+            let hit = self.0.get(url).cloned();
+            Box::pin(async move { hit })
+        }
+    }
+    /// A fetcher that resolves nothing (pages with no external code).
+    fn null_fetcher() -> Rc<dyn ScriptFetcher> {
+        Rc::new(MapFetcher(HashMap::new()))
+    }
+    /// A fetcher serving a fixed `{ url -> bytes }` set.
+    fn map_fetcher(entries: HashMap<String, Vec<u8>>) -> Rc<dyn ScriptFetcher> {
+        Rc::new(MapFetcher(entries))
+    }
+
     #[test]
     fn normalize_stub_body_defaults_empty_to_object() {
         assert_eq!(normalize_stub_body(""), "{}");
@@ -1326,7 +1380,7 @@ mod tests {
     }
 
     #[test]
-    fn appended_script_chunk_runs_from_prefetched_resources() {
+    fn appended_script_chunk_runs_via_fetcher() {
         let html = r#"<script>
             const s = document.createElement("script");
             s.src = "/_next/static/chunks/feature.abc123.js";
@@ -1337,7 +1391,7 @@ mod tests {
             "https://example.com/_next/static/chunks/feature.abc123.js".to_string(),
             br#"fetch("/api/from-chunk");"#.to_vec(),
         );
-        let report = run_capture_with_resources(
+        let report = run_capture(
             "https://example.com/",
             html,
             &CaptureConfig {
@@ -1346,7 +1400,7 @@ mod tests {
                 max_intercepts: 8,
                 stub_response_json: "{}".to_string(),
             },
-            resources,
+            map_fetcher(resources),
         );
         assert_eq!(report.requests.len(), 1, "{report:?}");
         assert_eq!(report.requests[0].url, "https://example.com/api/from-chunk");
@@ -1376,6 +1430,7 @@ mod tests {
                 max_intercepts: 8,
                 stub_response_json: "{}".to_string(),
             },
+            null_fetcher(),
         );
         assert!(
             report
@@ -1412,6 +1467,7 @@ mod tests {
                 max_intercepts: 8,
                 stub_response_json: "{}".to_string(),
             },
+            null_fetcher(),
         );
         assert!(
             report.logs.iter().any(|l| l.starts_with("[console.error]")
@@ -1448,7 +1504,7 @@ mod tests {
             "#
             .to_vec(),
         );
-        let report = run_capture_with_resources(
+        let report = run_capture(
             "https://example.com/",
             html,
             &CaptureConfig {
@@ -1457,7 +1513,7 @@ mod tests {
                 max_intercepts: 8,
                 stub_response_json: "{}".to_string(),
             },
-            resources,
+            map_fetcher(resources),
         );
         assert_eq!(report.requests.len(), 1, "{report:?}");
         assert_eq!(
@@ -1467,32 +1523,33 @@ mod tests {
     }
 
     #[test]
-    fn appended_script_chunk_can_load_through_supervisor_callback() {
+    fn appended_script_chunk_miss_is_survivable() {
+        // A chunk the fetcher cannot supply must fail like a 404'd <script> — the
+        // async load rejects, hydration continues, and the capture is not crashed.
+        // The inline fetch queued right after the (doomed) append still surfaces.
         let html = r#"<script>
             const s = document.createElement("script");
-            s.src = "/_next/static/chunks/on-demand.js";
+            s.src = "/_next/static/chunks/missing.js";
             document.head.appendChild(s);
+            fetch("/api/still-runs");
         </script>"#;
-        let loader: Arc<ScriptLoader> = Arc::new(|url| {
-            (url == "https://example.com/_next/static/chunks/on-demand.js")
-                .then(|| br#"fetch("/api/from-loader");"#.to_vec())
-        });
-        let report = run_capture_with_resources_and_loader(
+        let report = run_capture(
             "https://example.com/",
             html,
             &CaptureConfig {
-                capture_window_ms: 500,
+                capture_window_ms: 300,
                 quiesce_ms: 20,
                 max_intercepts: 8,
                 stub_response_json: "{}".to_string(),
             },
-            HashMap::new(),
-            Some(loader),
+            null_fetcher(),
         );
-        assert_eq!(report.requests.len(), 1, "{report:?}");
-        assert_eq!(
-            report.requests[0].url,
-            "https://example.com/api/from-loader"
+        assert!(
+            report
+                .requests
+                .iter()
+                .any(|r| r.url == "https://example.com/api/still-runs"),
+            "inline fetch after a chunk miss must still be captured: {report:?}"
         );
     }
 
@@ -1506,7 +1563,7 @@ mod tests {
             "https://example.com/app/entry.js".to_string(),
             br#"export function run() { fetch("./api/data"); }"#.to_vec(),
         );
-        let report = run_capture_with_resources(
+        let report = run_capture(
             "https://example.com/app/",
             html,
             &CaptureConfig {
@@ -1515,7 +1572,7 @@ mod tests {
                 max_intercepts: 8,
                 stub_response_json: "{}".to_string(),
             },
-            resources,
+            map_fetcher(resources),
         );
         assert_eq!(report.requests.len(), 1, "{report:?}");
         assert_eq!(report.requests[0].url, "https://example.com/app/api/data");

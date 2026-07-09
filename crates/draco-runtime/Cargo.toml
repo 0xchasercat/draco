@@ -15,11 +15,14 @@ deno_core = "0.406.0"
 deno_error = "=0.7.1"
 # futures::task primitives for the manual event-loop driver.
 futures = "0.3"
-# deno_core 0.406.0's only timer reactor is tokio-based (tokio::time::sleep_until),
-# so the event loop must run under a tokio time driver. We use a *current-thread*
-# runtime with `enable_time()` only (no worker pool, no I/O reactor) to keep the
-# eventual jailed child's syscall surface small. See lib.rs module docs.
-tokio = { version = "1", features = ["rt", "time", "macros"] }
+# The isolate runs in-process and does real async network I/O: its script/chunk
+# load ops `.await` the caller's `draco-net`-backed fetcher, and deno_core's timer
+# reactor is tokio-based. So `run_capture` drives the event loop on a *current-thread*
+# runtime built with `enable_all()` — current-thread because `JsRuntime` is `!Send`
+# (deno_core's async-op driver task also requires a current-thread runtime), and the
+# full driver set ("net" provides the I/O reactor the fetches need; "time" backs
+# op_sleep). See lib.rs module docs.
+tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

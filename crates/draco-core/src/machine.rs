@@ -279,7 +279,7 @@ impl Run {
 /// tests drive with mocks.
 ///
 /// The Tier 2 capture seam is chosen by the `tier2` feature: the real
-/// jail-spawning seam when on, a disabled seam (records "built without tier2")
+/// in-process V8 seam when on, a disabled seam (records "built without tier2")
 /// when off. Both keep `extract` returning a well-formed result.
 pub(crate) async fn run(url: &str, config: &Config) -> ExtractionResult {
     #[cfg(feature = "tier2")]
@@ -304,10 +304,10 @@ pub(crate) async fn run_with_pool(
 /// The escalation ladder, generic over its three effect seams (network, static
 /// extraction, Tier 2 capture) so it can be exercised offline. See module docs.
 ///
-/// The `capture` seam abstracts the jail-hosted V8 capture: production passes the
-/// real jail-spawning seam, tests pass a mock that fabricates intercepts so the
+/// The `capture` seam abstracts the in-process V8 capture: production passes the
+/// real isolate-hosting seam, tests pass a mock that fabricates intercepts so the
 /// full ladder — including the Tier 2 rank/replay path — is exercisable without
-/// forking a child. When the crate is built without the `tier2` feature, the
+/// booting an isolate. When the crate is built without the `tier2` feature, the
 /// Tier 2 branch never touches `capture`; it records a "built without tier2" note
 /// and finalizes `Unsupported`.
 pub(crate) async fn run_ladder<F, S, T>(
@@ -324,8 +324,8 @@ where
 {
     let mut run = Run::new(url);
     let mut opts = session_opts(config);
-    // One cookie jar for the whole operation: the page fetch, every prefetched
-    // and on-demand subresource, and the replay all share it, so a `Set-Cookie`
+    // One cookie jar for the whole operation: the page fetch, every script/chunk
+    // subresource the isolate pulls, and the replay all share it, so a `Set-Cookie`
     // on the initial response (e.g. Cloudflare's `__cf_bm`) is replayed on the
     // follow-up requests — exactly as a browser scopes cookies to a page session.
     // Without this, subresource fetches went out cookie-less and a bot wall
@@ -389,7 +389,7 @@ where
     // ---- Markdown scrape (the DEFAULT fast path; spec: Firecrawl-style) --
     //
     // For `Markdown` this is terminal: fetch → challenge → scrape → Success,
-    // never touching V8/the jail (~300ms). For `Both` we stage the Markdown +
+    // never touching V8 (~300ms). For `Both` we stage the Markdown +
     // metadata onto the run and fall through to the JSON ladder below. For
     // `Json` the scrape is skipped entirely.
     if config.formats.wants_static_content() {
@@ -485,7 +485,6 @@ where
                 incomplete,
                 config,
                 &opts,
-                fetcher,
                 capture,
             )
             .await;
@@ -609,49 +608,37 @@ where
     run.finish(Status::Unsupported, None, None, None)
 }
 
-/// Tier 2 sub-flow: jail-hosted V8 capture → ranked replay. Returns
-/// `Some(result)` if the ladder should terminate here (a successful replay, or a
-/// hard jail failure), or `None` to fall through to `Unsupported`.
+/// Run the in-process Tier 2 capture and record the `runtime.spawn` /
+/// `runtime.sandbox` / `runtime.capture` trace steps. Shared by the JSON-replay
+/// path ([`try_tier2`]) and the discovery path ([`try_discover`]). On a capture
+/// failure returns `Err(terminal Error result)` for the caller to return as-is;
+/// otherwise the [`CaptureResult`].
 ///
-/// Trace steps: `runtime.spawn` (spawn+capture the child), `runtime.sandbox`
-/// (achieved sandbox level the child reported), `runtime.capture` (intercept
-/// count + outcome), `runtime.rank` (winning score / no viable candidate),
-/// `runtime.replay` (replaying the winner). Isolate wall time is charged to the
-/// [`Bucket::Runtime`] timing bucket.
+/// There is no prefetch phase: the isolate pulls its own scripts, modules, and
+/// chunks — concurrently — through its async net+cache fetcher, so the
+/// `runtime.capture` timing covers hydration *and* the code loads it actually
+/// needed. Trace steps: `runtime.spawn` (boot the isolate capture; failure
+/// carries the error), `runtime.sandbox` (containment posture), `runtime.capture`
+/// (intercept count + outcome), then the callers' `runtime.rank` /
+/// `runtime.replay`. Isolate wall time is charged to [`Bucket::Runtime`].
 #[cfg(feature = "tier2")]
-/// Prefetch script subresources, run the Tier 2 capture, and record the
-/// `runtime.spawn` / `runtime.sandbox` / `runtime.capture` trace steps. Shared
-/// by the JSON-replay path ([`try_tier2`]) and the discovery path
-/// ([`try_discover`]). On a jail/IPC failure returns `Err(terminal Error
-/// result)` for the caller to return as-is; otherwise the [`CaptureResult`].
-#[cfg(feature = "tier2")]
-async fn run_tier2_capture<F, T>(
+async fn run_tier2_capture<T>(
     run: &mut Run,
     url: &str,
     body: &str,
     config: &Config,
     opts: &SessionOpts,
-    fetcher: &F,
     capture: &T,
 ) -> Result<crate::tier2::CaptureResult, ExtractionResult>
 where
-    F: PageFetcher + ?Sized,
     T: Tier2Capture + ?Sized,
 {
-    // The air-gapped isolate can't fetch, so the supervisor pre-fetches the
-    // page's scripts (external `<script src>`, module graph) and hands them to
-    // the child. Recorded as its own `runtime.prefetch` step, so the capture
-    // timing below is the capture alone.
-    let resources = prefetch_scripts_traced(run, url, body, opts, fetcher).await;
     let t_cap = Instant::now();
-    let capture_result = match capture
-        .capture(url, body.as_bytes(), &resources, config, opts)
-        .await
-    {
+    let capture_result = match capture.capture(url, body.as_bytes(), config, opts).await {
         Ok(c) => c,
         Err(e) => {
-            // A jail/IPC failure is a hard failure of Tier 2: record it and
-            // finalize `Error` carrying the mapped `DracoError::Jail`.
+            // A capture-boot failure is a hard failure of Tier 2: record it and
+            // finalize `Error` carrying the mapped `DracoError`.
             run.record(
                 SourceTier::RuntimeInterception,
                 "runtime.spawn",
@@ -673,9 +660,8 @@ where
         Bucket::None,
         None,
     );
-    // Surface the achieved sandbox posture the child reported (e.g.
-    // "hardened: seccomp+netns+landlock" or "isolate: v8 no host bindings
-    // (macos)"). Informational — no timing bucket.
+    // Surface the achieved containment posture (e.g. "isolate: in-process v8
+    // (no host bindings)"). Informational — no timing bucket.
     if let Some(level) = capture_result.sandbox_level.as_deref() {
         run.record(
             SourceTier::RuntimeInterception,
@@ -750,11 +736,10 @@ where
 {
     use crate::tier2::{discover_endpoints, rank_and_replay};
 
-    let capture_result =
-        match run_tier2_capture(run, url, body, config, opts, fetcher, capture).await {
-            Ok(c) => c,
-            Err(term) => return term,
-        };
+    let capture_result = match run_tier2_capture(run, url, body, config, opts, capture).await {
+        Ok(c) => c,
+        Err(term) => return term,
+    };
 
     // The ranked catalog — the discovery product.
     let endpoints = discover_endpoints(&capture_result, url, config.allow_unsafe_replay);
@@ -840,11 +825,10 @@ where
 
     // Prefetch subresources, spawn/reuse the isolate, capture — shared with the
     // discovery path.
-    let capture_result =
-        match run_tier2_capture(run, url, body, config, opts, fetcher, capture).await {
-            Ok(c) => c,
-            Err(term) => return Some(term),
-        };
+    let capture_result = match run_tier2_capture(run, url, body, config, opts, capture).await {
+        Ok(c) => c,
+        Err(term) => return Some(term),
+    };
 
     // --- Rank + replay the winner -----------------------------------------
     // Mutation-safety (see `ranking::best_replayable`) is applied here at replay
@@ -920,8 +904,8 @@ where
     }
 }
 
-/// Tier 2 branch for the **lean** build (no `tier2` feature): there is no jail /
-/// runtime linked, so record a "built without tier2" note and fall through to
+/// Tier 2 branch for the **lean** build (no `tier2` feature): there is no
+/// runtime (V8) linked, so record a "built without tier2" note and fall through to
 /// `Unsupported`. Signature mirrors the tier2 version so the call site is
 /// feature-agnostic; `_capture` is unused here.
 #[cfg(not(feature = "tier2"))]
@@ -988,505 +972,6 @@ fn nonws_len(s: &str) -> usize {
     s.chars().filter(|c| !c.is_whitespace()).count()
 }
 
-/// Pre-fetch the page's script subresources so the (air-gapped) Tier 2 isolate
-/// can run external `<script src>` and resolve `import`/`import()` for
-/// `type="module"` apps without ever touching the network itself.
-///
-/// Seeds from every `<script src>`, JS preload hint (`modulepreload`, and
-/// `preload as=script`), and string-literal import specifier in inline scripts in
-/// the HTML, then BFS-crawls the ES-module graph (static + dynamic import
-/// specifiers) via `draco-net`, resolving each against its importer. Bounded by a
-/// file count and total-byte cap so a pathological graph can't blow up.
-/// Bare/unresolvable specifiers (npm bare names, `data:` URLs) and non-2xx
-/// fetches are skipped. Best-effort: any fetch error just omits that resource
-/// (the isolate degrades gracefully).
-#[cfg(feature = "tier2")]
-async fn prefetch_scripts<F>(
-    page_url: &str,
-    html: &str,
-    opts: &SessionOpts,
-    fetcher: &F,
-) -> Vec<crate::tier2::ScriptResource>
-where
-    F: PageFetcher + ?Sized,
-{
-    prefetch_scripts_with_budget(page_url, html, opts, fetcher, PREFETCH_WALL_BUDGET_MS).await
-}
-
-/// How many subresource fetches one prefetch wave issues concurrently. Browsers
-/// burst a page's script graph over 6–8 pooled connections; matching that keeps
-/// the graph walk both fast and unremarkable to the origin.
-#[cfg(feature = "tier2")]
-const PREFETCH_CONCURRENCY: usize = 8;
-
-/// Total wall budget for the prefetch walk. A code-split Next.js site can
-/// reference 64+ chunks; fetched one-by-one that multiplied into tens of
-/// seconds of `runtime.capture` time. Past the budget the walk stops with
-/// whatever it has — the on-demand `LoadScript` path (itself budgeted) picks up
-/// stragglers the page actually asks for.
-#[cfg(feature = "tier2")]
-const PREFETCH_WALL_BUDGET_MS: u64 = 5_000;
-
-/// Wave-parallel, budgeted BFS over the page's script graph: seed from
-/// `<script src>` / preload hints / inline import specifiers, fetch up to
-/// [`PREFETCH_CONCURRENCY`] resources concurrently over the *borrowed* fetcher
-/// (`join_all` — no `'static`/spawn requirement), scan each body for module
-/// imports and webpack/Next chunk references, and feed discoveries into the
-/// next wave. File-count, total-byte, and wall-clock caps all bound the walk;
-/// per-fetch timeout and politeness posture come from
-/// [`crate::tier2::subresource_opts`].
-#[cfg(feature = "tier2")]
-async fn prefetch_scripts_with_budget<F>(
-    page_url: &str,
-    html: &str,
-    opts: &SessionOpts,
-    fetcher: &F,
-    wall_budget_ms: u64,
-) -> Vec<crate::tier2::ScriptResource>
-where
-    F: PageFetcher + ?Sized,
-{
-    use crate::tier2::ScriptResource;
-    use futures_util::future::join_all;
-    use std::collections::{HashSet, VecDeque};
-
-    const MAX_FILES: usize = 64;
-    const MAX_TOTAL_BYTES: usize = 12 * 1024 * 1024;
-
-    let Ok(base) = url::Url::parse(page_url) else {
-        return Vec::new();
-    };
-
-    // Subresource fetch posture: clamped per-fetch timeout, no politeness delay.
-    let sub_opts = crate::tier2::subresource_opts(opts);
-
-    // Two-tier frontier. `critical` is the eager module graph — seeds plus the
-    // **static** imports discovered under them — that hydration cannot proceed
-    // without. `lazy` holds only webpack/Next chunk-loader candidates (computed
-    // `<script src>` URLs those runtimes inject during mount).
-    //
-    // Dynamic ESM `import("…")` targets are deliberately NOT prefetched. They are
-    // lazy route/widget bundles the app pulls on navigation, not the
-    // initial-mount critical path; speculatively fetching them spent the budget on
-    // megabytes of route code (stake.com: 12.9 MB of route bundles chased vs a
-    // 548 KB critical graph, and under Cloudflare's per-fetch throttling that
-    // starved the critical graph itself). The on-demand `LoadScript` path fetches
-    // any dynamic chunk hydration actually reaches, so nothing needed is lost —
-    // discover's capture window never navigates, so route bundles never come due.
-    // Each wave drains `critical` first; `lazy` (chunk candidates) only once
-    // `critical` is exhausted. `visited` is shared so a URL reachable both ways is
-    // fetched once.
-    let mut critical: VecDeque<String> = VecDeque::new();
-    let mut lazy: VecDeque<String> = VecDeque::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut out: Vec<ScriptResource> = Vec::new();
-    let mut total = 0usize;
-
-    for src in scan_script_seed_urls(html)
-        .into_iter()
-        .chain(scan_inline_import_seed_urls(html))
-    {
-        if let Ok(u) = base.join(&src) {
-            if u.scheme() == "http" || u.scheme() == "https" {
-                critical.push_back(u.to_string());
-            }
-        }
-    }
-
-    let started = Instant::now();
-    'waves: while !critical.is_empty() || !lazy.is_empty() {
-        if out.len() >= MAX_FILES
-            || total >= MAX_TOTAL_BYTES
-            || started.elapsed().as_millis() as u64 >= wall_budget_ms
-        {
-            break;
-        }
-
-        // A wave is drawn from ONE tier: `critical` while any remains, else
-        // `lazy`. This keeps critical fetches strictly ahead of lazy ones even at
-        // the cost of an occasional under-full wave — the whole point is that the
-        // critical graph finishes before the budget can be spent on lazy chunks.
-        let source = if !critical.is_empty() {
-            &mut critical
-        } else {
-            &mut lazy
-        };
-        let mut wave: Vec<String> = Vec::new();
-        while wave.len() < PREFETCH_CONCURRENCY.min(MAX_FILES - out.len()) {
-            let Some(u) = source.pop_front() else { break };
-            if visited.insert(u.clone()) {
-                wave.push(u);
-            }
-        }
-        if wave.is_empty() {
-            // Everything drawable this tier had been visited; loop re-picks the
-            // other tier (or terminates when both are drained).
-            continue;
-        }
-
-        let responses = join_all(wave.iter().map(|u| fetcher.fetch(u, &sub_opts))).await;
-        for (u, resp) in wave.into_iter().zip(responses) {
-            let Ok(resp) = resp else { continue };
-            if !(200..300).contains(&resp.meta.status) {
-                continue;
-            }
-            let bytes = resp.body.to_vec();
-            total = total.saturating_add(bytes.len());
-
-            // Crawl this module's imports (resolved against its own URL): static
-            // imports extend the critical graph; dynamic `import()` targets and
-            // webpack/Next chunk-loader references are lazy.
-            if let Ok(mod_url) = url::Url::parse(&u) {
-                let src = String::from_utf8_lossy(&bytes);
-                let imports = extract_imports(&src);
-                let enqueue = |spec: &str, into: &mut VecDeque<String>| {
-                    if let Ok(child) = mod_url.join(spec) {
-                        if (child.scheme() == "http" || child.scheme() == "https")
-                            && !visited.contains(child.as_str())
-                        {
-                            into.push_back(child.to_string());
-                        }
-                    }
-                };
-                for spec in &imports.statik {
-                    enqueue(spec, &mut critical);
-                }
-                // Dynamic imports (`imports.dynamic`) are intentionally dropped
-                // here — see the frontier comment above. Only webpack/Next chunk
-                // candidates are prefetched, at lower priority than the static
-                // graph.
-                for spec in extract_chunk_candidates(&src) {
-                    enqueue(&spec, &mut lazy);
-                }
-            }
-
-            out.push(ScriptResource {
-                url: u,
-                source: bytes,
-            });
-            if out.len() >= MAX_FILES || total >= MAX_TOTAL_BYTES {
-                break 'waves;
-            }
-        }
-    }
-
-    out
-}
-
-/// Run the supervisor prefetch and record it as its own `runtime.prefetch`
-/// trace step (Runtime bucket), so `runtime.capture` timing stays honest:
-/// network time spent gathering the page's script graph is visible and
-/// attributable, never silently folded into the capture step.
-#[cfg(feature = "tier2")]
-async fn prefetch_scripts_traced<F>(
-    run: &mut Run,
-    url: &str,
-    html: &str,
-    opts: &SessionOpts,
-    fetcher: &F,
-) -> Vec<crate::tier2::ScriptResource>
-where
-    F: PageFetcher + ?Sized,
-{
-    let t = Instant::now();
-    let resources = prefetch_scripts(url, html, opts, fetcher).await;
-    let bytes: usize = resources.iter().map(|r| r.source.len()).sum();
-    run.record(
-        SourceTier::RuntimeInterception,
-        "runtime.prefetch",
-        StepOutcome::Matched,
-        t.elapsed().as_millis() as u64,
-        Bucket::Runtime,
-        Some(format!(
-            "{} script(s), {} KiB",
-            resources.len(),
-            bytes / 1024
-        )),
-    );
-    resources
-}
-
-/// Extract initial JavaScript resource URLs from HTML, in document order.
-///
-/// Includes both executable `<script src>` tags and preload hints that commonly
-/// seed module graphs in SvelteKit/Vite output (`rel="modulepreload"` and
-/// `rel="preload" as="script"`).
-#[cfg(feature = "tier2")]
-fn scan_script_seed_urls(html: &str) -> Vec<String> {
-    use std::sync::LazyLock;
-    static TAG_RE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r#"(?is)<(?:script|link)\b[^>]*>"#).unwrap());
-    let mut out = Vec::new();
-    for tag in TAG_RE.find_iter(html).map(|m| m.as_str()) {
-        let lower = tag.to_ascii_lowercase();
-        let is_script = lower.starts_with("<script");
-        let is_link = lower.starts_with("<link");
-        if is_script {
-            if let Some(src) = html_attr_value(tag, "src") {
-                push_nonempty(&mut out, src);
-            }
-        } else if is_link {
-            let rel = html_attr_value(tag, "rel")
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            let as_attr = html_attr_value(tag, "as")
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            let is_js_hint = rel.split_whitespace().any(|p| p == "modulepreload")
-                || (rel.split_whitespace().any(|p| p == "preload") && as_attr == "script");
-            if is_js_hint {
-                if let Some(href) = html_attr_value(tag, "href") {
-                    push_nonempty(&mut out, href);
-                }
-            }
-        }
-    }
-    out
-}
-
-#[cfg(feature = "tier2")]
-fn push_nonempty(out: &mut Vec<String>, value: String) {
-    let value = value.trim();
-    if !value.is_empty() {
-        out.push(value.to_string());
-    }
-}
-
-#[cfg(feature = "tier2")]
-fn scan_inline_import_seed_urls(html: &str) -> Vec<String> {
-    use std::sync::LazyLock;
-    static SCRIPT_RE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r#"(?is)<script\b[^>]*>(.*?)</script\s*>"#).unwrap());
-    let mut out = Vec::new();
-    for caps in SCRIPT_RE.captures_iter(html) {
-        let open_tag = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
-        // External scripts are already seeded by `scan_script_seed_urls`; JSON-ish
-        // script bodies are not executable and should not be parsed as JS.
-        if html_attr_value(open_tag, "src").is_some() {
-            continue;
-        }
-        if let Some(ty) = html_attr_value(open_tag, "type") {
-            let ty = ty.trim().to_ascii_lowercase();
-            if !(ty.is_empty()
-                || ty == "module"
-                || ty == "text/javascript"
-                || ty == "application/javascript"
-                || ty == "text/ecmascript"
-                || ty == "application/ecmascript")
-            {
-                continue;
-            }
-        }
-        if let Some(body) = caps.get(1).map(|m| m.as_str()) {
-            out.extend(extract_module_imports(body));
-        }
-    }
-    out
-}
-
-#[cfg(feature = "tier2")]
-fn html_attr_value(tag: &str, name: &str) -> Option<String> {
-    let lower = tag.to_ascii_lowercase();
-    let mut search_from = 0;
-    loop {
-        let rel = lower[search_from..].find(name)?;
-        let at = search_from + rel;
-        let prev_ok = at == 0
-            || lower.as_bytes()[at - 1].is_ascii_whitespace()
-            || lower.as_bytes()[at - 1] == b'<';
-        let after = at + name.len();
-        let mut j = after;
-        while matches!(tag.as_bytes().get(j), Some(c) if c.is_ascii_whitespace()) {
-            j += 1;
-        }
-        if prev_ok && tag.as_bytes().get(j) == Some(&b'=') {
-            j += 1;
-            while matches!(tag.as_bytes().get(j), Some(c) if c.is_ascii_whitespace()) {
-                j += 1;
-            }
-            let val = match tag.as_bytes().get(j) {
-                Some(&b'"') => {
-                    let start = j + 1;
-                    let end = tag[start..].find('"').map(|e| start + e)?;
-                    tag[start..end].to_string()
-                }
-                Some(&b'\'') => {
-                    let start = j + 1;
-                    let end = tag[start..].find('\'').map(|e| start + e)?;
-                    tag[start..end].to_string()
-                }
-                _ => {
-                    let start = j;
-                    let end = tag[start..]
-                        .find(|c: char| c.is_ascii_whitespace() || c == '>')
-                        .map(|e| start + e)
-                        .unwrap_or(tag.len());
-                    tag[start..end].to_string()
-                }
-            };
-            return Some(val);
-        }
-        search_from = at + name.len();
-    }
-}
-
-/// Extract likely dynamically injected chunk URLs from JS source. This complements
-/// AST import extraction for webpack/Next runtimes, whose `import()` implementation
-/// often builds `<script src>` URLs from numeric chunk ids plus chunk-name/hash maps
-/// rather than leaving literal module specifiers in the source.
-#[cfg(feature = "tier2")]
-pub(crate) fn extract_chunk_candidates(src: &str) -> Vec<String> {
-    use std::sync::LazyLock;
-    static DIRECT_CHUNK_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r#"["']((?:\./|/)?(?:_next/static/)?chunks/[^"']+?\.js)["']"#).unwrap()
-    });
-    static NEXT_PART_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(
-            r#"(?s)(\d+)\s*:\s*["']([^"']+?)["'].*?\+\s*["']\.([0-9a-fA-F]{6,})\.js["']"#,
-        )
-        .unwrap()
-    });
-    static NUMERIC_STRING_PAIR_RE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r#"(\d+)\s*:\s*["']([^"']+?)["']"#).unwrap());
-
-    let mut out = Vec::new();
-    for caps in DIRECT_CHUNK_RE.captures_iter(src) {
-        if let Some(m) = caps.get(1) {
-            out.push(m.as_str().to_string());
-        }
-    }
-    for caps in NEXT_PART_RE.captures_iter(src) {
-        let Some(name) = caps.get(2).map(|m| m.as_str()) else {
-            continue;
-        };
-        let Some(hash) = caps.get(3).map(|m| m.as_str()) else {
-            continue;
-        };
-        out.push(format!("./{name}.{hash}.js"));
-    }
-
-    // Common Next/Webpack shape: one function maps chunk id -> chunk basename and
-    // another maps chunk id -> content hash, then the runtime concatenates them.
-    // Example observed in the wild: id 7871 => name `7722f4ca`, hash
-    // `78bc63657a3a3377`, requested as `/_next/static/chunks/7722f4ca.78bc...js`.
-    let mut by_id: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
-    for caps in NUMERIC_STRING_PAIR_RE.captures_iter(src) {
-        let Some(id) = caps.get(1).map(|m| m.as_str()) else {
-            continue;
-        };
-        let Some(value) = caps.get(2).map(|m| m.as_str()) else {
-            continue;
-        };
-        if value.ends_with(".js") || value.contains('/') || value.len() < 4 {
-            continue;
-        }
-        by_id.entry(id).or_default().push(value);
-    }
-    for values in by_id.values() {
-        for (i, a) in values.iter().enumerate() {
-            for b in values.iter().skip(i + 1) {
-                if looks_like_chunk_part(a) && looks_like_hash_part(b) {
-                    out.push(format!("./{a}.{b}.js"));
-                }
-                if looks_like_chunk_part(b) && looks_like_hash_part(a) {
-                    out.push(format!("./{b}.{a}.js"));
-                }
-            }
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
-#[cfg(feature = "tier2")]
-fn looks_like_chunk_part(value: &str) -> bool {
-    // Chunk basenames are often short hex-ish ids, numeric ids, or human-readable
-    // route names. Exclude long content hashes to avoid producing hash.hash.js.
-    !looks_like_hash_part(value) && value.len() <= 80
-}
-
-#[cfg(feature = "tier2")]
-fn looks_like_hash_part(value: &str) -> bool {
-    // Next/Webpack chunk basenames can themselves be short hex strings (for
-    // example `7722f4ca`), while content hashes tend to be longer. Keep the
-    // threshold above short basenames so name+hash maps still combine.
-    value.len() >= 12 && value.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-/// A module's outbound import specifiers, split by load semantics.
-///
-/// `statik` are eagerly loaded as part of the module graph *before* the module
-/// evaluates — they are the **critical hydration path** and must be fetched for
-/// hydration to proceed at all. `dynamic` (`import("…")`) are loaded only when
-/// the code path reaches them — usually lazy routes/widgets that initial
-/// hydration does not need. The prefetch walk fetches `statik` at higher
-/// priority so a budget cap never starves the critical graph in favour of a lazy
-/// route chunk (the stake.com failure mode: a critical `chunks/HASH.js` static
-/// dep of the entry went unfetched while the walk spent its budget elsewhere,
-/// then the on-demand path's own budget expired before it could recover it).
-#[cfg(feature = "tier2")]
-#[derive(Default)]
-pub(crate) struct ModuleImports {
-    pub(crate) statik: Vec<String>,
-    pub(crate) dynamic: Vec<String>,
-}
-
-/// Extract ES-module import/export specifiers from JS source via the **Oxc**
-/// parse-once AST, split into static vs dynamic (see [`ModuleImports`]): static
-/// `import … from`, side-effect `import "…"`, re-export `export … from` /
-/// `export * from` are `statik`; dynamic `import("…")` with a string literal is
-/// `dynamic`. A real parse (vs. regex) means specifiers inside strings/comments
-/// are never matched and computed `import(expr)` is correctly ignored. Oxc
-/// recovers from syntax errors, so a partial/odd bundle still yields whatever
-/// specifiers it could parse.
-#[cfg(feature = "tier2")]
-pub(crate) fn extract_imports(src: &str) -> ModuleImports {
-    use oxc_allocator::Allocator;
-    use oxc_parser::Parser;
-    use oxc_span::SourceType;
-
-    let allocator = Allocator::default();
-    let ret = Parser::new(&allocator, src, SourceType::mjs()).parse();
-    let mr = &ret.module_record;
-
-    let mut imports = ModuleImports::default();
-    // Static import/export module requests (the map keys are the specifiers).
-    for (spec, _) in mr.requested_modules.iter() {
-        imports.statik.push(spec.as_str().to_string());
-    }
-    // Dynamic `import("…")`: the span points at the argument; keep it only when
-    // it is a string literal (skip `import(dynamicExpr)`).
-    for di in mr.dynamic_imports.iter() {
-        let (start, end) = (
-            di.module_request.start as usize,
-            di.module_request.end as usize,
-        );
-        if let Some(slice) = src.get(start..end) {
-            let t = slice.trim();
-            let bytes = t.as_bytes();
-            if bytes.len() >= 2
-                && (bytes[0] == b'"' || bytes[0] == b'\'')
-                && bytes[bytes.len() - 1] == bytes[0]
-            {
-                imports.dynamic.push(t[1..t.len() - 1].to_string());
-            }
-        }
-    }
-    imports
-}
-
-/// All import specifiers (static + dynamic), order-preserving. Used where load
-/// priority does not matter — seeding from inline `<script>` bodies (every
-/// specifier there is a page entry point) — and by tests.
-#[cfg(feature = "tier2")]
-fn extract_module_imports(src: &str) -> Vec<String> {
-    let i = extract_imports(src);
-    let mut out = i.statik;
-    out.extend(i.dynamic);
-    out
-}
-
 /// Render-then-Markdown escalation (feature-on). Hydrate the thin shell in the
 /// Tier 2 isolate, serialize the live DOM, merge it with the shell's real
 /// `<head>`, and re-run the content engine. On a material content gain it
@@ -1497,7 +982,7 @@ fn extract_module_imports(src: &str) -> Vec<String> {
 /// finalizes at its call site.
 #[cfg(feature = "tier2")]
 #[allow(clippy::too_many_arguments)]
-async fn try_render_markdown<F, T>(
+async fn try_render_markdown<T>(
     run: &mut Run,
     url: &str,
     body: &str,
@@ -1506,23 +991,15 @@ async fn try_render_markdown<F, T>(
     shell_incomplete: bool,
     config: &Config,
     opts: &SessionOpts,
-    fetcher: &F,
     capture: &T,
 ) where
-    F: PageFetcher + ?Sized,
     T: Tier2Capture + ?Sized,
 {
-    // Prefetch is its own `runtime.prefetch` step; the render step below then
-    // times the capture alone.
-    let resources = prefetch_scripts_traced(run, url, body, opts, fetcher).await;
     let t_cap = Instant::now();
-    let capture_result = match capture
-        .capture(url, body.as_bytes(), &resources, config, opts)
-        .await
-    {
+    let capture_result = match capture.capture(url, body.as_bytes(), config, opts).await {
         Ok(c) => c,
         Err(e) => {
-            // A jail/IPC failure is not fatal to the Markdown path: we already
+            // A capture failure is not fatal to the Markdown path: we already
             // have the static shell Markdown staged. Record the miss and keep it.
             run.record(
                 SourceTier::RuntimeInterception,
@@ -1914,328 +1391,11 @@ mod tests {
     use draco_types::{ExtractOrigin, ExtractedData, InterceptVia, NetKind};
     use serde_json::json;
 
-    // ---- ES-module subresource prefetch ------------------------------
-
-    #[test]
-    fn scan_script_seed_urls_finds_scripts_and_js_preloads() {
-        let html = r#"<html><head>
-            <link rel="stylesheet" href="/style.css">
-            <link rel="modulepreload" href="./_app/entry/start.js">
-            <link rel="preload" as="script" href='/preloaded.js'>
-            <link rel="preload" as="style" href="/ignored.css">
-            <script src="/a.js"></script>
-            <script type="module" src="https://cdn.example/b.mjs"></script>
-            <script>inline(); // no src</script>
-            <script src='c.js' defer></script>
-          </head></html>"#;
-        let srcs = scan_script_seed_urls(html);
-        assert_eq!(
-            srcs,
-            vec![
-                "./_app/entry/start.js",
-                "/preloaded.js",
-                "/a.js",
-                "https://cdn.example/b.mjs",
-                "c.js"
-            ]
-        );
-    }
-
-    #[test]
-    fn scan_inline_import_seed_urls_finds_sveltekit_boot_imports() {
-        let html = r#"<html><body><script>
-            Promise.all([
-                import("./_app/immutable/entry/start.js"),
-                import('./_app/immutable/entry/app.js')
-            ]).then(([kit, app]) => kit.start(app));
-        </script>
-        <script type="application/json">{"import":"./ignored.js"}</script>
-        </body></html>"#;
-        let mut got = scan_inline_import_seed_urls(html);
-        got.sort();
-        assert_eq!(
-            got,
-            vec![
-                "./_app/immutable/entry/app.js".to_string(),
-                "./_app/immutable/entry/start.js".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn extract_chunk_candidates_finds_next_chunk_literals_and_maps() {
-        let src = r#"
-            var a = "/_next/static/chunks/direct.abc123.js";
-            f.u = function(e) { return ({7871:"7722f4ca"}[e] || e) + ".78bc63657a3a3377.js"; }
-            f.u2 = function(e) { return ({7871:"7722f4ca"}[e] || e) + "." + ({7871:"78bc63657a3a3377"}[e] || "x") + ".js"; }
-        "#;
-        let got = extract_chunk_candidates(src);
-        assert!(
-            got.contains(&"/_next/static/chunks/direct.abc123.js".to_string()),
-            "{got:?}"
-        );
-        assert!(
-            got.contains(&"./7722f4ca.78bc63657a3a3377.js".to_string()),
-            "{got:?}"
-        );
-        assert_eq!(
-            got.iter()
-                .filter(|v| v.as_str() == "./7722f4ca.78bc63657a3a3377.js")
-                .count(),
-            1,
-            "deduped candidate list: {got:?}"
-        );
-    }
-
-    #[test]
-    fn extract_imports_splits_static_from_dynamic() {
-        let src = r#"
-            import a from "./a.js";
-            export { c } from "./c.js";
-            import "./side-effect.js";
-            const p = import("./lazy.js");
-            const q = import('./lazy2.js');
-            const dyn = import(computed);
-        "#;
-        let i = extract_imports(src);
-        // Static graph (critical): the three `import`/`export … from` specifiers.
-        for want in ["./a.js", "./c.js", "./side-effect.js"] {
-            assert!(
-                i.statik.contains(&want.to_string()),
-                "static missing {want}: {:?}",
-                i.statik
-            );
-        }
-        assert!(
-            !i.statik.iter().any(|s| s.contains("lazy")),
-            "dynamic leaked into static: {:?}",
-            i.statik
-        );
-        // Dynamic (lazy): the string-literal `import(...)` targets; computed skipped.
-        for want in ["./lazy.js", "./lazy2.js"] {
-            assert!(
-                i.dynamic.contains(&want.to_string()),
-                "dynamic missing {want}: {:?}",
-                i.dynamic
-            );
-        }
-        assert!(
-            !i.dynamic
-                .iter()
-                .any(|s| s.contains("a.js") || s.contains("c.js")),
-            "static leaked into dynamic: {:?}",
-            i.dynamic
-        );
-    }
-
-    /// A per-URL recording fetcher: serves a fixed `{url -> body}` map and logs
-    /// the exact order in which URLs were fetched, so a test can assert the
-    /// prefetch walk's fetch ordering across waves.
-    struct GraphFetcher {
-        bodies: std::collections::HashMap<String, String>,
-        order: std::sync::Mutex<Vec<String>>,
-    }
-    impl GraphFetcher {
-        fn new(pairs: &[(&str, &str)]) -> Self {
-            Self {
-                bodies: pairs
-                    .iter()
-                    .map(|(u, b)| (u.to_string(), b.to_string()))
-                    .collect(),
-                order: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-        fn order(&self) -> Vec<String> {
-            self.order.lock().unwrap().clone()
-        }
-    }
-    #[async_trait::async_trait]
-    impl PageFetcher for GraphFetcher {
-        async fn fetch(
-            &self,
-            url: &str,
-            _opts: &SessionOpts,
-        ) -> Result<draco_net::HtmlResponse, DracoError> {
-            self.order.lock().unwrap().push(url.to_string());
-            let (status, body) = match self.bodies.get(url) {
-                Some(b) => (200u16, b.clone()),
-                None => (404u16, String::new()),
-            };
-            Ok(draco_net::HtmlResponse {
-                meta: draco_types::HttpResponseMeta {
-                    status,
-                    headers: vec![("content-type".into(), "application/javascript".into())],
-                    final_url: url.to_string(),
-                    elapsed_ms: 1,
-                },
-                body: bytes::Bytes::from(body.into_bytes()),
-            })
-        }
-        async fn replay(
-            &self,
-            _spec: &draco_types::HttpRequestSpec,
-            _opts: &SessionOpts,
-        ) -> Result<draco_net::HtmlResponse, DracoError> {
-            Ok(draco_net::HtmlResponse {
-                meta: draco_types::HttpResponseMeta {
-                    status: 404,
-                    headers: vec![],
-                    final_url: String::new(),
-                    elapsed_ms: 1,
-                },
-                body: bytes::Bytes::new(),
-            })
-        }
-    }
-
-    /// The stake.com fix. The prefetch walk fetches the entry's transitive
-    /// **static** graph (the critical hydration path) and webpack/Next chunk
-    /// candidates, but must NOT fetch dynamic `import()` targets (lazy route
-    /// bundles the app pulls on navigation — the 12.9 MB stake was chasing). Here
-    /// the seed statically imports `a.js` (→ `a2.js`), dynamically imports `d1.js`
-    /// (→ `d2.js`), and references a webpack-style `chunks/c1.js`.
-    #[tokio::test]
-    async fn prefetch_fetches_static_and_chunk_candidates_skips_dynamic() {
-        let base = "https://app.example.com/";
-        let html = r#"<html><body>
-            <script type="module">import("/seed.js")</script>
-        </body></html>"#;
-
-        let fetcher = GraphFetcher::new(&[
-            (
-                "https://app.example.com/seed.js",
-                r#"import { a } from "/a.js";
-                   const lazyRoute = () => import("/d1.js");
-                   const chunk = "chunks/c1.js";"#,
-            ),
-            (
-                "https://app.example.com/a.js",
-                r#"import { a2 } from "/a2.js";"#,
-            ),
-            ("https://app.example.com/a2.js", "export const a2 = 1;"),
-            ("https://app.example.com/d1.js", r#"import("/d2.js");"#),
-            ("https://app.example.com/d2.js", "export const d2 = 1;"),
-            (
-                "https://app.example.com/chunks/c1.js",
-                "export const c1 = 1;",
-            ),
-        ]);
-
-        let out =
-            prefetch_scripts_with_budget(base, html, &SessionOpts::default(), &fetcher, 5_000)
-                .await;
-        let fetched: std::collections::HashSet<String> =
-            out.iter().map(|r| r.url.clone()).collect();
-
-        // The whole critical static graph plus the chunk candidate are prefetched.
-        for u in [
-            "https://app.example.com/seed.js",
-            "https://app.example.com/a.js",
-            "https://app.example.com/a2.js",
-            "https://app.example.com/chunks/c1.js",
-        ] {
-            assert!(
-                fetched.contains(u),
-                "expected node not prefetched: {u}; got {fetched:?}"
-            );
-        }
-
-        // Dynamic `import()` targets are NEVER prefetched (on-demand's job).
-        for u in [
-            "https://app.example.com/d1.js",
-            "https://app.example.com/d2.js",
-        ] {
-            assert!(
-                !fetched.contains(u),
-                "dynamic import target was prefetched (should be skipped): {u}; got {fetched:?}"
-            );
-        }
-
-        // Ordering: the static critical graph is fetched before the chunk
-        // candidate (lazy tier).
-        let order = fetcher.order();
-        let pos = |needle: &str| order.iter().position(|u| u == needle);
-        let last_critical = ["/seed.js", "/a.js", "/a2.js"]
-            .iter()
-            .filter_map(|s| pos(&format!("https://app.example.com{s}")))
-            .max()
-            .expect("critical nodes fetched");
-        if let Some(p) = pos("https://app.example.com/chunks/c1.js") {
-            assert!(
-                p > last_critical,
-                "chunk candidate (pos {p}) fetched before a critical node (last critical pos {last_critical}); order: {order:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn extract_module_imports_covers_static_dynamic_reexport() {
-        let src = r#"
-            import a from "./a.js";
-            import { b } from '/x/b.js';
-            import "./side-effect.js";
-            export { c } from "./c.js";
-            export * from "./star.js";
-            const p = import("./lazy.js");
-            const dyn = import(computedSpecifier);
-            // Oxc parses, so these decoys must NOT be extracted:
-            const decoy = "import x from './evil.js'";
-            // import ./commented-out.js
-        "#;
-        let mut got = extract_module_imports(src);
-        got.sort();
-        got.dedup();
-        for want in [
-            "./a.js",
-            "/x/b.js",
-            "./side-effect.js",
-            "./c.js",
-            "./star.js",
-            "./lazy.js",
-        ] {
-            assert!(got.contains(&want.to_string()), "missing {want}: {got:?}");
-        }
-        // A real parse ignores specifiers inside string literals / comments and
-        // computed dynamic imports — the whole point of using Oxc over regex.
-        assert!(
-            !got.iter().any(|s| s.contains("evil")),
-            "false match: {got:?}"
-        );
-        assert!(
-            !got.iter().any(|s| s.contains("commented")),
-            "false match: {got:?}"
-        );
-        assert!(
-            !got.iter().any(|s| s == "computedSpecifier"),
-            "computed import matched: {got:?}"
-        );
-    }
-
-    #[cfg(feature = "tier2")]
-    #[tokio::test]
-    async fn prefetch_wall_budget_zero_fetches_nothing() {
-        // The wall budget is checked before every wave; a zero budget must stop
-        // the walk before the first fetch (the deterministic degenerate case of
-        // "a slow CDN can only cost the budget, never tens of seconds").
-        let html =
-            r#"<html><head><script src="/static/app.js"></script></head><body></body></html>"#;
-        let fetcher = MockFetcher::ok_html(200, "console.log('bundle');");
-        let opts = SessionOpts::default();
-        let res =
-            prefetch_scripts_with_budget("https://shop.example.com/p", html, &opts, &fetcher, 0)
-                .await;
-        assert!(
-            res.is_empty(),
-            "zero budget must stop before the first wave: {res:?}"
-        );
-    }
-
     #[cfg(feature = "tier2")]
     #[tokio::test]
     async fn runtime_logs_attach_to_trace_only_when_opted_in() {
         // The capture reports page-side diagnostics; they surface as
-        // `runtime.log` trace steps only under `runtime_log: true`, and the
-        // prefetch is recorded as its own `runtime.prefetch` step either way.
+        // `runtime.log` trace steps only under `runtime_log: true`.
         for (enabled, expected) in [(false, 0usize), (true, 2usize)] {
             let fetcher = MockFetcher::ok_html(200, "<html>rsc</html>");
             let statics = MockStatic::miss_no_build_id();
@@ -2264,35 +1424,7 @@ mod tests {
                     Some("[exception] TypeError: boom")
                 );
             }
-            assert!(
-                r.trace.iter().any(|t| t.action == "runtime.prefetch"),
-                "prefetch step missing (enabled={enabled}): {:?}",
-                r.trace
-            );
         }
-    }
-
-    #[tokio::test]
-    async fn prefetch_scripts_fetches_external_seed_scripts() {
-        // Each fetched script (fixed mock body) is returned as a ScriptResource,
-        // keyed by its URL resolved against the page.
-        let html = r#"<html><head>
-            <script src="/static/app.js"></script>
-            <script type="module" src="/static/entry.mjs"></script>
-          </head><body></body></html>"#;
-        let fetcher = MockFetcher::ok_html(200, "console.log('bundle');");
-        let opts = SessionOpts::default();
-        let res = prefetch_scripts("https://shop.example.com/p", html, &opts, &fetcher).await;
-        let urls: Vec<&str> = res.iter().map(|r| r.url.as_str()).collect();
-        assert!(
-            urls.contains(&"https://shop.example.com/static/app.js"),
-            "{urls:?}"
-        );
-        assert!(
-            urls.contains(&"https://shop.example.com/static/entry.mjs"),
-            "{urls:?}"
-        );
-        assert!(res.iter().all(|r| !r.source.is_empty()));
     }
 
     // ---- pure helpers -------------------------------------------------
@@ -2757,7 +1889,11 @@ mod tests {
             .find(|t| t.action == "runtime.spawn")
             .unwrap();
         assert_eq!(spawn.outcome, StepOutcome::Failed);
-        assert_eq!(fetcher.replay_calls(), 0, "no replay after a jail failure");
+        assert_eq!(
+            fetcher.replay_calls(),
+            0,
+            "no replay after a capture failure"
+        );
     }
 
     #[tokio::test]
@@ -2850,7 +1986,7 @@ mod tests {
     async fn markdown_is_the_fast_path_and_never_touches_tier2() {
         // Default Markdown format: fetch → scrape → Success/Static, with a
         // `static.markdown` step and NO tier1/tier2 escalation. The capture seam
-        // must never be reached (it would panic on the real jail).
+        // must never be reached (the mock asserts it is never called).
         let fetcher = MockFetcher::ok_html(200, "<html><body><h1>Hi</h1></body></html>")
             .with_header("content-type", "text/html; charset=utf-8");
         // A normal (non-thin) content page: static extraction already found the

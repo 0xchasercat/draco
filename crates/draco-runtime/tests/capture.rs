@@ -11,6 +11,9 @@
 use draco_runtime::{run_capture, CaptureConfig};
 use draco_types::{InterceptVia, RuntimeOutcome};
 
+mod common;
+use common::{map_fetcher, null_fetcher};
+
 fn cfg() -> CaptureConfig {
     CaptureConfig {
         capture_window_ms: 2000,
@@ -30,7 +33,7 @@ fn find<'a>(
 #[test]
 fn spa_fetch_is_captured() {
     let html = include_str!("fixtures/spa_fetch.html");
-    let report = run_capture("https://shop.example.com/p/1", html, &cfg());
+    let report = run_capture("https://shop.example.com/p/1", html, &cfg(), null_fetcher());
 
     // Outcome should be a clean close (quiesced) or the hard cap — both are
     // "we ran and captured".
@@ -65,7 +68,7 @@ fn spa_fetch_is_captured() {
 #[test]
 fn spa_xhr_is_captured_with_via_xhr() {
     let html = include_str!("fixtures/spa_xhr.html");
-    let report = run_capture("https://legacy.example.com/", html, &cfg());
+    let report = run_capture("https://legacy.example.com/", html, &cfg(), null_fetcher());
 
     assert!(
         matches!(
@@ -91,7 +94,12 @@ fn spa_xhr_is_captured_with_via_xhr() {
 #[test]
 fn decoy_and_real_endpoint_both_captured() {
     let html = include_str!("fixtures/spa_decoy.html");
-    let report = run_capture("https://shop.example.com/c/widgets", html, &cfg());
+    let report = run_capture(
+        "https://shop.example.com/c/widgets",
+        html,
+        &cfg(),
+        null_fetcher(),
+    );
 
     assert!(
         matches!(
@@ -126,7 +134,7 @@ fn decoy_and_real_endpoint_both_captured() {
 #[test]
 fn no_fetch_reports_no_intercepts() {
     let html = include_str!("fixtures/no_fetch.html");
-    let report = run_capture("https://static.example.com/", html, &cfg());
+    let report = run_capture("https://static.example.com/", html, &cfg(), null_fetcher());
 
     assert!(
         report.requests.is_empty(),
@@ -139,7 +147,7 @@ fn no_fetch_reports_no_intercepts() {
 #[test]
 fn throwing_page_reports_threw_without_panicking() {
     let html = include_str!("fixtures/throws.html");
-    let report = run_capture("https://broken.example.com/", html, &cfg());
+    let report = run_capture("https://broken.example.com/", html, &cfg(), null_fetcher());
 
     // No fetch happened and JS threw → Threw. Crucially, no panic.
     assert!(report.requests.is_empty(), "unexpected captures");
@@ -158,7 +166,7 @@ fn max_intercepts_is_enforced() {
     "#;
     let mut c = cfg();
     c.max_intercepts = 5;
-    let report = run_capture("https://api.example.com/", html, &c);
+    let report = run_capture("https://api.example.com/", html, &c, null_fetcher());
 
     assert!(
         report.requests.len() <= 5,
@@ -188,7 +196,7 @@ fn stub_body_is_delivered_to_page() {
             .then(d => { window.__got = d.ok; });
         </script></body></html>
     "#;
-    let report = run_capture("https://echo.example.com/", html, &cfg());
+    let report = run_capture("https://echo.example.com/", html, &cfg(), null_fetcher());
     let req = find(&report.requests, "/api/echo").expect("no /api/echo capture");
     assert_eq!(req.via, InterceptVia::Fetch);
 }
@@ -201,7 +209,12 @@ fn framework_scheduler_hydration_surfaces_endpoints() {
     // triggers must be captured — proving the scheduler polyfill lets deferred,
     // chained requests surface.
     let html = include_str!("fixtures/framework_scheduler.html");
-    let report = run_capture("https://app.example.com/dashboard", html, &cfg());
+    let report = run_capture(
+        "https://app.example.com/dashboard",
+        html,
+        &cfg(),
+        null_fetcher(),
+    );
 
     assert!(
         matches!(
@@ -258,7 +271,7 @@ fn real_vue_bundle_hydrates_and_leaks_fetch() {
     // the app and drove the chained request).
     let mut c = cfg();
     c.stub_response_json = r#"{"ok":true,"items":[{"id":42}]}"#.to_string();
-    let report = run_capture("https://dashboard.example.com/", &html, &c);
+    let report = run_capture("https://dashboard.example.com/", &html, &c, null_fetcher());
 
     assert!(
         matches!(
@@ -336,7 +349,7 @@ fn post_with_json_body_captures_body_bytes() {
           });
         </script></body></html>
     "#;
-    let report = run_capture("https://save.example.com/", html, &cfg());
+    let report = run_capture("https://save.example.com/", html, &cfg(), null_fetcher());
     let req = find(&report.requests, "/api/save").expect("no /api/save capture");
     assert_eq!(req.method, "POST");
     let body = req.body.as_ref().expect("body should be captured");
@@ -358,7 +371,12 @@ fn post_with_json_body_captures_body_bytes() {
 #[test]
 fn standard_web_api_globals_do_not_crash_hydration() {
     let html = include_str!("fixtures/webapi_hydrate.html");
-    let report = run_capture("https://app.example.com/dashboard", html, &cfg());
+    let report = run_capture(
+        "https://app.example.com/dashboard",
+        html,
+        &cfg(),
+        null_fetcher(),
+    );
 
     assert!(
         matches!(
@@ -415,7 +433,7 @@ fn standard_web_api_globals_do_not_crash_hydration() {
 #[test]
 fn throwing_third_party_script_does_not_block_later_fetch() {
     let html = include_str!("fixtures/poison_then_fetch.html");
-    let report = run_capture("https://shop.example.com/", html, &cfg());
+    let report = run_capture("https://shop.example.com/", html, &cfg(), null_fetcher());
 
     // We captured a request, so the run is a successful close (not Threw), even
     // though an earlier script threw synchronously and async errors fired.
@@ -465,7 +483,7 @@ fn hydrated_dom_is_serialized_for_render_then_markdown() {
           </script>
         </body></html>
     "#;
-    let report = run_capture("https://spa.example.com/", html, &cfg());
+    let report = run_capture("https://spa.example.com/", html, &cfg(), null_fetcher());
 
     let dom = report
         .rendered_html
@@ -493,7 +511,7 @@ fn static_body_content_survives_to_serialized_dom() {
     let html = r#"<html><head></head><body>
         <article><h1>Static Heading</h1><p>Plain server body text.</p></article>
       </body></html>"#;
-    let report = run_capture("https://static.example.com/", html, &cfg());
+    let report = run_capture("https://static.example.com/", html, &cfg(), null_fetcher());
 
     let dom = report.rendered_html.expect("serialized DOM present");
     assert!(
@@ -506,8 +524,7 @@ fn static_body_content_survives_to_serialized_dom() {
     );
 }
 
-// ---- ES-module + external-script support (run_capture_with_resources) --------
-use draco_runtime::run_capture_with_resources;
+// ---- ES-module + external-script support (map-backed fetcher) --------
 use std::collections::HashMap;
 
 #[test]
@@ -523,7 +540,7 @@ fn external_classic_script_from_resources_executes() {
         "https://shop.example.com/static/app.js".into(),
         b"fetch('/api/products', { headers: { accept: 'application/json' } });".to_vec(),
     );
-    let report = run_capture_with_resources("https://shop.example.com/", html, &cfg(), res);
+    let report = run_capture("https://shop.example.com/", html, &cfg(), map_fetcher(res));
     let req =
         find(&report.requests, "/api/products").expect("no /api/products from external script");
     assert_eq!(req.via, InterceptVia::Fetch);
@@ -543,8 +560,12 @@ fn inline_es_module_hydrates_and_fetches() {
           fetch('/api/data', { headers: { accept: 'application/json' } });
         </script>
       </body></html>"#;
-    let report =
-        run_capture_with_resources("https://app.example.com/", html, &cfg(), HashMap::new());
+    let report = run_capture(
+        "https://app.example.com/",
+        html,
+        &cfg(),
+        map_fetcher(HashMap::new()),
+    );
     let req = find(&report.requests, "/api/data").expect("no /api/data from inline module");
     assert_eq!(req.via, InterceptVia::Fetch);
     // The module actually mutated the DOM.
@@ -576,7 +597,12 @@ fn external_module_with_static_and_dynamic_imports() {
         "https://app.example.com/m/lazy.js".into(),
         b"fetch('/api/lazy', { headers: { accept: 'application/json' } });".to_vec(),
     );
-    let report = run_capture_with_resources("https://app.example.com/page", html, &cfg(), res);
+    let report = run_capture(
+        "https://app.example.com/page",
+        html,
+        &cfg(),
+        map_fetcher(res),
+    );
     let req = find(&report.requests, "/api/lazy").expect("no /api/lazy from dynamic import");
     assert_eq!(req.via, InterceptVia::Fetch);
 }
@@ -592,8 +618,12 @@ fn missing_dynamic_import_does_not_crash() {
           fetch('/api/ok', { headers: { accept: 'application/json' } });
         </script>
       </body></html>"#;
-    let report =
-        run_capture_with_resources("https://app.example.com/", html, &cfg(), HashMap::new());
+    let report = run_capture(
+        "https://app.example.com/",
+        html,
+        &cfg(),
+        map_fetcher(HashMap::new()),
+    );
     assert!(
         matches!(
             report.outcome,
@@ -616,7 +646,7 @@ fn multiple_captures_same_thread_fresh_isolate_each() {
              var h=document.createElement('h1');h.textContent='run {i} content here';\
              document.getElementById('r').appendChild(h);</script></body></html>"
         );
-        let report = run_capture("https://ex.com/", &html, &cfg());
+        let report = run_capture("https://ex.com/", &html, &cfg(), null_fetcher());
         let dom = report.rendered_html.expect("serialized DOM");
         assert!(
             dom.contains(&format!("run {i} content here")),

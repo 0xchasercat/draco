@@ -36,15 +36,15 @@ mod machine;
 mod ranking;
 #[cfg(test)]
 mod testutil;
-/// Tier 2 supervisor wiring (jail-hosted V8 capture → ranked replay). Always
+/// Tier 2 supervisor wiring (in-process V8 capture → ranked replay). Always
 /// compiled: the capture *seam* + rank/replay logic are V8-free. Only the
-/// production capture seam that actually spawns the jail is behind the `tier2`
+/// production capture seam that actually hosts V8 is behind the `tier2`
 /// feature — the lean build uses a disabled seam that reports "built without
 /// tier2" and finalizes `Unsupported`.
 mod tier2;
 
 #[cfg(feature = "tier2")]
-mod prewarm;
+mod chunk_cache;
 
 // ---- Public API -----------------------------------------------------------
 
@@ -56,15 +56,6 @@ pub use machine::{clamp_tier_max, session_opts, ProdStatic, StaticEngine, TIER_C
 /// [`extract_with_pool`].
 pub use tier2::Tier2Pool;
 
-/// Re-export the jailed-child entry so the CLI's `__jail` re-exec hook can call
-/// it without depending on `draco-jail` directly. Only present with `tier2` on;
-/// the lean CLI build has no `__jail` hook and never references this.
-///
-/// `run_jail_child` is the `draco __jail` child entry (arms the sandbox, hosts
-/// the V8 capture, and never returns). `spawn_jail` is the supervisor-side spawn,
-/// re-exported for completeness / external drivers.
-#[cfg(feature = "tier2")]
-pub use draco_jail::{run_jail_child, spawn_jail, JailHandle};
 pub use ranking::{
     best_candidate, best_replayable, is_read_style_post, is_safe_method, score_request, Candidate,
     MIN_VIABLE_SCORE, PENALTY_ANALYTICS, PENALTY_STATIC_ASSET, SCORE_API_PATH, SCORE_JSON,
@@ -77,7 +68,7 @@ pub use ranking::{
 /// Each flag is an independent output; a request may ask for any combination.
 /// The default is `markdown` alone: Draco is first a Firecrawl-style scraper
 /// (URL → clean Markdown + metadata), and that path is the fast one — it never
-/// touches V8/the jail.
+/// touches V8.
 ///
 /// - `markdown` — clean Markdown of the main content (+ `metadata`).
 /// - `html` — cleaned, absolutized main-content HTML.
@@ -180,15 +171,14 @@ pub struct Config {
     /// Cap the escalation ladder: 0 = static only, 1 = +build-id, 2 = +runtime.
     pub tier_max: u8,
     pub capture_window_ms: u64,
-    /// Skip OS-level sandbox hardening for Tier 2. The V8 isolate still runs with
-    /// no host-capability bindings (page JS cannot reach the network, filesystem,
-    /// or processes); only the defense-in-depth OS sandbox (seccomp/netns/
-    /// Landlock) is skipped. On non-Linux this is a no-op (there is no OS sandbox
-    /// to skip). Set via the CLI `--no-jail` flag.
+    /// Accepted for CLI compatibility; a no-op since the OS process jail was
+    /// retired. Tier 2 runs V8 **in-process**: containment is the isolate itself
+    /// (page JS has no host-capability bindings — it cannot reach the network,
+    /// filesystem, or processes; the only I/O it can cause is the script fetches
+    /// the engine explicitly brokers). Set via the CLI `--no-jail` flag.
     pub no_jail: bool,
-    /// Use the strict default-deny seccomp allowlist instead of the default robust
-    /// denylist (Linux, jailed path only). Maximum hardening but may need per-host
-    /// tuning. Set via the CLI `--strict-sandbox` flag. Off by default.
+    /// Accepted for CLI compatibility; a no-op since the OS process jail (and its
+    /// seccomp profiles) was retired. Set via the CLI `--strict-sandbox` flag.
     pub strict_sandbox: bool,
     /// Allow Tier 2 to replay a state-changing request (an unsafe HTTP method
     /// that is not a GraphQL/JSON-RPC read) that the ranking picked. Off by
@@ -237,16 +227,13 @@ pub async fn extract(url: &str, config: &Config) -> ExtractionResult {
     machine::run(url, config).await
 }
 
-/// Like [`extract`], but routes the Tier 2 capture through a warm
-/// [`Tier2Pool`] instead of spawning a fresh jailed child per scrape. Intended
-/// for the long-lived daemon, where the pool amortizes the process + sandbox
-/// setup across requests; the CLI keeps using [`extract`]. Same guarantees:
+/// Like [`extract`], but routes the Tier 2 capture through a [`Tier2Pool`],
+/// which bounds how many V8 isolates run concurrently. Intended for the
+/// long-lived daemon; the CLI keeps using [`extract`]. Same guarantees:
 /// never panics, never returns `Err` — every outcome is in the result.
 ///
-/// Each capture still runs in a fresh isolate inside a reused worker process, so
-/// there is no cross-scrape state bleed (see [`Tier2Pool`]). A request whose
-/// sandbox posture differs from the pool's transparently falls back to a
-/// one-shot spawn.
+/// Every capture runs in a fresh snapshot-restored isolate in-process, so there
+/// is no cross-scrape state bleed (see [`Tier2Pool`]).
 pub async fn extract_with_pool(url: &str, config: &Config, pool: &Tier2Pool) -> ExtractionResult {
     machine::run_with_pool(url, config, pool).await
 }

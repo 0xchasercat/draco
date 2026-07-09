@@ -1,17 +1,17 @@
-//! Tier 2 wiring (Slice 4): jail-hosted V8 capture → ranked replay.
+//! Tier 2 wiring: in-process V8 capture → ranked replay.
 //!
-//! This is the supervisor half of the Tier 2 flow (the jailed-child half lives in
-//! `draco-jail`). When the ladder reaches Tier 2 (Tiers 0/1 missed, it is not a
-//! challenge, and `tier_max >= 2`), it drives a [`Tier2Capture`] seam to obtain a
+//! When the ladder reaches Tier 2 (Tiers 0/1 missed, it is not a challenge, and
+//! `tier_max >= 2`), it drives a [`Tier2Capture`] seam to obtain a
 //! [`CaptureResult`], then [`rank_and_replay`]s it:
 //!
 //! 1. **Capture.** The production seam ([`ProdTier2Capture`], `tier2` feature on)
-//!    spawns the jail child via [`draco_jail::spawn_jail`] (or, when
-//!    `config.no_jail`, an un-jailed dev fork of `draco __jail`), drives the IPC
-//!    exchange (read `Ready`, write `Hydrate` with the Tier-0 HTML as the frame
-//!    body, collect `Intercept`s until the terminal `Result`), and returns the
-//!    captured requests + outcome. With the feature OFF, the seam is
-//!    [`DisabledCapture`], which reports "built without tier2".
+//!    runs the page **in-process** via [`draco_runtime::run_capture`]: a fresh V8
+//!    isolate (happy-dom, no host-capability bindings) hydrates the Tier-0 HTML
+//!    and every request it makes is recorded. The isolate pulls its own code —
+//!    external `<script src>`, `import()`, and webpack/Next chunks — through an
+//!    async fetcher backed by `draco-net` + the immutable chunk cache, so those
+//!    loads fan out concurrently on its event loop. With the feature OFF, the
+//!    seam is [`DisabledCapture`], which reports "built without tier2".
 //! 2. **Rank + replay.** [`best_replayable`](crate::ranking::best_replayable)
 //!    picks the most data-endpoint-like intercept that is *also* safe to replay;
 //!    if it clears [`MIN_VIABLE_SCORE`](crate::ranking::MIN_VIABLE_SCORE) it is
@@ -24,20 +24,20 @@
 //!
 //! Splitting capture behind [`Tier2Capture`] keeps the ladder offline-testable:
 //! unit tests drive `run_ladder` (and [`rank_and_replay`]) with a **mock** capture
-//! that returns a canned `Vec` of intercepts, so no real child is forked. The
-//! real-child path is exercised only by an `#[ignore]`d e2e test. The rank/replay
-//! logic and the `CaptureResult` shape are V8-free and always compiled; only the
-//! jail-spawning production seam is behind `#[cfg(feature = "tier2")]`.
+//! that returns a canned `Vec` of intercepts, so no isolate is booted. The
+//! rank/replay logic and the `CaptureResult` shape are V8-free and always
+//! compiled; only the isolate-hosting production seam is behind
+//! `#[cfg(feature = "tier2")]`.
 //!
-//! ## Blocking IPC inside an async ladder
+//! ## Driving `!Send` V8 from an async ladder
 //!
-//! `spawn_jail` forks and the IPC uses blocking `UnixStream` reads/writes, so the
-//! spawn+capture phase is synchronous. The ladder runs under a multi-thread tokio
-//! runtime, so [`ProdTier2Capture`] pushes that phase onto
-//! [`tokio::task::spawn_blocking`] rather than stalling a worker. The V8 isolate
-//! (and its own current-thread tokio runtime) lives entirely in the **child**
-//! process, so there is no nested-runtime hazard on the supervisor side. Only the
-//! *replay* is async — it goes back through the normal `PageFetcher`.
+//! [`draco_runtime::run_capture`] owns a current-thread tokio runtime and drives a
+//! `!Send` `JsRuntime`, so it cannot run on an async worker. The ladder runs under
+//! a multi-thread runtime, so [`ProdTier2Capture`] pushes each capture onto
+//! [`tokio::task::spawn_blocking`] — the isolate lives and dies on that one
+//! blocking thread. The isolate's own script/chunk fetches are async (real
+//! `draco-net` sockets) driven on its current-thread runtime; only the final
+//! *replay* goes back through the ladder's normal async `PageFetcher`.
 
 use async_trait::async_trait;
 use draco_types::{DiscoveredEndpoint, DracoError, JailKind, RuntimeOutcome};
@@ -48,10 +48,10 @@ use crate::Config;
 
 // ===========================================================================
 // Always-on: capture result shape, the seam, and rank+replay.
-// (No dependency on draco-jail / V8; compiled in the lean build too.)
+// (No dependency on V8; compiled in the lean build too.)
 // ===========================================================================
 
-/// The outcome of the capture phase: what the child intercepted, plus the
+/// The outcome of the capture phase: what the isolate intercepted, plus the
 /// terminal runtime outcome it reported. Produced by a [`Tier2Capture`] seam and
 /// consumed by [`rank_and_replay`].
 #[derive(Debug, Clone)]
@@ -63,49 +63,38 @@ pub(crate) struct CaptureResult {
     /// [`Candidate`] so the ranking policy stays body-agnostic, but carried here
     /// so a POST winner (e.g. GraphQL) can be replayed faithfully.
     pub bodies: Vec<Option<Vec<u8>>>,
-    /// The child's terminal runtime outcome.
+    /// The capture's terminal runtime outcome.
     pub outcome: RuntimeOutcome,
-    /// The achieved sandbox level the child reported (e.g.
-    /// `"hardened: seccomp+netns+landlock"` or `"isolate: v8 no host bindings
-    /// (macos)"`), surfaced as the `runtime.sandbox` trace step. `None` if the
-    /// child did not report one (e.g. the offline mock capture).
+    /// The achieved containment posture (e.g. `"isolate: in-process v8 (no host
+    /// bindings)"`), surfaced as the `runtime.sandbox` trace step. `None` if the
+    /// seam did not report one (e.g. the offline mock capture).
     pub sandbox_level: Option<String>,
     /// The hydrated DOM the runtime serialized (`document.documentElement.
-    /// outerHTML`), carried on the terminal `Result` frame body. `Some` when the
-    /// isolate produced usable markup — the input to the render-then-Markdown
-    /// escalation ([`crate::machine`]); `None` otherwise (empty body, or the
-    /// offline mock capture).
+    /// outerHTML`). `Some` when the isolate produced usable markup — the input to
+    /// the render-then-Markdown escalation ([`crate::machine`]); `None` otherwise
+    /// (nothing usable, or the offline mock capture).
     pub rendered_html: Option<String>,
     /// Page-side runtime diagnostics (glue-swallowed exceptions, console.error
-    /// lines, page-script throws), carried as `Error`-level `Log` frames ahead
-    /// of the terminal `Result`. Bounded child-side; surfaced as `runtime.log`
-    /// trace steps when [`Config::runtime_log`](crate::Config) asks for them.
+    /// lines, page-script throws). Bounded runtime-side; surfaced as
+    /// `runtime.log` trace steps when [`Config::runtime_log`](crate::Config)
+    /// asks for them.
     pub logs: Vec<String>,
 }
 
 /// The Tier 2 capture seam: given the page URL + Tier-0 HTML, produce a
 /// [`CaptureResult`] (or a [`DracoError::Jail`]). Behind a trait so the ladder is
-/// drivable offline with a mock that fabricates intercepts, no child forked.
+/// drivable offline with a mock that fabricates intercepts, no isolate booted.
+/// There is no resource list to pass: the isolate pulls the code it needs itself,
+/// on demand and concurrently, through its async fetcher.
 #[async_trait]
 pub(crate) trait Tier2Capture: Send + Sync {
     async fn capture(
         &self,
         url: &str,
         html: &[u8],
-        resources: &[ScriptResource],
         config: &Config,
         opts: &draco_net::SessionOpts,
     ) -> Result<CaptureResult, DracoError>;
-}
-
-/// A supervisor-prefetched script subresource handed to the jailed child so the
-/// (air-gapped) isolate can run external `<script src>` and resolve
-/// `import`/`import()` for `type="module"` apps. `url` is the absolute resource
-/// URL (the module-loader key); `source` is its raw bytes.
-#[derive(Debug, Clone)]
-pub(crate) struct ScriptResource {
-    pub url: String,
-    pub source: Vec<u8>,
 }
 
 /// A structured Tier 2 error, mapped to [`DracoError::Jail`] for the trace/result.
@@ -267,7 +256,7 @@ pub(crate) fn discover_endpoints(
 }
 
 /// Capture seam used when the crate is built **without** the `tier2` feature:
-/// there is no jail/runtime linked, so Tier 2 cannot run. The ladder records a
+/// there is no runtime (V8) linked, so Tier 2 cannot run. The ladder records a
 /// "built without tier2" note and finalizes `Unsupported`.
 #[cfg(not(feature = "tier2"))]
 pub(crate) struct DisabledCapture;
@@ -279,13 +268,12 @@ impl Tier2Capture for DisabledCapture {
         &self,
         _url: &str,
         _html: &[u8],
-        _resources: &[ScriptResource],
         _config: &Config,
         _opts: &draco_net::SessionOpts,
     ) -> Result<CaptureResult, DracoError> {
         Err(jail_error(
             JailKind::Spawn,
-            "built without tier2: Tier 2 (jail-hosted V8 capture) is not compiled in",
+            "built without tier2: Tier 2 (in-process V8 capture) is not compiled in",
         ))
     }
 }
@@ -307,29 +295,24 @@ fn effective_capture_window_ms(requested: u64) -> u64 {
     requested.min(MAX_SUPERVISOR_CAPTURE_WINDOW_MS)
 }
 
-/// Per-fetch timeout clamp for script **subresources** (the supervisor prefetch
-/// and on-demand `LoadScript` chunks). The session's own timeout (default 30 s)
-/// is sized for the page fetch; letting a single hung chunk CDN pin a capture
-/// for that long multiplies into the tens of seconds the capture-window clamp
-/// was supposed to prevent. A chunk that can't answer in 2.5 s is treated as
-/// missing — the page sees the same `onerror` shape as a network miss.
+/// Per-fetch timeout clamp for script **subresources** (the isolate's on-demand
+/// script/module/chunk loads). The session's own timeout (default 30 s) is sized
+/// for the page fetch; letting a single hung chunk CDN pin a capture for that
+/// long multiplies into the tens of seconds the capture-window clamp was
+/// supposed to prevent. A chunk that can't answer in 2.5 s is treated as
+/// missing — the page sees the same `onerror` shape as a network miss. (The
+/// capture window itself independently bounds total job time; loads still in
+/// flight when it closes are simply abandoned with the isolate.)
 #[cfg(feature = "tier2")]
 pub(crate) const SUBRESOURCE_FETCH_TIMEOUT_MS: u64 = 2_500;
-
-/// Total wall budget for servicing on-demand `LoadScript` requests within one
-/// Hydrate job. The child's capture window only bounds event-loop *pump* time —
-/// it cannot preempt a synchronous `op_raze_load_script` mid-JS-turn, and a
-/// chunk loader that requests scripts back-to-back inside one turn would extend
-/// the job unboundedly. Past this budget the supervisor answers `ok: false`
-/// immediately (no fetch), so hydration degrades exactly like missing chunks.
-#[cfg(feature = "tier2")]
-const DYNAMIC_LOAD_BUDGET_MS: u64 = 4_000;
 
 /// Derive the [`draco_net::SessionOpts`] used for script subresource fetches
 /// from the session's own: per-fetch timeout clamped to
 /// [`SUBRESOURCE_FETCH_TIMEOUT_MS`], and the politeness `delay_ms` dropped —
 /// browsers burst-load a page's chunks over pooled connections, and a per-host
-/// delay would serialize every prefetch wave.
+/// delay would serialize the isolate's concurrent load fan-out. The session's
+/// cookie jar is preserved (chunk CDNs behind Cloudflare need the page's
+/// `__cf_bm` cookie).
 #[cfg(feature = "tier2")]
 pub(crate) fn subresource_opts(opts: &draco_net::SessionOpts) -> draco_net::SessionOpts {
     let mut o = opts.clone();
@@ -375,25 +358,130 @@ fn base64_encode(input: &[u8]) -> String {
 }
 
 // ===========================================================================
-// tier2-gated: the production capture seam (spawns the jail, drives IPC).
+// tier2-gated: the production capture seam (in-process V8, async net fetches).
 // ===========================================================================
 
 #[cfg(feature = "tier2")]
 mod prod {
-    use std::os::unix::net::UnixStream;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use async_trait::async_trait;
-    use draco_jail::frame::{self, FrameError};
-    use draco_types::{DracoError, JailKind, JailToSupervisor, RuntimeOutcome, SupervisorToJail};
+    use draco_types::{DracoError, JailKind};
 
     use super::{
-        default_quiesce_ms, effective_capture_window_ms, jail_error, CaptureResult, Config,
-        ScriptResource, Tier2Capture, DYNAMIC_LOAD_BUDGET_MS, MAX_INTERCEPTS,
+        default_quiesce_ms, effective_capture_window_ms, jail_error, subresource_opts,
+        CaptureResult, Config, Tier2Capture, MAX_INTERCEPTS,
     };
+    use crate::chunk_cache::ChunkCache;
     use crate::ranking::Candidate;
 
-    /// Production [`Tier2Capture`]: spawns the jail child and drives one Hydrate.
+    /// In-process async source of script / module / chunk bytes for the isolate:
+    /// a pooled `draco-net` fetch (with the job's subresource posture + shared
+    /// cookie jar) fronted by the immutable [`ChunkCache`]. Implements
+    /// [`draco_runtime::ScriptFetcher`] so the isolate `.await`s it directly on its
+    /// own event loop — many chunk/module loads kicked off in a burst fan out
+    /// concurrently over Tokio instead of serializing one blocking round-trip at a
+    /// time (the whole point of retiring the jail's per-chunk IPC).
+    struct NetScriptFetcher {
+        opts: draco_net::SessionOpts,
+        cache: Arc<ChunkCache>,
+    }
+
+    impl draco_runtime::ScriptFetcher for NetScriptFetcher {
+        // Return type spelled out (rather than the `futures::future::LocalBoxFuture`
+        // alias the trait declares) so draco-core needs no `futures` dependency —
+        // the alias is transparently `Pin<Box<dyn Future + 'a>>`.
+        fn fetch<'a>(
+            &'a self,
+            url: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + 'a>> {
+            Box::pin(async move {
+                // Code chunks carry content-hashed filenames, so a URL is an
+                // immutable key: serve from cache when present (this is what makes a
+                // repeat scrape of a site sub-second).
+                if let Some(bytes) = self.cache.get(url) {
+                    return Some(bytes);
+                }
+                match draco_net::fetch_target(url, &self.opts).await {
+                    Ok(resp) if (200..300).contains(&resp.meta.status) => {
+                        let bytes = resp.body.to_vec();
+                        self.cache.put(url, &bytes);
+                        Some(bytes)
+                    }
+                    // 403 → bot-wall, 404 → moved/renamed chunk, others verbatim:
+                    // a miss rejects exactly that load (the module loader / script
+                    // onerror), never poisons the graph. Never cache non-2xx.
+                    _ => None,
+                }
+            })
+        }
+    }
+
+    /// Translate the ladder's [`Config`] into the isolate's capture knobs. The
+    /// requested capture window is clamped ([`effective_capture_window_ms`]); the
+    /// stub body is `"[]"` (an empty JSON array — the shape most page code
+    /// `.flatMap`/`.map`s over without throwing, so hydration proceeds).
+    fn capture_config(config: &Config) -> draco_runtime::CaptureConfig {
+        let capture_window_ms = effective_capture_window_ms(config.capture_window_ms);
+        draco_runtime::CaptureConfig {
+            capture_window_ms,
+            quiesce_ms: default_quiesce_ms(capture_window_ms),
+            max_intercepts: MAX_INTERCEPTS,
+            stub_response_json: "[]".to_string(),
+        }
+    }
+
+    /// Map a [`draco_runtime::CaptureReport`] onto the ladder's [`CaptureResult`]
+    /// (rank/replay's V8-free input). Header order is preserved verbatim (it is
+    /// fingerprint-relevant to replay).
+    fn to_capture_result(report: draco_runtime::CaptureReport) -> CaptureResult {
+        let mut candidates = Vec::with_capacity(report.requests.len());
+        let mut bodies = Vec::with_capacity(report.requests.len());
+        for r in report.requests {
+            candidates.push(Candidate {
+                method: r.method,
+                url: r.url,
+                headers: r.headers,
+                via: r.via,
+            });
+            bodies.push(r.body);
+        }
+        CaptureResult {
+            candidates,
+            bodies,
+            outcome: report.outcome,
+            // The containment story is now purely the isolate: page JS runs with no
+            // host-capability bindings, in-process. Surfaced as `runtime.sandbox`.
+            sandbox_level: Some("isolate: in-process v8 (no host bindings)".to_string()),
+            rendered_html: report.rendered_html,
+            logs: report.logs,
+        }
+    }
+
+    /// Run one capture **in-process**. Blocking — always invoked from
+    /// `spawn_blocking`, because [`draco_runtime::run_capture`] owns a current-thread
+    /// tokio runtime and drives a `!Send` `JsRuntime`; it must not run on an async
+    /// worker. The `NetScriptFetcher` is built here (on the blocking thread) since
+    /// it holds a `!Send` `Rc<dyn ScriptFetcher>` once inside `run_capture`.
+    fn capture_blocking(
+        url: &str,
+        html: &[u8],
+        config: &Config,
+        opts: &draco_net::SessionOpts,
+    ) -> CaptureResult {
+        let fetcher: std::rc::Rc<dyn draco_runtime::ScriptFetcher> =
+            std::rc::Rc::new(NetScriptFetcher {
+                opts: subresource_opts(opts),
+                cache: ChunkCache::shared(),
+            });
+        let html = String::from_utf8_lossy(html);
+        let report = draco_runtime::run_capture(url, &html, &capture_config(config), fetcher);
+        to_capture_result(report)
+    }
+
+    /// Production [`Tier2Capture`]: run one capture in-process on a dedicated
+    /// blocking thread. There is no child process, no IPC, and no prefetch — the
+    /// isolate pulls exactly the code it needs, concurrently, via the fetcher.
     pub(crate) struct ProdTier2Capture;
 
     #[async_trait]
@@ -402,405 +490,53 @@ mod prod {
             &self,
             url: &str,
             html: &[u8],
-            resources: &[ScriptResource],
             config: &Config,
             opts: &draco_net::SessionOpts,
         ) -> Result<CaptureResult, DracoError> {
-            // The spawn + blocking IPC exchange runs off the async worker pool.
             let url = url.to_string();
             let html = html.to_vec();
-            let resources = resources.to_vec();
             let config = config.clone();
             let opts = opts.clone();
-            tokio::task::spawn_blocking(move || {
-                capture_blocking(&url, &html, &resources, &config, &opts)
-            })
-            .await
-            .map_err(|e| {
-                jail_error(
-                    JailKind::Spawn,
-                    format!("capture task panicked/cancelled: {e}"),
-                )
-            })?
-        }
-    }
-
-    /// Spawn the jail child, drive one `Hydrate`, and collect the capture result.
-    /// **Blocking** — always called from `spawn_blocking`. This is the one-shot
-    /// path (CLI, and posture-overriding daemon requests): spawn a worker, run a
-    /// single job, shut it down. The warm-pool path reuses a [`Worker`] across
-    /// many jobs instead (see [`Tier2Pool`]).
-    fn capture_blocking(
-        url: &str,
-        html: &[u8],
-        resources: &[ScriptResource],
-        config: &Config,
-        opts: &draco_net::SessionOpts,
-    ) -> Result<CaptureResult, DracoError> {
-        let mut worker = Worker::spawn(config.no_jail, config.strict_sandbox)?;
-        let result = worker.run_job(url, html, resources, config, opts);
-        // Always shut the one-shot worker down, whether the job succeeded or not,
-        // so we never leak a child or a zombie.
-        worker.shutdown();
-        result
-    }
-
-    /// A warm, reusable jailed capture worker: a child process that has already
-    /// paid the fork+exec + sandbox-arming + first snapshot cost and announced
-    /// `Ready`, and can service many `Hydrate` jobs over its lifetime (each with
-    /// a *fresh* isolate — see [`crate::tier2`] and the child loop in
-    /// `draco_jail::runtime_payload`). Held idle in a [`Tier2Pool`] between jobs.
-    ///
-    /// The worker is `Send`: the V8 isolate lives in the *child* process; this
-    /// struct only owns the supervisor's IPC endpoint (an fd) + the child pid, so
-    /// it can move between blocking threads freely.
-    struct Worker {
-        handle: Handle,
-        /// Jobs serviced so far — used by the pool to recycle after a bound.
-        jobs_done: u32,
-        /// The achieved sandbox posture, reported by the child as a prefixed
-        /// `Log` right after `Ready` (at boot, once). Stashed here so it can be
-        /// attached to *every* job's [`CaptureResult`], not just the first —
-        /// a reused worker never re-reports it.
-        sandbox_level: Option<String>,
-    }
-
-    impl Worker {
-        /// Spawn a child with the given posture and consume its `Ready`
-        /// handshake, leaving the worker ready to accept jobs. A hard EOF /
-        /// protocol error here usually means the child died during sandbox setup
-        /// (seccomp kill, or namespaces refused) — surfaced as a jail error.
-        fn spawn(no_jail: bool, strict_sandbox: bool) -> Result<Worker, DracoError> {
-            let mut handle = spawn_posture(no_jail, strict_sandbox)?;
-            let ipc = handle.ipc_stream();
-            match frame::read_jail_frame(ipc) {
-                Ok(f) => match f.header {
-                    JailToSupervisor::Ready { .. } => {}
-                    JailToSupervisor::Error { reason, detail } => {
-                        return Err(jail_error(
-                            reason,
-                            format!("child error before ready: {detail}"),
-                        ));
-                    }
-                    other => {
-                        return Err(jail_error(
-                            JailKind::Protocol,
-                            format!("expected Ready, got {other:?}"),
-                        ));
-                    }
-                },
-                Err(e) => return Err(map_frame_err(e, "reading Ready")),
-            }
-            Ok(Worker {
-                handle,
-                jobs_done: 0,
-                sandbox_level: None,
-            })
-        }
-
-        /// Drive one `Hydrate` job over this worker: stream the prefetched
-        /// subresources, send the page, and collect intercepts until the terminal
-        /// `Result`. Does **not** shut the worker down — the caller decides
-        /// whether to reuse or retire it. On any IPC error the worker is
-        /// considered poisoned and must not be reused (the pool drops it).
-        fn run_job(
-            &mut self,
-            url: &str,
-            html: &[u8],
-            resources: &[ScriptResource],
-            config: &Config,
-            opts: &draco_net::SessionOpts,
-        ) -> Result<CaptureResult, DracoError> {
-            // Per-job prewarmer: on-demand chunk fetches (and their static
-            // dependency closures) run concurrently on a small multi-thread
-            // runtime into a shared per-job cache, so the isolate's strictly
-            // serial `LoadScript`s land as warm-cache hits instead of each
-            // paying a fresh round-trip. The runtime is owned here, so it and
-            // any in-flight background warms are torn down when the job ends.
-            let prewarm_rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(crate::prewarm::PREWARM_WORKER_THREADS)
-                .enable_io()
-                .enable_time()
-                .build()
+            tokio::task::spawn_blocking(move || capture_blocking(&url, &html, &config, &opts))
+                .await
                 .map_err(|e| {
                     jail_error(
-                        JailKind::Protocol,
-                        format!("prewarm runtime unavailable: {e}"),
+                        JailKind::Spawn,
+                        format!("capture task panicked/cancelled: {e}"),
                     )
-                })?;
-            let prewarmer = crate::prewarm::Prewarmer::for_job(prewarm_rt.handle().clone(), opts);
-
-            let ipc = self.handle.ipc_stream();
-
-            // 1. Stream the pre-fetched script subresources (each source rides its
-            //    frame body) so the isolate's module loader can serve
-            //    `<script src>` and `import`/`import()` without the air-gapped
-            //    child fetching.
-            for res in resources {
-                let frame = SupervisorToJail::Resource {
-                    url: res.url.clone(),
-                };
-                frame::write_supervisor_frame(ipc, &frame, &res.source)
-                    .map_err(|e| map_frame_err(e, "sending Resource"))?;
-            }
-
-            // 2. Send Hydrate with the page HTML as the frame body.
-            let capture_window_ms = effective_capture_window_ms(config.capture_window_ms);
-            let hydrate = SupervisorToJail::Hydrate {
-                url: url.to_string(),
-                capture_window_ms,
-                quiesce_ms: default_quiesce_ms(capture_window_ms),
-                max_intercepts: MAX_INTERCEPTS,
-                stub_response_json: "[]".to_string(),
-            };
-            frame::write_supervisor_frame(ipc, &hydrate, html)
-                .map_err(|e| map_frame_err(e, "sending Hydrate"))?;
-            let mut hydrate_sent = std::time::Instant::now();
-
-            // 3. Collect Intercept frames until the terminal Result. On the FIRST
-            //    job the child's boot-time sandbox-level Log is still queued ahead
-            //    of the Result; stash it on the worker so later jobs inherit it.
-            let mut candidates = Vec::new();
-            let mut bodies = Vec::new();
-            let mut rendered_html: Option<String> = None;
-            let mut logs: Vec<String> = Vec::new();
-            let outcome: RuntimeOutcome = loop {
-                let f = match frame::read_jail_frame(ipc) {
-                    Ok(f) => f,
-                    Err(FrameError::Eof) => {
-                        let status = self
-                            .handle
-                            .try_reap_status()
-                            .unwrap_or_else(|| "status unavailable".to_string());
-                        return Err(jail_error(
-                            JailKind::Protocol,
-                            format!("child closed IPC before sending a Result ({status})"),
-                        ));
-                    }
-                    Err(e) => return Err(map_frame_err(e, "collecting intercepts")),
-                };
-                match f.header {
-                    JailToSupervisor::Intercept {
-                        method,
-                        url,
-                        headers,
-                        has_body,
-                        via,
-                        ..
-                    } => {
-                        candidates.push(Candidate {
-                            method,
-                            url,
-                            headers,
-                            via,
-                        });
-                        bodies.push(if has_body { Some(f.body) } else { None });
-                    }
-                    JailToSupervisor::LoadScript { id, url } => {
-                        // The capture window cannot preempt these synchronous
-                        // loads mid-JS-turn, so the supervisor enforces its own
-                        // wall budget: past it, answer "missing" immediately
-                        // rather than fetching — hydration degrades exactly like
-                        // a missing chunk instead of pinning the job open.
-                        //
-                        // The budget resets after each successful load so that
-                        // scripts evaluated early in the page don't consume the
-                        // entire window before later dynamic imports fire.
-                        let elapsed_ms = hydrate_sent.elapsed().as_millis() as u64;
-                        let within_budget = elapsed_ms < DYNAMIC_LOAD_BUDGET_MS;
-                        let (body, fail_reason): (Vec<u8>, Option<String>) = if within_budget {
-                            match prewarmer.serve(&url) {
-                                Ok(b) => (b, None),
-                                Err(reason) => (Vec::new(), Some(reason)),
-                            }
-                        } else {
-                            (
-                                Vec::new(),
-                                Some(format!(
-                                    "on-demand load budget exhausted ({elapsed_ms}ms \
-                                     ≥ {DYNAMIC_LOAD_BUDGET_MS}ms); not fetched"
-                                )),
-                            )
-                        };
-                        let ok = !body.is_empty();
-                        // Reset the budget timer on success so the next chunk
-                        // gets a fresh window. Failed loads keep the old timer
-                        // so repeated failures for the same chunk don't infinite-loop.
-                        if ok {
-                            hydrate_sent = std::time::Instant::now();
-                        }
-                        // A failed on-demand chunk fetch is the difference between
-                        // a hydrated SPA and 0 endpoints, and the child only sees a
-                        // bare "missing" (its module loader rejects the import). So
-                        // record WHY here — budget vs HTTP status vs network — as a
-                        // bounded `runtime.log` line, correlated to the child's own
-                        // rejection by URL. `--runtime-log` then explains a
-                        // missing-chunk hydration stall instead of leaving it to
-                        // guesswork. Successful loads stay silent (no flood).
-                        if let Some(reason) = &fail_reason {
-                            if logs.len() < 64 {
-                                logs.push(format!("[loadscript] {reason}: {url}"));
-                            }
-                        }
-                        let reply = SupervisorToJail::Script { id, ok, url };
-                        frame::write_supervisor_frame(ipc, &reply, &body)
-                            .map_err(|e| map_frame_err(e, "sending Script"))?;
-                    }
-                    JailToSupervisor::Result { outcome, .. } => {
-                        // The Result frame's body carries the hydrated DOM the
-                        // runtime serialized (empty when there was none) — the raw
-                        // material for the render-then-Markdown escalation.
-                        if !f.body.is_empty() {
-                            rendered_html = Some(String::from_utf8_lossy(&f.body).into_owned());
-                        }
-                        break outcome;
-                    }
-                    // A Log prefixed with the sandbox-level marker carries the
-                    // achieved posture (boot-time, once); other Logs are the
-                    // runtime's page-side diagnostics — collect them (defensive
-                    // re-bound: the child already caps count and length).
-                    JailToSupervisor::Log { msg, .. } => {
-                        if let Some(level) = msg.strip_prefix(draco_jail::level::LEVEL_LOG_PREFIX) {
-                            self.sandbox_level = Some(level.to_string());
-                        } else if logs.len() < 64 {
-                            logs.push(msg);
-                        }
-                    }
-                    JailToSupervisor::Error { reason, detail } => {
-                        return Err(jail_error(reason, detail));
-                    }
-                    JailToSupervisor::Ready { .. } => {
-                        return Err(jail_error(
-                            JailKind::Protocol,
-                            "unexpected second Ready frame",
-                        ));
-                    }
-                }
-            };
-
-            self.jobs_done += 1;
-            Ok(CaptureResult {
-                candidates,
-                bodies,
-                outcome,
-                sandbox_level: self.sandbox_level.clone(),
-                rendered_html,
-                logs,
-            })
-        }
-
-        /// Tell the child to shut down (best-effort — it may already be waiting on
-        /// EOF) and reap it so we leave no zombie. Consumes the worker.
-        fn shutdown(mut self) {
-            let ipc = self.handle.ipc_stream();
-            let _ = frame::write_supervisor_frame(ipc, &SupervisorToJail::Shutdown, &[]);
-            self.handle.finish();
+                })
         }
     }
 
-    /// A pool of warm [`Worker`]s for the daemon. Keeps children alive and idle
-    /// between scrapes so each Tier 2 request skips the fork+exec + sandbox-arming
-    /// + first snapshot cost (~130+ ms measured) and pays only the actual capture.
+    /// Bounded-concurrency Tier 2 capture for the daemon.
     ///
-    /// Each job still runs in a **fresh isolate** inside a reused worker process
-    /// (the child loops, building a new snapshot-restored `JsRuntime` per job), so
-    /// there is no cross-scrape state, cookie, or DOM bleed — the reuse is of the
-    /// expensive *process + sandbox*, never of the isolate. Workers are recycled
-    /// after `max_jobs` (leak hygiene) and dropped (not reused) on any IPC error.
+    /// With the jail gone there is no warm child process to keep alive: every
+    /// capture already builds a **fresh** snapshot-restored isolate (no cross-scrape
+    /// state), and that snapshot-restore is the dominant per-job cost, so a "warm
+    /// pool" would save almost nothing. What the daemon *does* need is a ceiling on
+    /// how many isolates run at once — each is a live V8 heap — so this pool is a
+    /// [`tokio::sync::Semaphore`] guarding the shared in-process capture path.
     ///
-    /// Cloneable and `Send + Sync` (an `Arc` inner), so the daemon holds one and
-    /// shares it across request handlers. Concurrency is expected to be bounded by
-    /// the daemon's own permit gate; the pool spawns a fresh worker on a checkout
-    /// miss rather than blocking.
+    /// Cloneable + `Send + Sync` (an `Arc` inner) so the daemon holds one and shares
+    /// it across request handlers.
     #[derive(Clone)]
     pub struct Tier2Pool {
-        inner: Arc<PoolInner>,
-    }
-
-    struct PoolInner {
-        /// Idle warm workers available for checkout (LIFO — reuse the hottest).
-        idle: Mutex<Vec<Worker>>,
-        /// Max workers to retain idle; extras returned over this are retired.
-        max_idle: usize,
-        /// Retire (and let the next demand respawn) a worker after this many jobs.
-        max_jobs: u32,
-        /// The sandbox posture the pooled workers were spawned with. A request
-        /// whose posture differs falls back to a one-shot spawn.
-        no_jail: bool,
-        strict_sandbox: bool,
+        permits: Arc<tokio::sync::Semaphore>,
     }
 
     impl Tier2Pool {
-        /// Create a pool. `size` is the number of workers kept warm/idle (a good
-        /// default is the CPU count, which also caps concurrent isolates);
-        /// `max_jobs` recycles a worker after that many captures. `no_jail` /
-        /// `strict_sandbox` fix the workers' sandbox posture.
-        pub fn new(size: usize, max_jobs: u32, no_jail: bool, strict_sandbox: bool) -> Self {
+        /// Create a pool bounding concurrent captures to `size` (a good default is
+        /// the CPU count — each concurrent capture is a live isolate). `max_jobs`,
+        /// `no_jail`, and `strict_sandbox` are accepted for API/CLI compatibility
+        /// but no longer affect capture now that the OS jail is gone.
+        pub fn new(size: usize, _max_jobs: u32, _no_jail: bool, _strict_sandbox: bool) -> Self {
             Tier2Pool {
-                inner: Arc::new(PoolInner {
-                    idle: Mutex::new(Vec::new()),
-                    max_idle: size.max(1),
-                    max_jobs: max_jobs.max(1),
-                    no_jail,
-                    strict_sandbox,
-                }),
+                permits: Arc::new(tokio::sync::Semaphore::new(size.max(1))),
             }
         }
 
-        /// Retire all idle workers (best-effort). Call on daemon shutdown so
-        /// children exit promptly instead of on EOF when the socket drops.
-        pub fn shutdown(&self) {
-            let workers = std::mem::take(&mut *self.inner.idle.lock().unwrap());
-            for w in workers {
-                w.shutdown();
-            }
-        }
-    }
-
-    impl PoolInner {
-        /// Blocking: run one job on a pooled (or freshly spawned) worker, then
-        /// return it to the pool or recycle it.
-        fn run_pooled(
-            &self,
-            url: &str,
-            html: &[u8],
-            resources: &[ScriptResource],
-            config: &Config,
-            opts: &draco_net::SessionOpts,
-        ) -> Result<CaptureResult, DracoError> {
-            let mut worker = match self.idle.lock().unwrap().pop() {
-                Some(w) => w,
-                None => Worker::spawn(self.no_jail, self.strict_sandbox)?,
-            };
-            match worker.run_job(url, html, resources, config, opts) {
-                Ok(result) => {
-                    self.return_or_recycle(worker);
-                    Ok(result)
-                }
-                // A poisoned worker (IPC error / child died mid-job) must never
-                // be reused — drop it; the next demand spawns a fresh one.
-                Err(e) => {
-                    worker.shutdown();
-                    Err(e)
-                }
-            }
-        }
-
-        /// Return a healthy worker to the idle set, or retire it if it has hit the
-        /// recycle bound or the idle set is already full.
-        fn return_or_recycle(&self, worker: Worker) {
-            if worker.jobs_done >= self.max_jobs {
-                worker.shutdown();
-                return;
-            }
-            let mut idle = self.idle.lock().unwrap();
-            if idle.len() < self.max_idle {
-                idle.push(worker);
-            } else {
-                drop(idle);
-                worker.shutdown();
-            }
-        }
+        /// No warm children to retire; kept for daemon API compatibility.
+        pub fn shutdown(&self) {}
     }
 
     #[async_trait]
@@ -809,285 +545,34 @@ mod prod {
             &self,
             url: &str,
             html: &[u8],
-            resources: &[ScriptResource],
             config: &Config,
             opts: &draco_net::SessionOpts,
         ) -> Result<CaptureResult, DracoError> {
-            // A request that overrides the pool's sandbox posture can't use a
-            // pooled worker (workers are spawned with a fixed posture) — fall back
-            // to a dedicated one-shot capture for it.
-            if config.no_jail != self.inner.no_jail
-                || config.strict_sandbox != self.inner.strict_sandbox
-            {
-                return ProdTier2Capture
-                    .capture(url, html, resources, config, opts)
-                    .await;
-            }
-
-            let inner = self.inner.clone();
-            let url = url.to_string();
-            let html = html.to_vec();
-            let resources = resources.to_vec();
-            let config = config.clone();
-            let opts = opts.clone();
-            tokio::task::spawn_blocking(move || {
-                inner.run_pooled(&url, &html, &resources, &config, &opts)
-            })
-            .await
-            .map_err(|e| {
-                jail_error(
-                    JailKind::Spawn,
-                    format!("pooled capture task panicked/cancelled: {e}"),
-                )
-            })?
-        }
-    }
-
-    /// Owns the supervisor side of the child so `capture_blocking` is agnostic to
-    /// whether it was jailed (`spawn_jail`) or un-jailed (dev `no_jail`).
-    enum Handle {
-        Jailed(draco_jail::JailHandle),
-        #[cfg(target_os = "linux")]
-        Unjailed(unjailed::UnjailedChild),
-    }
-
-    impl Handle {
-        fn ipc_stream(&mut self) -> &mut UnixStream {
-            match self {
-                Handle::Jailed(h) => h.ipc(),
-                #[cfg(target_os = "linux")]
-                Handle::Unjailed(h) => h.ipc(),
-            }
-        }
-
-        fn finish(self) {
-            match self {
-                Handle::Jailed(h) => {
-                    reap_pid(h.pid());
-                    drop(h);
-                }
-                #[cfg(target_os = "linux")]
-                Handle::Unjailed(h) => h.finish(),
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        fn try_reap_status(&mut self) -> Option<String> {
-            match self {
-                Handle::Jailed(h) => reap_pid_status(h.pid()),
-                Handle::Unjailed(_) => None,
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        fn try_reap_status(&mut self) -> Option<String> {
-            None
-        }
-    }
-
-    /// Spawn the child with an explicit sandbox posture. Default: the
-    /// OS-sandboxed (`hardened`) child via [`draco_jail::spawn_jail_with`],
-    /// selecting the strict seccomp model when `strict_sandbox`. With `no_jail`,
-    /// the isolate-only child (OS sandbox skipped; V8 still has no host bindings).
-    fn spawn_posture(no_jail: bool, strict_sandbox: bool) -> Result<Handle, DracoError> {
-        if no_jail {
-            #[cfg(target_os = "linux")]
-            {
-                return unjailed::spawn().map(Handle::Unjailed);
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                // On non-Linux there is no OS sandbox to skip: spawn_jail() is
-                // already the isolate path, so `no_jail` is a no-op distinction.
-                return draco_jail::spawn_jail()
-                    .map(Handle::Jailed)
-                    .map_err(|e| jail_error(e.reason, e.detail));
-            }
-        }
-        draco_jail::spawn_jail_with(strict_sandbox)
-            .map(Handle::Jailed)
-            .map_err(|e| jail_error(e.reason, e.detail))
-    }
-
-    /// Best-effort reap of a child pid so a completed jail run leaves no zombie.
-    #[cfg(target_os = "linux")]
-    fn reap_pid(pid: i32) {
-        let _ = reap_pid_status(pid);
-    }
-
-    #[cfg(target_os = "linux")]
-    fn reap_pid_status(pid: i32) -> Option<String> {
-        // SAFETY: waitpid on our own child pid; the child exits promptly after
-        // emitting its Result and seeing Shutdown/EOF.
-        unsafe {
-            let mut status: libc::c_int = 0;
-            let r = libc::waitpid(pid, &mut status, 0);
-            if r < 0 {
-                return Some(format!(
-                    "waitpid failed: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-            if libc::WIFSIGNALED(status) {
-                return Some(format!("child signaled {}", libc::WTERMSIG(status)));
-            }
-            if libc::WIFEXITED(status) {
-                return Some(format!("child exited {}", libc::WEXITSTATUS(status)));
-            }
-            Some(format!("wait status 0x{status:x}"))
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn reap_pid(_pid: i32) {
-        // Non-Linux degraded spawn manages child lifetime itself.
-    }
-
-    /// Map a frame-codec error to the most specific [`DracoError::Jail`].
-    fn map_frame_err(e: FrameError, ctx: &str) -> DracoError {
-        match e {
-            FrameError::Eof => jail_error(JailKind::Protocol, format!("{ctx}: unexpected EOF")),
-            FrameError::Io(io) => jail_error(
-                JailKind::Killed,
-                format!("{ctx}: IPC I/O error (child likely killed): {io}"),
-            ),
-            other => jail_error(JailKind::Protocol, format!("{ctx}: {other}")),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Isolate-mode path (`--no-jail` on Linux): fork + re-exec `draco __jail`
-    // WITHOUT the OS sandbox (netns/seccomp/Landlock). Tier 2 still hosts V8 with
-    // no host-capability bindings, so page JS stays contained; this only skips
-    // the defense-in-depth OS layer. Linux-only (elsewhere the isolate path is the
-    // normal spawn).
-    // -----------------------------------------------------------------------
-    #[cfg(target_os = "linux")]
-    mod unjailed {
-        use std::ffi::CString;
-        use std::os::fd::{IntoRawFd, OwnedFd};
-        use std::os::unix::net::UnixStream;
-
-        use draco_types::JailKind;
-
-        use super::super::jail_error;
-        use draco_types::DracoError;
-
-        /// Fd the child inherits its IPC socket on — matches draco-jail's contract.
-        const JAIL_IPC_FD: i32 = 3;
-
-        /// A forked isolate-mode `draco __jail` child + the supervisor IPC end.
-        pub(super) struct UnjailedChild {
-            pid: i32,
-            ipc: UnixStream,
-        }
-
-        impl UnjailedChild {
-            pub(super) fn ipc(&mut self) -> &mut UnixStream {
-                &mut self.ipc
-            }
-
-            pub(super) fn finish(self) {
-                // SAFETY: reap our own child; it exits after Shutdown/EOF.
-                unsafe {
-                    let mut status: libc::c_int = 0;
-                    libc::waitpid(self.pid, &mut status, 0);
-                }
-                drop(self.ipc);
-            }
-        }
-
-        /// Spawn `draco __jail` in isolate mode: socketpair → fork → (child) dup
-        /// socket onto fd 3 and exec self; (parent) keep the supervisor end.
-        ///
-        /// Intentionally skips the OS sandbox (netns/seccomp/Landlock) — the
-        /// `--no-jail` path. The re-exec target is the running executable, whose
-        /// `__jail` hook routes into `draco_jail::run_jail_child`. We set
-        /// [`draco_jail::JAIL_NO_SANDBOX_ENV`] in the child before exec so that
-        /// entry skips arming the OS sandbox and runs the capture payload directly
-        /// (V8 still has no host-capability bindings).
-        pub(super) fn spawn() -> Result<UnjailedChild, DracoError> {
-            // The user explicitly opted out of OS-level hardening on a platform
-            // where it was available. One concise, non-alarming line noting the
-            // achieved posture — Tier 2 still runs V8 with no host bindings.
-            eprintln!(
-                "draco-core: --no-jail set; running Tier 2 in isolate mode (V8, no host \
-                 bindings) without the OS sandbox (seccomp/netns/Landlock)."
-            );
-
-            let (sup, child) = UnixStream::pair()
-                .map_err(|e| jail_error(JailKind::Spawn, format!("socketpair: {e}")))?;
-
-            let exe = std::env::current_exe()
-                .map_err(|e| jail_error(JailKind::Spawn, format!("current_exe: {e}")))?;
-            let exe_c = CString::new(exe.as_os_str().as_encoded_bytes())
-                .map_err(|e| jail_error(JailKind::Spawn, format!("exe path has NUL: {e}")))?;
-            let jail_arg =
-                CString::new("__jail").expect("static literal \"__jail\" contains no NUL byte");
-            // Marker name/value for the un-jailed child (set via setenv before
-            // exec). Allocated pre-fork so the child arm is allocation-free.
-            let env_name = CString::new(draco_jail::JAIL_NO_SANDBOX_ENV)
-                .expect("env var name contains no NUL byte");
-            let env_val = CString::new("1").expect("static \"1\" contains no NUL byte");
-
-            let child_fd: OwnedFd = child.into();
-            let child_raw = child_fd.into_raw_fd();
-
-            // SAFETY: between fork and exec we call only async-signal-safe libc
-            // functions (dup2/close/setenv/execv/_exit) and touch no Rust runtime
-            // state. `setenv` is safe post-fork in the single-threaded child.
-            match unsafe { libc::fork() } {
-                -1 => {
-                    // SAFETY: child_raw is a valid fd we still own here.
-                    unsafe { libc::close(child_raw) };
-                    drop(sup);
-                    Err(jail_error(JailKind::Spawn, "fork failed"))
-                }
-                0 => {
-                    // SAFETY: async-signal-safe calls only; abort hard on any
-                    // failure so we never run supervisor code in the child.
-                    unsafe {
-                        if child_raw != JAIL_IPC_FD {
-                            if libc::dup2(child_raw, JAIL_IPC_FD) < 0 {
-                                libc::_exit(126);
-                            }
-                            libc::close(child_raw);
-                        } else if libc::fcntl(child_raw, libc::F_SETFD, 0) < 0 {
-                            libc::_exit(126);
-                        }
-                        // Tell the re-exec'd child to skip the sandbox.
-                        if libc::setenv(env_name.as_ptr(), env_val.as_ptr(), 1) < 0 {
-                            libc::_exit(125);
-                        }
-                        let argv = [exe_c.as_ptr(), jail_arg.as_ptr(), std::ptr::null()];
-                        libc::execv(exe_c.as_ptr(), argv.as_ptr());
-                        // exec failed; diverge so this arm has type `!` (coerces
-                        // to the `Result` the other arms produce).
-                        libc::_exit(127)
-                    }
-                }
-                pid => {
-                    // Parent: close the child end, keep the supervisor end.
-                    // SAFETY: child_raw belongs to the child now; close our copy.
-                    unsafe { libc::close(child_raw) };
-                    Ok(UnjailedChild { pid, ipc: sup })
-                }
-            }
+            // Cap concurrent isolates. The permit is held for the whole capture and
+            // released on drop. The semaphore is never closed, so `acquire_owned`
+            // only errors in impossible conditions — treat as a spawn error, don't
+            // panic.
+            let _permit =
+                self.permits.clone().acquire_owned().await.map_err(|e| {
+                    jail_error(JailKind::Spawn, format!("pool semaphore closed: {e}"))
+                })?;
+            ProdTier2Capture.capture(url, html, config, opts).await
         }
     }
 }
 
 #[cfg(feature = "tier2")]
 pub(crate) use prod::ProdTier2Capture;
-/// The warm worker pool — public so the daemon can hold one and route scrapes
-/// through it (via [`crate::extract_with_pool`]).
+/// The capture concurrency pool — public so the daemon can hold one and route
+/// scrapes through it (via [`crate::extract_with_pool`]).
 #[cfg(feature = "tier2")]
 pub use prod::Tier2Pool;
 
-/// Lean-build stub of the warm pool: with no `tier2` feature there is no
-/// jail/runtime linked, so the pool cannot host V8. It exists only so the daemon
-/// compiles and links the same way in both builds; its capture path finalizes
-/// `Unsupported`, exactly like [`DisabledCapture`]. Constructor args are ignored.
+/// Lean-build stub of the capture pool: with no `tier2` feature there is no
+/// runtime (V8) linked, so the pool cannot host captures. It exists only so the
+/// daemon compiles and links the same way in both builds; its capture path
+/// finalizes `Unsupported`, exactly like [`DisabledCapture`]. Constructor args
+/// are ignored.
 #[cfg(not(feature = "tier2"))]
 #[derive(Clone)]
 pub struct Tier2Pool;
@@ -1107,13 +592,12 @@ impl Tier2Capture for Tier2Pool {
         &self,
         _url: &str,
         _html: &[u8],
-        _resources: &[ScriptResource],
         _config: &Config,
         _opts: &draco_net::SessionOpts,
     ) -> Result<CaptureResult, DracoError> {
         Err(jail_error(
             JailKind::Spawn,
-            "built without tier2: Tier 2 (jail-hosted V8 capture) is not compiled in",
+            "built without tier2: Tier 2 (in-process V8 capture) is not compiled in",
         ))
     }
 }
