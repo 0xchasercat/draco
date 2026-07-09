@@ -395,7 +395,7 @@ impl ChunkCache {
 
         let target = self.disk_cap.saturating_mul(9) / 10; // ~90% of cap
         if total > target {
-            files.sort_by(|a, b| a.0.cmp(&b.0)); // oldest mtime first
+            files.sort_by_key(|a| a.0); // oldest mtime first
             for (_, path, size) in &files {
                 if total <= target {
                     break;

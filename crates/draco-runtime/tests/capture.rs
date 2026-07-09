@@ -94,7 +94,12 @@ fn spa_xhr_is_captured_with_via_xhr() {
 #[test]
 fn decoy_and_real_endpoint_both_captured() {
     let html = include_str!("fixtures/spa_decoy.html");
-    let report = run_capture("https://shop.example.com/c/widgets", html, &cfg(), null_fetcher());
+    let report = run_capture(
+        "https://shop.example.com/c/widgets",
+        html,
+        &cfg(),
+        null_fetcher(),
+    );
 
     assert!(
         matches!(
@@ -204,7 +209,12 @@ fn framework_scheduler_hydration_surfaces_endpoints() {
     // triggers must be captured — proving the scheduler polyfill lets deferred,
     // chained requests surface.
     let html = include_str!("fixtures/framework_scheduler.html");
-    let report = run_capture("https://app.example.com/dashboard", html, &cfg(), null_fetcher());
+    let report = run_capture(
+        "https://app.example.com/dashboard",
+        html,
+        &cfg(),
+        null_fetcher(),
+    );
 
     assert!(
         matches!(
@@ -361,7 +371,12 @@ fn post_with_json_body_captures_body_bytes() {
 #[test]
 fn standard_web_api_globals_do_not_crash_hydration() {
     let html = include_str!("fixtures/webapi_hydrate.html");
-    let report = run_capture("https://app.example.com/dashboard", html, &cfg(), null_fetcher());
+    let report = run_capture(
+        "https://app.example.com/dashboard",
+        html,
+        &cfg(),
+        null_fetcher(),
+    );
 
     assert!(
         matches!(
@@ -545,8 +560,12 @@ fn inline_es_module_hydrates_and_fetches() {
           fetch('/api/data', { headers: { accept: 'application/json' } });
         </script>
       </body></html>"#;
-    let report =
-        run_capture("https://app.example.com/", html, &cfg(), map_fetcher(HashMap::new()));
+    let report = run_capture(
+        "https://app.example.com/",
+        html,
+        &cfg(),
+        map_fetcher(HashMap::new()),
+    );
     let req = find(&report.requests, "/api/data").expect("no /api/data from inline module");
     assert_eq!(req.via, InterceptVia::Fetch);
     // The module actually mutated the DOM.
@@ -578,7 +597,12 @@ fn external_module_with_static_and_dynamic_imports() {
         "https://app.example.com/m/lazy.js".into(),
         b"fetch('/api/lazy', { headers: { accept: 'application/json' } });".to_vec(),
     );
-    let report = run_capture("https://app.example.com/page", html, &cfg(), map_fetcher(res));
+    let report = run_capture(
+        "https://app.example.com/page",
+        html,
+        &cfg(),
+        map_fetcher(res),
+    );
     let req = find(&report.requests, "/api/lazy").expect("no /api/lazy from dynamic import");
     assert_eq!(req.via, InterceptVia::Fetch);
 }
@@ -594,8 +618,12 @@ fn missing_dynamic_import_does_not_crash() {
           fetch('/api/ok', { headers: { accept: 'application/json' } });
         </script>
       </body></html>"#;
-    let report =
-        run_capture("https://app.example.com/", html, &cfg(), map_fetcher(HashMap::new()));
+    let report = run_capture(
+        "https://app.example.com/",
+        html,
+        &cfg(),
+        map_fetcher(HashMap::new()),
+    );
     assert!(
         matches!(
             report.outcome,

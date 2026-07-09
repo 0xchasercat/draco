@@ -156,7 +156,12 @@ fn interleaved_classic_and_module_dynamic_imports_do_not_abort() {
         ),
     ]);
 
-    let report = run_capture("https://interleave.test/", html, &cfg(), map_fetcher(resources));
+    let report = run_capture(
+        "https://interleave.test/",
+        html,
+        &cfg(),
+        map_fetcher(resources),
+    );
     let got = urls(&report);
     for want in ["/api/from-x", "/api/from-y", "/api/from-z"] {
         assert!(
