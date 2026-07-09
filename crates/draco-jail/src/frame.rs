@@ -321,6 +321,117 @@ pub fn read_jail_frame<R: Read>(r: &mut R) -> Result<JailFrame, FrameError> {
     Ok(JailFrame { header, body })
 }
 
+// ===========================================================================
+// Async frame I/O (Option B: tokio::net::UnixStream transport).
+//
+// Byte-identical wire format to the sync helpers above — same `encode`, same
+// 12-byte prefix + JSON header + body, same caps and clean-EOF semantics. These
+// drive the fully-async, concurrent IPC: the jailed child runs a tokio reactor
+// (the strict seccomp allowlist already permits epoll/eventfd2) so a page's
+// `import()` chunk loads fan out over the socket without freezing the V8 thread,
+// and the supervisor serves fetches + writes replies out-of-order on its
+// multi-thread runtime.
+// ===========================================================================
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+/// Write a supervisor -> child frame to an async writer.
+pub async fn write_supervisor_frame_async<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    header: &SupervisorToJail,
+    body: &[u8],
+) -> Result<(), FrameError> {
+    let buf = encode(MsgClass::SupervisorToJail, header, body)?;
+    w.write_all(&buf).await.map_err(FrameError::Io)?;
+    w.flush().await.map_err(FrameError::Io)
+}
+
+/// Write a child -> supervisor frame to an async writer.
+pub async fn write_jail_frame_async<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    header: &JailToSupervisor,
+    body: &[u8],
+) -> Result<(), FrameError> {
+    let buf = encode(MsgClass::JailToSupervisor, header, body)?;
+    w.write_all(&buf).await.map_err(FrameError::Io)?;
+    w.flush().await.map_err(FrameError::Io)
+}
+
+/// Async twin of [`read_prefix`]: returns [`FrameError::Eof`] iff the very first
+/// byte hits EOF (a clean frame-boundary close); EOF thereafter is a truncated
+/// frame surfaced as [`FrameError::Io`].
+async fn read_prefix_async<R: AsyncRead + Unpin>(r: &mut R) -> Result<Prefix, FrameError> {
+    let mut prefix = [0u8; PREFIX_LEN];
+    match r.read(&mut prefix[..1]).await {
+        Ok(0) => return Err(FrameError::Eof),
+        Ok(_) => {}
+        Err(e) => return Err(FrameError::Io(e)),
+    }
+    r.read_exact(&mut prefix[1..]).await.map_err(FrameError::Io)?;
+
+    if prefix[0..2] != MAGIC {
+        return Err(FrameError::BadMagic([prefix[0], prefix[1]]));
+    }
+    if prefix[2] != VERSION {
+        return Err(FrameError::BadVersion(prefix[2]));
+    }
+    let class = MsgClass::from_byte(prefix[3])?;
+    let header_len = u32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]);
+    let body_len = u32::from_le_bytes([prefix[8], prefix[9], prefix[10], prefix[11]]);
+    if header_len > MAX_HEADER_LEN {
+        return Err(FrameError::HeaderTooLarge(header_len));
+    }
+    if body_len > MAX_BODY_LEN {
+        return Err(FrameError::BodyTooLarge(body_len));
+    }
+    Ok(Prefix {
+        class,
+        header_len,
+        body_len,
+    })
+}
+
+async fn read_frame_async<R: AsyncRead + Unpin, H: DeserializeOwned>(
+    r: &mut R,
+    expected: MsgClass,
+) -> Result<(H, Vec<u8>), FrameError> {
+    let prefix = read_prefix_async(r).await?;
+    if prefix.class != expected {
+        // Drain the announced payload so the stream stays frame-aligned.
+        let to_skip = prefix.header_len as usize + prefix.body_len as usize;
+        let mut scratch = vec![0u8; to_skip];
+        let _ = r.read_exact(&mut scratch).await;
+        return Err(FrameError::WrongDirection {
+            expected,
+            got: prefix.class,
+        });
+    }
+    let mut header_buf = vec![0u8; prefix.header_len as usize];
+    r.read_exact(&mut header_buf).await.map_err(FrameError::Io)?;
+    let mut body = vec![0u8; prefix.body_len as usize];
+    r.read_exact(&mut body).await.map_err(FrameError::Io)?;
+    let header: H = serde_json::from_slice(&header_buf)?;
+    Ok((header, body))
+}
+
+/// Read one supervisor -> child frame from an async reader.
+pub async fn read_supervisor_frame_async<R: AsyncRead + Unpin>(
+    r: &mut R,
+) -> Result<SupervisorFrame, FrameError> {
+    let (header, body) =
+        read_frame_async::<R, SupervisorToJail>(r, MsgClass::SupervisorToJail).await?;
+    Ok(SupervisorFrame { header, body })
+}
+
+/// Read one child -> supervisor frame from an async reader.
+pub async fn read_jail_frame_async<R: AsyncRead + Unpin>(
+    r: &mut R,
+) -> Result<JailFrame, FrameError> {
+    let (header, body) =
+        read_frame_async::<R, JailToSupervisor>(r, MsgClass::JailToSupervisor).await?;
+    Ok(JailFrame { header, body })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
