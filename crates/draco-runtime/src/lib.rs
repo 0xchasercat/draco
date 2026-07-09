@@ -346,7 +346,7 @@ impl CaptureState {
             s.push('…');
         }
         // Bounded scan (≤ MAX_RUNTIME_LOGS entries): an exact repeat adds nothing.
-        if self.logs.iter().any(|l| *l == s) {
+        if self.logs.contains(&s) {
             return;
         }
         self.logs.push(s);
@@ -591,10 +591,7 @@ async fn op_raze_fetch(
 /// dropped before the `.await` (no `Ref` may be held across it).
 #[deno_core::op2]
 #[string]
-async fn op_raze_load_script(
-    state: Rc<RefCell<OpState>>,
-    #[string] url: String,
-) -> Option<String> {
+async fn op_raze_load_script(state: Rc<RefCell<OpState>>, #[string] url: String) -> Option<String> {
     let (fetcher, inflight) = {
         let op_state = state.borrow();
         let cap = op_state.borrow::<Rc<RefCell<CaptureState>>>().clone();
@@ -924,8 +921,7 @@ async fn run_capture_inner(
         .filter(|(_, s)| !s.inline)
         .map(|(i, s)| (i, resolve_script_url(url, &s.payload)))
         .collect();
-    let fetched =
-        futures::future::join_all(external.iter().map(|(_, u)| fetcher.fetch(u))).await;
+    let fetched = futures::future::join_all(external.iter().map(|(_, u)| fetcher.fetch(u))).await;
     let mut ext_bytes: HashMap<usize, Vec<u8>> = HashMap::new();
     for ((i, _), bytes) in external.iter().zip(fetched) {
         if let Some(b) = bytes {
@@ -2258,4 +2254,3 @@ mod tests {
         }
     }
 }
-
