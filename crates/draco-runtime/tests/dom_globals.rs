@@ -13,6 +13,9 @@
 
 use draco_runtime::{run_capture, CaptureConfig};
 
+mod common;
+use common::null_fetcher;
+
 fn cfg() -> CaptureConfig {
     CaptureConfig {
         capture_window_ms: 2000,
@@ -41,7 +44,7 @@ fn svga_element_instanceof_guard_does_not_throw() {
 </script>
 </body></html>"#;
 
-    let report = run_capture("https://sk.example.com/", html, &cfg());
+    let report = run_capture("https://sk.example.com/", html, &cfg(), null_fetcher());
     assert!(
         captured(&report, "/api/router-ran"),
         "SVGAElement guard aborted the script; logs: {:?}",
@@ -76,7 +79,7 @@ fn svga_element_is_defined_and_sane() {
 </script>
 </body></html>"#;
 
-    let report = run_capture("https://sk.example.com/", html, &cfg());
+    let report = run_capture("https://sk.example.com/", html, &cfg(), null_fetcher());
     assert!(
         captured(&report, "/api/check?ok=true"),
         "SVGAElement not defined/sane; requests: {:?}, logs: {:?}",
@@ -102,7 +105,7 @@ fn event_source_is_stubbed_and_records_the_sse_endpoint() {
 </script>
 </body></html>"#;
 
-    let report = run_capture("https://sse.example.com/", html, &cfg());
+    let report = run_capture("https://sse.example.com/", html, &cfg(), null_fetcher());
     assert!(
         captured(&report, "/api/after-eventsource"),
         "code after `new EventSource(...)` did not run; logs: {:?}",
@@ -130,7 +133,7 @@ fn fetch_response_body_getreader_does_not_throw() {
 </script>
 </body></html>"#;
 
-    let report = run_capture("https://sse.example.com/", html, &cfg());
+    let report = run_capture("https://sse.example.com/", html, &cfg(), null_fetcher());
     assert!(
         captured(&report, "/api/after-getreader?done=true"),
         "response.body.getReader() path threw or stalled; logs: {:?}",
@@ -150,7 +153,7 @@ fn websocket_is_stubbed_and_records_endpoint() {
 </script>
 </body></html>"#;
 
-    let report = run_capture("https://sse.example.com/", html, &cfg());
+    let report = run_capture("https://sse.example.com/", html, &cfg(), null_fetcher());
     assert!(
         captured(&report, "/api/after-websocket"),
         "code after `new WebSocket(...)` did not run; logs: {:?}",

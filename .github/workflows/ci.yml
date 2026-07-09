@@ -12,8 +12,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        runs-on:
+          - namespace-profile-draco-macos-arm64
+          - namespace-profile-draco-linux-x86-64
+          - namespace-profile-draco-linux-arm64
+    runs-on: ${{ matrix.runs-on }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

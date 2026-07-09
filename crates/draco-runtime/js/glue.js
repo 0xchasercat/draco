@@ -330,10 +330,13 @@
 
   // Dynamic script chunk loader hook. Frameworks such as Next/Webpack load lazy
   // chunks by creating <script src="/_next/static/chunks/..."></script> and
-  // resolving a promise from onload/onerror. happy-dom's script loading is disabled
-  // (the isolate is air-gapped), so execute prefetched chunk sources synchronously
-  // when such script nodes are appended/inserted. Missing chunks fire onerror so
-  // page code sees the same failure shape as a network miss.
+  // resolving a promise from onload/onerror. happy-dom's own script loading is
+  // disabled, so we take over: when such a node is appended/inserted we kick off an
+  // ASYNC in-process fetch (op_raze_load_script → draco-net + chunk cache) and eval
+  // the source when it resolves, firing load/error. The fetch does NOT block the
+  // insertion, so a burst of chunk appends fans out CONCURRENTLY on the event loop
+  // (the whole point of the in-process async engine) instead of one blocking round
+  // trip at a time. A miss fires onerror so page code sees a network-miss shape.
   function scriptSrc(node) {
     try {
       if (!node || String(node.tagName || "").toLowerCase() !== "script") return null;
@@ -355,30 +358,39 @@
     const u = scriptSrc(node);
     if (!u || node.__dracoLoaded) return false;
     node.__dracoLoaded = true;
-    let src = null;
-    try { src = ops.op_raze_resource(u); } catch (_) { src = null; }
-    if (typeof src !== "string") {
-      try { src = ops.op_raze_load_script(u); } catch (_) { src = null; }
-    }
-    if (typeof src !== "string") { fireScriptEvent(node, "error", u); return false; }
-    try {
-      // Indirect eval runs in global scope. //# sourceURL gives stack traces an
-      // absolute URL and lets relative dynamic imports inside chunks resolve.
-      (0, eval)(src + "\n//# sourceURL=" + u);
-      fireScriptEvent(node, "load", u);
-      return true;
-    } catch (e) {
-      logSwallowed("script", e);
-      fireScriptEvent(node, "error", u);
-      return true;
-    }
+    // Kick off the chunk fetch ASYNCHRONOUSLY and return true (handled) at once —
+    // a dynamically inserted <script src> loads off-thread in a browser, so we must
+    // not block insertion. op_raze_load_script is an async op (returns a Promise):
+    // eval + fire `load` when it resolves, fire `error` on a miss/throw. Because we
+    // return immediately, a burst of appended chunks fetches CONCURRENTLY on the
+    // event loop instead of serializing one blocking round-trip at a time.
+    let p = null;
+    try { p = ops.op_raze_load_script(u); } catch (_) { p = null; }
+    if (!p || typeof p.then !== "function") { fireScriptEvent(node, "error", u); return true; }
+    p.then(
+      (src) => {
+        if (typeof src !== "string") { fireScriptEvent(node, "error", u); return; }
+        try {
+          // Indirect eval runs in global scope. //# sourceURL gives stack traces an
+          // absolute URL and lets relative dynamic imports inside chunks resolve.
+          (0, eval)(src + "\n//# sourceURL=" + u);
+          fireScriptEvent(node, "load", u);
+        } catch (e) {
+          logSwallowed("script", e);
+          fireScriptEvent(node, "error", u);
+        }
+      },
+      (e) => { logSwallowed("script", e); fireScriptEvent(node, "error", u); },
+    );
+    return true;
   }
   function hookInsertion(proto, name) {
     if (!proto || typeof proto[name] !== "function") return;
     const orig = proto[name];
     proto[name] = function (...args) {
-      // Run known prefetched scripts BEFORE insertion so happy-dom's disabled file
-      // loader never tries (and fails) to fetch them itself.
+      // Take over <script src> loading BEFORE real insertion (maybeRunScriptNode
+      // kicks off the async fetch and returns true immediately) so happy-dom's
+      // disabled file loader never tries — and fails — to fetch it itself.
       const handled = (() => { try { return maybeRunScriptNode(args[0]); } catch (_) { return false; } })();
       if (handled && name !== "append") return args[0];
       if (handled && name === "append") return undefined;

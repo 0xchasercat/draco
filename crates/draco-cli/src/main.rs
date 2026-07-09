@@ -355,9 +355,6 @@ enum Command {
         #[arg(long)]
         proxy: Option<String>,
     },
-    /// Internal: jailed child entry (self-re-exec target). Hidden.
-    #[command(name = "__jail", hide = true)]
-    Jail,
 }
 
 /// Map a terminal [`Status`] to the process exit code, per spec §12.
@@ -486,30 +483,7 @@ fn render_output(
 }
 
 fn main() {
-    // ---- Jailed-child re-exec hook (canonical §6/§7) -----------------------
-    //
-    // The supervisor re-execs this very binary as `draco __jail` to become the
-    // jailed Tier 2 child, inheriting the IPC socket on fd 3. That child arms the
-    // sandbox and then hosts the V8 capture — it must run **before** any tokio
-    // runtime is created, because `draco-runtime::run_capture` (invoked deep
-    // inside the child) builds its OWN current-thread tokio runtime and would
-    // panic if nested inside another. So we detect the hook at the very top of
-    // `main`, before `#[tokio::main]`'s runtime would have started, and hand off
-    // to the child entry, which never returns.
-    //
-    // Only compiled with the `tier2` feature: the lean build has no jail/runtime
-    // linked, so there is nothing for `__jail` to do. (Clap still knows the
-    // hidden `__jail` subcommand in both builds; without tier2 it falls through
-    // to the normal dispatch, which reports it is unavailable.)
-    #[cfg(feature = "tier2")]
-    {
-        if std::env::args().nth(1).as_deref() == Some("__jail") {
-            // Never returns: arms the sandbox, hosts the capture, exits.
-            draco_core::run_jail_child();
-        }
-    }
-
-    // ---- Normal path: build the async runtime and run the ladder ----------
+    // Build the async runtime and run the ladder.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -517,8 +491,7 @@ fn main() {
     runtime.block_on(async_main());
 }
 
-/// The async entry proper — everything that needs the tokio runtime. Split out of
-/// `main` so the `__jail` re-exec check can run before any runtime exists.
+/// The async entry proper — everything that needs the tokio runtime.
 async fn async_main() {
     let cli = Cli::parse();
     match cli.command {
@@ -764,16 +737,6 @@ async fn async_main() {
                 eprintln!("draco mcp: {e}");
                 std::process::exit(1);
             }
-        }
-        Command::Jail => {
-            // Reached only when `tier2` is OFF (the tier2 build handles `__jail`
-            // in `main` before the runtime starts and never gets here), or if
-            // `__jail` is somehow dispatched through clap in a lean build.
-            eprintln!(
-                "draco __jail: unavailable — this binary was built without the `tier2` feature, \
-                 so there is no jailed Tier 2 runtime to enter."
-            );
-            std::process::exit(1);
         }
     }
 }

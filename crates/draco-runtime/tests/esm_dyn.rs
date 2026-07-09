@@ -21,11 +21,11 @@
 //! chunk top-level evaluation.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use draco_runtime::{
-    run_capture_with_resources, run_capture_with_resources_and_loader, CaptureConfig,
-};
+use draco_runtime::{run_capture, CaptureConfig};
+
+mod common;
+use common::{fn_fetcher, map_fetcher};
 
 fn cfg() -> CaptureConfig {
     CaptureConfig {
@@ -108,7 +108,7 @@ fetch("/api/from-lazy-a");"#,
         ),
     ]);
 
-    let report = run_capture_with_resources("https://chaser.test/", html, &cfg(), resources);
+    let report = run_capture("https://chaser.test/", html, &cfg(), map_fetcher(resources));
 
     let got = urls(&report);
     for want in [
@@ -156,7 +156,12 @@ fn interleaved_classic_and_module_dynamic_imports_do_not_abort() {
         ),
     ]);
 
-    let report = run_capture_with_resources("https://interleave.test/", html, &cfg(), resources);
+    let report = run_capture(
+        "https://interleave.test/",
+        html,
+        &cfg(),
+        map_fetcher(resources),
+    );
     let got = urls(&report);
     for want in ["/api/from-x", "/api/from-y", "/api/from-z"] {
         assert!(
@@ -191,7 +196,7 @@ export const x = l;
 fetch("/api/from-chunk");"#,
     )]);
 
-    let report = run_capture_with_resources("https://stake.test/", html, &cfg(), resources);
+    let report = run_capture("https://stake.test/", html, &cfg(), map_fetcher(resources));
     let got = urls(&report);
 
     assert!(
@@ -229,7 +234,7 @@ fn missing_deps_are_fetched_through_script_loader() {
 export function go() { fetch("/api/chunk-ok?l=" + l); }"#,
     )]);
 
-    let loader: Arc<draco_runtime::ScriptLoader> = Arc::new(|url: &str| {
+    let loader = |url: &str| {
         if url == "https://stake.test/app/missing-dep.js" {
             Some(b"export const l = 42; fetch(\"/api/from-missing-dep\");".to_vec())
         } else if url == "https://stake.test/app/lazy-route.js" {
@@ -237,14 +242,14 @@ export function go() { fetch("/api/chunk-ok?l=" + l); }"#,
         } else {
             None
         }
-    });
+    };
 
-    let report = run_capture_with_resources_and_loader(
+    // Old resolution order preserved: prefetch map first, then on-demand loader.
+    let report = run_capture(
         "https://stake.test/",
         html,
         &cfg(),
-        resources,
-        Some(loader),
+        fn_fetcher(move |url| resources.get(url).cloned().or_else(|| loader(url))),
     );
     let got = urls(&report);
     for want in ["/api/chunk-ok?l=42", "/api/from-missing-dep"] {
@@ -270,21 +275,16 @@ fn dynamic_import_of_unprefetched_chunk_uses_script_loader() {
 </script>
 </body></html>"#;
 
-    let loader: Arc<draco_runtime::ScriptLoader> = Arc::new(|url: &str| {
+    let loader = |url: &str| {
         if url == "https://stake.test/app/lazy-route.js" {
             Some(b"fetch(\"/api/from-lazy-route\");".to_vec())
         } else {
             None
         }
-    });
+    };
 
-    let report = run_capture_with_resources_and_loader(
-        "https://stake.test/",
-        html,
-        &cfg(),
-        res(&[]),
-        Some(loader),
-    );
+    // Prefetch map was empty (`res(&[])`), so the closure alone is the fetcher.
+    let report = run_capture("https://stake.test/", html, &cfg(), fn_fetcher(loader));
     let got = urls(&report);
     for want in ["/api/from-lazy-route", "/api/route-loaded"] {
         assert!(

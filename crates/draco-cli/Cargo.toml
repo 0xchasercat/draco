@@ -10,9 +10,9 @@ name = "draco"
 path = "src/main.rs"
 
 [features]
-# DEFAULT ON. Forwards to `draco-core/tier2`, which pulls in the jail + runtime
+# DEFAULT ON. Forwards to `draco-core/tier2`, which pulls in the runtime
 # (deno_core/V8). With `--no-default-features` the CLI builds V8-free: the
-# `__jail` re-exec hook and the Tier 2 branch compile out, and Tier 2 finalizes
+# Tier 2 branch compiles out, and Tier 2 finalizes
 # `Unsupported`. Both configurations MUST build (canonical §4).
 default = ["tier2", "serve"]
 tier2 = ["draco-core/tier2"]
@@ -42,7 +42,7 @@ serve = [
 # on an inherited `workspace = true` dep unless the workspace entry sets it; a
 # direct path dep honours it and keeps this change local to the CLI manifest.)
 # With `--no-default-features` the CLI's `tier2` is off ⇒ draco-core is built
-# without `tier2` ⇒ no draco-jail/draco-runtime ⇒ V8-free.
+# without `tier2` ⇒ no draco-runtime ⇒ V8-free.
 [dependencies]
 draco-core = { path = "../draco-core", default-features = false }
 draco-types = { workspace = true }
