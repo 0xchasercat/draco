@@ -38,6 +38,11 @@ use draco_types::{
 use crate::challenge::detect_challenge;
 use crate::fetcher::{NetFetcher, PageFetcher};
 use crate::tier2::Tier2Capture;
+// `CaptureMode` is only referenced from the tier2-gated capture call sites
+// (`run_tier2_capture` / `try_render_markdown`); gate the import so the lean
+// `--no-default-features` build doesn't flag it as unused.
+#[cfg(feature = "tier2")]
+use crate::tier2::CaptureMode;
 use crate::Config;
 
 // ---------------------------------------------------------------------------
@@ -420,10 +425,17 @@ where
         let thin = draco_static::content::is_thin_content(&scraped.markdown, THIN_CONTENT_CHARS);
         let incomplete = scraped.incomplete;
         let needs_render = thin || incomplete;
+        // The render-then-Markdown escalation fires when the static shell is thin or
+        // a skeleton, OR the caller forced it (`--force-render`) — and Tier 2 is
+        // permitted. `--force-render` is the hidden knob for exercising Render mode
+        // on a page the thin-shell heuristic wouldn't flag.
+        let render = (needs_render || config.force_render) && tier_max >= 2;
         let reason = if incomplete {
             "incomplete render: skeleton/loading shell"
-        } else {
+        } else if thin {
             "thin client-rendered shell"
+        } else {
+            "forced render (--force-render)"
         };
         run.record(
             SourceTier::Static,
@@ -431,7 +443,7 @@ where
             StepOutcome::Matched,
             md_ms,
             Bucket::Parse,
-            Some(if needs_render && tier_max >= 2 {
+            Some(if render {
                 format!(
                     "{} chars ({reason} — escalating to render)",
                     scraped.markdown.len()
@@ -475,7 +487,7 @@ where
         // identical HTML→Markdown transform. Upgrades `run.markdown`/`metadata` in
         // place and records `runtime.render`; leaves them untouched if it can't do
         // better.
-        if needs_render && tier_max >= 2 {
+        if render {
             try_render_markdown(
                 &mut run,
                 url,
@@ -634,7 +646,10 @@ where
     T: Tier2Capture + ?Sized,
 {
     let t_cap = Instant::now();
-    let capture_result = match capture.capture(url, body.as_bytes(), config, opts).await {
+    let capture_result = match capture
+        .capture(url, body.as_bytes(), config, opts, CaptureMode::Observe)
+        .await
+    {
         Ok(c) => c,
         Err(e) => {
             // A capture-boot failure is a hard failure of Tier 2: record it and
@@ -736,10 +751,11 @@ where
 {
     use crate::tier2::{discover_endpoints, rank_and_replay};
 
-    let capture_result = match run_tier2_capture(run, url, body, config, opts, capture).await {
-        Ok(c) => c,
-        Err(term) => return term,
-    };
+    let capture_result =
+        match run_tier2_capture(run, url, body, config, opts, capture).await {
+            Ok(c) => c,
+            Err(term) => return term,
+        };
 
     // The ranked catalog — the discovery product.
     let endpoints = discover_endpoints(&capture_result, url, config.allow_unsafe_replay);
@@ -825,10 +841,11 @@ where
 
     // Prefetch subresources, spawn/reuse the isolate, capture — shared with the
     // discovery path.
-    let capture_result = match run_tier2_capture(run, url, body, config, opts, capture).await {
-        Ok(c) => c,
-        Err(term) => return Some(term),
-    };
+    let capture_result =
+        match run_tier2_capture(run, url, body, config, opts, capture).await {
+            Ok(c) => c,
+            Err(term) => return Some(term),
+        };
 
     // --- Rank + replay the winner -----------------------------------------
     // Mutation-safety (see `ranking::best_replayable`) is applied here at replay
@@ -996,7 +1013,10 @@ async fn try_render_markdown<T>(
     T: Tier2Capture + ?Sized,
 {
     let t_cap = Instant::now();
-    let capture_result = match capture.capture(url, body.as_bytes(), config, opts).await {
+    let capture_result = match capture
+        .capture(url, body.as_bytes(), config, opts, CaptureMode::Render)
+        .await
+    {
         Ok(c) => c,
         Err(e) => {
             // A capture failure is not fatal to the Markdown path: we already
@@ -1405,6 +1425,7 @@ mod tests {
             ]);
             let config = Config {
                 runtime_log: enabled,
+                force_render: false,
                 ..cfg(2)
             };
             let r = run_ladder("https://x.com/p", &config, &fetcher, &statics, &capture).await;
@@ -1441,6 +1462,7 @@ mod tests {
     #[test]
     fn session_opts_projects_config() {
         let cfg = Config {
+            force_render: false,
             proxy: Some("http://p:8080".into()),
             delay_ms: 250,
             timeout_ms: 9_000,
@@ -1491,6 +1513,7 @@ mod tests {
     /// covered by its own tests below.
     fn cfg(tier_max: u8) -> Config {
         Config {
+            force_render: false,
             formats: FormatSet::json_only(),
             tier_max,
             ..Config::default()
@@ -1507,6 +1530,7 @@ mod tests {
         assert_eq!(borrowed.as_ref(), html);
         // excludeTags set → owned, filtered (nav gone, main kept).
         let cfg = Config {
+            force_render: false,
             exclude_tags: vec!["nav".to_string()],
             ..Config::default()
         };
@@ -1822,6 +1846,7 @@ mod tests {
             ),
         ]);
         let config = Config {
+            force_render: false,
             formats: FormatSet {
                 json: true,
                 endpoints: true,
@@ -1852,6 +1877,7 @@ mod tests {
         let statics = MockStatic::miss_no_build_id();
         let capture = MockCapture::empty();
         let config = Config {
+            force_render: false,
             formats: FormatSet {
                 json: true,
                 endpoints: true,
@@ -1889,11 +1915,7 @@ mod tests {
             .find(|t| t.action == "runtime.spawn")
             .unwrap();
         assert_eq!(spawn.outcome, StepOutcome::Failed);
-        assert_eq!(
-            fetcher.replay_calls(),
-            0,
-            "no replay after a capture failure"
-        );
+        assert_eq!(fetcher.replay_calls(), 0, "no replay after a capture failure");
     }
 
     #[tokio::test]
@@ -1977,6 +1999,7 @@ mod tests {
     /// A Markdown-format config.
     fn cfg_markdown() -> Config {
         Config {
+            force_render: false,
             formats: FormatSet::markdown_only(),
             ..Config::default()
         }
@@ -2241,6 +2264,7 @@ mod tests {
 
     fn cfg_both() -> Config {
         Config {
+            force_render: false,
             formats: FormatSet {
                 markdown: true,
                 json: true,

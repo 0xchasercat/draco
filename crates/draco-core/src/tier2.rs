@@ -81,11 +81,32 @@ pub(crate) struct CaptureResult {
     pub logs: Vec<String>,
 }
 
-/// The Tier 2 capture seam: given the page URL + Tier-0 HTML, produce a
-/// [`CaptureResult`] (or a [`DracoError::Jail`]). Behind a trait so the ladder is
-/// drivable offline with a mock that fabricates intercepts, no isolate booted.
-/// There is no resource list to pass: the isolate pulls the code it needs itself,
-/// on demand and concurrently, through its async fetcher.
+/// Which fetch policy the isolate runs the page's own data requests under.
+///
+///   * [`Observe`](CaptureMode::Observe) — `fetch`/XHR are recorded and answered
+///     with a cheap synthetic stub; nothing is fetched live. This is `discover`'s
+///     model (enumerate endpoints, rank + replay ourselves) and the fast path for
+///     SSR/hybrid `scrape`, where the shell already carries content.
+///   * [`Render`](CaptureMode::Render) — the page's *safe* data requests are
+///     fetched live via `draco-net` so a pure-CSR shell's content materializes
+///     before the DOM is serialized. The ladder selects it when static extraction
+///     sees a thin/CSR shell (or `--force-render` forces it).
+///
+/// `#[allow(dead_code)]`: in a `--no-default-features` (V8-free) build the variants
+/// are never constructed (the lean Tier 2 branch never captures), but the type is
+/// still part of the always-compiled [`Tier2Capture`] signature.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureMode {
+    Observe,
+    Render,
+}
+
+/// The Tier 2 capture seam: given the page URL + Tier-0 HTML and a [`CaptureMode`],
+/// produce a [`CaptureResult`] (or a [`DracoError::Jail`]). Behind a trait so the
+/// ladder is drivable offline with a mock that fabricates intercepts, no isolate
+/// booted. There is no resource list to pass: the isolate pulls the code it needs
+/// itself, on demand and concurrently, through its async fetcher.
 #[async_trait]
 pub(crate) trait Tier2Capture: Send + Sync {
     async fn capture(
@@ -94,6 +115,7 @@ pub(crate) trait Tier2Capture: Send + Sync {
         html: &[u8],
         config: &Config,
         opts: &draco_net::SessionOpts,
+        mode: CaptureMode,
     ) -> Result<CaptureResult, DracoError>;
 }
 
@@ -270,6 +292,7 @@ impl Tier2Capture for DisabledCapture {
         _html: &[u8],
         _config: &Config,
         _opts: &draco_net::SessionOpts,
+        _mode: CaptureMode,
     ) -> Result<CaptureResult, DracoError> {
         Err(jail_error(
             JailKind::Spawn,
@@ -366,14 +389,16 @@ mod prod {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use draco_types::{DracoError, JailKind};
+    use draco_types::{DracoError, HttpRequestSpec, InterceptVia, JailKind};
 
     use super::{
-        default_quiesce_ms, effective_capture_window_ms, jail_error, subresource_opts,
-        CaptureResult, Config, Tier2Capture, MAX_INTERCEPTS,
+        base64_encode, default_quiesce_ms, effective_capture_window_ms, jail_error,
+        subresource_opts, CaptureMode, CaptureResult, Config, Tier2Capture, MAX_INTERCEPTS,
     };
     use crate::chunk_cache::ChunkCache;
-    use crate::ranking::Candidate;
+    use crate::ranking::{
+        is_analytics_url, is_read_style_post, is_safe_method, is_streaming_endpoint, Candidate,
+    };
 
     /// In-process async source of script / module / chunk bytes for the isolate:
     /// a pooled `draco-net` fetch (with the job's subresource posture + shared
@@ -412,6 +437,76 @@ mod prod {
                     // a miss rejects exactly that load (the module loader / script
                     // onerror), never poisons the graph. Never cache non-2xx.
                     _ => None,
+                }
+            })
+        }
+    }
+
+    /// In-process async responder for the page's own data requests in **Render
+    /// mode**. Issues the safe ones live through the pooled `draco-net` client
+    /// (with the job's subresource posture + shared cookie jar) and returns the
+    /// real `{status, headers, body}`; declines the rest, returning `None` so the
+    /// runtime falls back to its built-in synthetic stub.
+    ///
+    /// The stub-vs-live line reuses the ranking module's mutation-safety policy so
+    /// it matches replay exactly: never live-execute a streaming endpoint (it would
+    /// hang the capture window), an analytics/tracking beacon (waste + privacy
+    /// leak), or an unsafe state-changing method — but DO run GET/HEAD and
+    /// read-style POST/PUT (GraphQL/JSON-RPC), which is how a CSR SPA fetches its
+    /// layout data. `allow_unsafe` (from `--allow-unsafe-replay`) opens the gate to
+    /// any method.
+    struct NetApiFetcher {
+        opts: draco_net::SessionOpts,
+        allow_unsafe: bool,
+    }
+
+    impl NetApiFetcher {
+        /// Eligibility mirror of `ranking::best_replayable`'s policy: safe to send
+        /// live iff not a stream, not analytics, and (a safe method OR a read-style
+        /// POST/PUT OR `allow_unsafe`).
+        fn may_fetch_live(&self, cand: &Candidate) -> bool {
+            if is_streaming_endpoint(cand) || is_analytics_url(&cand.url) {
+                return false;
+            }
+            self.allow_unsafe || is_safe_method(&cand.method) || is_read_style_post(cand)
+        }
+    }
+
+    impl draco_runtime::ApiFetcher for NetApiFetcher {
+        fn fetch<'a>(
+            &'a self,
+            req: &'a draco_runtime::ApiRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<draco_runtime::ApiResponse>> + 'a>,
+        > {
+            Box::pin(async move {
+                // View the request as a Candidate to reuse the ranking policy verbatim.
+                let cand = Candidate {
+                    method: req.method.clone(),
+                    url: req.url.clone(),
+                    headers: req.headers.clone(),
+                    via: InterceptVia::Fetch,
+                };
+                if !self.may_fetch_live(&cand) {
+                    return None; // → the runtime's built-in synthetic stub
+                }
+                let spec = HttpRequestSpec {
+                    method: req.method.clone(),
+                    url: req.url.clone(),
+                    headers: req.headers.clone(),
+                    body_b64: req.body.as_ref().map(|b| base64_encode(b)),
+                };
+                match draco_net::replay(&spec, &self.opts).await {
+                    // Return the REAL status/headers/body — including a non-2xx such
+                    // as a 403 JSON, so the page's router runs its logged-out path
+                    // instead of throwing on a synthetic 404.
+                    Ok(resp) => Some(draco_runtime::ApiResponse {
+                        status: resp.meta.status,
+                        headers: resp.meta.headers.clone(),
+                        body: resp.body.to_vec(),
+                    }),
+                    // Transport failure → fall back to the stub; hydration proceeds.
+                    Err(_) => None,
                 }
             })
         }
@@ -468,14 +563,33 @@ mod prod {
         html: &[u8],
         config: &Config,
         opts: &draco_net::SessionOpts,
+        mode: CaptureMode,
     ) -> CaptureResult {
-        let fetcher: std::rc::Rc<dyn draco_runtime::ScriptFetcher> =
+        let script_fetcher: std::rc::Rc<dyn draco_runtime::ScriptFetcher> =
             std::rc::Rc::new(NetScriptFetcher {
                 opts: subresource_opts(opts),
                 cache: ChunkCache::shared(),
             });
         let html = String::from_utf8_lossy(html);
-        let report = draco_runtime::run_capture(url, &html, &capture_config(config), fetcher);
+        let cfg = capture_config(config);
+        let report = match mode {
+            // Observe: data requests are stubbed (discover; SSR/hybrid fast path).
+            CaptureMode::Observe => {
+                draco_runtime::run_capture(url, &html, &cfg, script_fetcher)
+            }
+            // Render: the page's safe data requests hit the live network so a
+            // pure-CSR shell's content materializes. API fetches share the same
+            // subresource posture (clamped timeout, dropped delay, shared cookie
+            // jar) as chunk loads.
+            CaptureMode::Render => {
+                let api: std::rc::Rc<dyn draco_runtime::ApiFetcher> =
+                    std::rc::Rc::new(NetApiFetcher {
+                        opts: subresource_opts(opts),
+                        allow_unsafe: config.allow_unsafe_replay,
+                    });
+                draco_runtime::run_capture_render(url, &html, &cfg, script_fetcher, api)
+            }
+        };
         to_capture_result(report)
     }
 
@@ -492,12 +606,13 @@ mod prod {
             html: &[u8],
             config: &Config,
             opts: &draco_net::SessionOpts,
+            mode: CaptureMode,
         ) -> Result<CaptureResult, DracoError> {
             let url = url.to_string();
             let html = html.to_vec();
             let config = config.clone();
             let opts = opts.clone();
-            tokio::task::spawn_blocking(move || capture_blocking(&url, &html, &config, &opts))
+            tokio::task::spawn_blocking(move || capture_blocking(&url, &html, &config, &opts, mode))
                 .await
                 .map_err(|e| {
                     jail_error(
@@ -547,16 +662,16 @@ mod prod {
             html: &[u8],
             config: &Config,
             opts: &draco_net::SessionOpts,
+            mode: CaptureMode,
         ) -> Result<CaptureResult, DracoError> {
             // Cap concurrent isolates. The permit is held for the whole capture and
             // released on drop. The semaphore is never closed, so `acquire_owned`
             // only errors in impossible conditions — treat as a spawn error, don't
             // panic.
-            let _permit =
-                self.permits.clone().acquire_owned().await.map_err(|e| {
-                    jail_error(JailKind::Spawn, format!("pool semaphore closed: {e}"))
-                })?;
-            ProdTier2Capture.capture(url, html, config, opts).await
+            let _permit = self.permits.clone().acquire_owned().await.map_err(|e| {
+                jail_error(JailKind::Spawn, format!("pool semaphore closed: {e}"))
+            })?;
+            ProdTier2Capture.capture(url, html, config, opts, mode).await
         }
     }
 }
@@ -594,6 +709,7 @@ impl Tier2Capture for Tier2Pool {
         _html: &[u8],
         _config: &Config,
         _opts: &draco_net::SessionOpts,
+        _mode: CaptureMode,
     ) -> Result<CaptureResult, DracoError> {
         Err(jail_error(
             JailKind::Spawn,

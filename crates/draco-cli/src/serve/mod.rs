@@ -285,6 +285,7 @@ async fn scrape(
             None => state.defaults.respect_robots,
         },
         runtime_log: req.runtime_log.unwrap_or(state.defaults.runtime_log),
+        force_render: false,
         ..state.defaults.clone()
     };
 
@@ -861,6 +862,7 @@ mod tests {
 
         // Static-only config: the fixture page needs no isolate/jail.
         let defaults = Config {
+            force_render: false,
             tier_max: 0,
             respect_robots: false,
             ..Config::default()

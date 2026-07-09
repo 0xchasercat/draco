@@ -161,6 +161,42 @@ pub trait ScriptFetcher {
     fn fetch<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, Option<Vec<u8>>>;
 }
 
+/// A page-side network request the isolate wants to make (`window.fetch` /
+/// `XMLHttpRequest` / an SSE/WebSocket open), carried in full so the caller can
+/// issue it faithfully.
+#[derive(Debug, Clone)]
+pub struct ApiRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+}
+
+/// The response handed back to the page for an [`ApiRequest`] — the *real* status,
+/// headers, and body when the caller fetched it live, so a framework router runs
+/// its native success/error paths (a genuine 403-JSON renders the logged-out view
+/// instead of throwing on a synthetic 404).
+#[derive(Debug, Clone)]
+pub struct ApiResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// Async, in-process responder for the page's own data requests (`fetch`/XHR).
+///
+/// Distinct from [`ScriptFetcher`] (code loads are `url -> bytes`); a data request
+/// needs full fidelity both ways: method + headers + body in, real status +
+/// headers + body out. `draco-core` implements this over its pooled `draco-net`
+/// client under a stub-vs-live **policy** — a pure-CSR SPA's content only exists
+/// after its data fetches resolve, so `scrape` runs the safe ones live while
+/// `discover` stubs. Returning `None` means "no live response — use the built-in
+/// synthetic stub" (Observe mode, or a request the policy declined). The runtime
+/// records the request for `discover` regardless of what this returns.
+pub trait ApiFetcher {
+    fn fetch<'a>(&'a self, req: &'a ApiRequest) -> LocalBoxFuture<'a, Option<ApiResponse>>;
+}
+
 /// Boot an isolate, evaluate `html`'s scripts under `url`, run the capture window,
 /// and return everything the page tried to fetch plus the hydrated DOM.
 ///
@@ -179,12 +215,39 @@ pub fn run_capture(
     cfg: &CaptureConfig,
     fetcher: Rc<dyn ScriptFetcher>,
 ) -> CaptureReport {
+    run_capture_impl(url, html, cfg, fetcher, None)
+}
+
+/// As [`run_capture`], but in **Render mode**: the page's own data requests
+/// (`fetch`/XHR) are answered by `api_fetcher`, which `draco-core` routes to the
+/// live network (`draco-net`) for the requests its policy deems safe — so a
+/// pure-CSR shell's content actually materializes before the DOM is serialized.
+/// Requests the policy declines fall back to the same synthetic stub
+/// [`run_capture`] always uses.
+pub fn run_capture_render(
+    url: &str,
+    html: &str,
+    cfg: &CaptureConfig,
+    fetcher: Rc<dyn ScriptFetcher>,
+    api_fetcher: Rc<dyn ApiFetcher>,
+) -> CaptureReport {
+    run_capture_impl(url, html, cfg, fetcher, Some(api_fetcher))
+}
+
+fn run_capture_impl(
+    url: &str,
+    html: &str,
+    cfg: &CaptureConfig,
+    fetcher: Rc<dyn ScriptFetcher>,
+    api_fetcher: Option<Rc<dyn ApiFetcher>>,
+) -> CaptureReport {
     ensure_v8_flags();
 
     // Current-thread tokio runtime with the FULL driver set. The isolate's async
-    // ops (`op_raze_load_script`) and module loader `.await` real `draco-net`
-    // fetches, which need the I/O reactor; `enable_all()` also provides the time
-    // driver that backs `op_sleep`. Current-thread because `JsRuntime` is `!Send`.
+    // ops (`op_raze_load_script`, `op_raze_fetch`) and module loader `.await` real
+    // `draco-net` fetches, which need the I/O reactor; `enable_all()` also provides
+    // the time driver that backs `op_sleep`. Current-thread because `JsRuntime` is
+    // `!Send`.
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -202,7 +265,7 @@ pub fn run_capture(
         }
     };
 
-    rt.block_on(async move { run_capture_inner(url, html, cfg, fetcher).await })
+    rt.block_on(async move { run_capture_inner(url, html, cfg, fetcher, api_fetcher).await })
 }
 
 /// Thin legacy entry retained from the stub. Not used by the jail directly (Slice
@@ -231,6 +294,11 @@ struct CaptureState {
     /// awaited by `op_raze_load_script` for dynamic `<script src>` chunks. The
     /// module loader holds its own clone for `import` / `import()`.
     fetcher: Rc<dyn ScriptFetcher>,
+    /// Optional in-process responder for the page's own data requests (fetch/XHR),
+    /// awaited by `op_raze_fetch`. `Some` in Render mode (live data via draco-net
+    /// under a stub-vs-live policy); `None` in Observe mode (built-in synthetic
+    /// stub, the default that `discover` and SSR/hybrid `scrape` use).
+    api_fetcher: Option<Rc<dyn ApiFetcher>>,
     /// Count of script/module loads currently in flight. The capture-window driver
     /// treats a non-zero count as activity so the window cannot quiesce while the
     /// page is still pulling code concurrently — the async analogue of the old
@@ -283,48 +351,101 @@ struct RawRequest {
 // Ops
 // ===================================================================
 
-/// Record an intercepted request and return a synthetic stub-response JSON
-/// string: `{"status":u16,"headers":[[k,v]],"body":"..."}`.
+/// Record an intercepted request, then return the response JSON the page should
+/// see: `{"status":u16,"headers":[[k,v]],"body":"..."}`.
 ///
-/// Returning a value (rather than blocking) is deliberate: the page's fetch
-/// resolves immediately with our stub, so hydration proceeds and more endpoints
-/// surface. Enforces `max_intercepts` by throwing once the cap is exceeded (the
-/// JS side swallows the throw and falls back to an empty `{}` response).
+/// **Async.** Recording (and the `max_intercepts` cap) happens synchronously up
+/// front — so `discover` sees every endpoint regardless of the response — then the
+/// op consults the optional [`ApiFetcher`]. In Render mode a safe request is
+/// fetched live and its REAL status/headers/body are returned (so a framework
+/// router runs its native success/error paths — a genuine 403-JSON renders the
+/// logged-out view instead of throwing on a synthetic 404). With no fetcher, or
+/// when the policy declines a request (Observe mode, unsafe method, streaming,
+/// analytics), it falls back to the synthetic stub so the page's fetch still
+/// resolves and hydration proceeds. A live fetch bumps the in-flight counter so
+/// the capture window stays open while it is outstanding.
+///
+/// NOTE: `async` is inferred from the `async fn` with a bare `#[op2]` (matching
+/// `op_sleep`); state is taken as `Rc<RefCell<OpState>>` and every borrow is
+/// dropped before the `.await`.
 #[deno_core::op2]
 #[string]
-fn op_raze_fetch(
-    state: &mut OpState,
+async fn op_raze_fetch(
+    state: Rc<RefCell<OpState>>,
     #[string] request_json: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     let raw: RawRequest = serde_json::from_str(&request_json)
         .map_err(|e| deno_error::JsErrorBox::generic(format!("op_raze_fetch bad payload: {e}")))?;
 
-    let cap = state.borrow::<Rc<RefCell<CaptureState>>>().clone();
-    let mut cs = cap.borrow_mut();
+    // Record the request + enforce the cap + snapshot what we need, all under a
+    // short borrow that ends before the `.await` (no `Ref` may cross it).
+    let (api_fetcher, inflight, stub_body, api_req) = {
+        let op_state = state.borrow();
+        let cap = op_state.borrow::<Rc<RefCell<CaptureState>>>().clone();
+        let mut cs = cap.borrow_mut();
 
-    if cs.requests.len() as u32 >= cs.max_intercepts {
-        return Err(deno_error::JsErrorBox::generic("max_intercepts exceeded"));
-    }
+        if cs.requests.len() as u32 >= cs.max_intercepts {
+            return Err(deno_error::JsErrorBox::generic("max_intercepts exceeded"));
+        }
 
-    let via = match raw.via.as_str() {
-        "xhr" => InterceptVia::Xhr,
-        _ => InterceptVia::Fetch,
+        let via = match raw.via.as_str() {
+            "xhr" => InterceptVia::Xhr,
+            _ => InterceptVia::Fetch,
+        };
+        let body = raw.body.map(|b| b.into_bytes());
+        cs.requests.push(CapturedRequest {
+            method: raw.method.clone(),
+            url: raw.url.clone(),
+            headers: raw.headers.clone(),
+            body: body.clone(),
+            via,
+        });
+        let api_req = ApiRequest {
+            method: raw.method,
+            url: raw.url,
+            headers: raw.headers,
+            body,
+        };
+        (
+            cs.api_fetcher.clone(),
+            cs.inflight.clone(),
+            cs.stub_body.clone(),
+            api_req,
+        )
     };
-    cs.requests.push(CapturedRequest {
-        method: raw.method,
-        url: raw.url,
-        headers: raw.headers,
-        body: raw.body.map(|b| b.into_bytes()),
-        via,
-    });
 
-    // Build the stub response. We always answer 200 with the configured body and
-    // a JSON content-type so `res.json()` works on the page side.
-    let resp = serde_json::json!({
-        "status": 200,
-        "headers": [["content-type", "application/json"]],
-        "body": cs.stub_body,
-    });
+    // Render mode: try a live response. `None` (Observe mode, or a request the
+    // policy declined) falls through to the synthetic stub below.
+    let live = match api_fetcher {
+        Some(f) => {
+            inflight.set(inflight.get() + 1);
+            let r = f.fetch(&api_req).await;
+            inflight.set(inflight.get().saturating_sub(1));
+            r
+        }
+        None => None,
+    };
+
+    let resp = match live {
+        Some(r) => {
+            // Real response bytes are lossy-decoded to a JS string (API data is
+            // text/JSON). Headers → a JSON array of [k,v] pairs `makeResponse` reads.
+            let headers =
+                serde_json::to_value(&r.headers).unwrap_or_else(|_| serde_json::json!([]));
+            serde_json::json!({
+                "status": r.status,
+                "headers": headers,
+                "body": String::from_utf8_lossy(&r.body).into_owned(),
+            })
+        }
+        // Synthetic stub: always 200 + the configured body + a JSON content-type
+        // so `res.json()` works page-side and hydration keeps moving.
+        None => serde_json::json!({
+            "status": 200,
+            "headers": [["content-type", "application/json"]],
+            "body": stub_body,
+        }),
+    };
     Ok(resp.to_string())
 }
 
@@ -341,7 +462,10 @@ fn op_raze_fetch(
 /// dropped before the `.await` (no `Ref` may be held across it).
 #[deno_core::op2]
 #[string]
-async fn op_raze_load_script(state: Rc<RefCell<OpState>>, #[string] url: String) -> Option<String> {
+async fn op_raze_load_script(
+    state: Rc<RefCell<OpState>>,
+    #[string] url: String,
+) -> Option<String> {
     let (fetcher, inflight) = {
         let op_state = state.borrow();
         let cap = op_state.borrow::<Rc<RefCell<CaptureState>>>().clone();
@@ -571,6 +695,7 @@ async fn run_capture_inner(
     html: &str,
     cfg: &CaptureConfig,
     fetcher: Rc<dyn ScriptFetcher>,
+    api_fetcher: Option<Rc<dyn ApiFetcher>>,
 ) -> CaptureReport {
     let stub_body = normalize_stub_body(&cfg.stub_response_json);
 
@@ -588,6 +713,7 @@ async fn run_capture_inner(
         max_intercepts: cfg.max_intercepts,
         stub_body: stub_body.clone(),
         fetcher: fetcher.clone(),
+        api_fetcher,
         inflight: inflight.clone(),
         rendered_html: None,
         logs: Vec::new(),
@@ -644,7 +770,8 @@ async fn run_capture_inner(
         .filter(|(_, s)| !s.inline)
         .map(|(i, s)| (i, resolve_script_url(url, &s.payload)))
         .collect();
-    let fetched = futures::future::join_all(external.iter().map(|(_, u)| fetcher.fetch(u))).await;
+    let fetched =
+        futures::future::join_all(external.iter().map(|(_, u)| fetcher.fetch(u))).await;
     let mut ext_bytes: HashMap<usize, Vec<u8>> = HashMap::new();
     for ((i, _), bytes) in external.iter().zip(fetched) {
         if let Some(b) = bytes {
@@ -1251,6 +1378,23 @@ mod tests {
         Rc::new(MapFetcher(entries))
     }
 
+    /// Test [`ApiFetcher`] serving a fixed `{ url -> (status, json_body) }` map as
+    /// real responses (Render mode) — the offline stand-in for the net-backed one.
+    struct MapApiFetcher(HashMap<String, (u16, String)>);
+    impl ApiFetcher for MapApiFetcher {
+        fn fetch<'a>(&'a self, req: &'a ApiRequest) -> LocalBoxFuture<'a, Option<ApiResponse>> {
+            let hit = self.0.get(&req.url).map(|(status, body)| ApiResponse {
+                status: *status,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: body.clone().into_bytes(),
+            });
+            Box::pin(async move { hit })
+        }
+    }
+    fn api_fetcher(entries: HashMap<String, (u16, String)>) -> Rc<dyn ApiFetcher> {
+        Rc::new(MapApiFetcher(entries))
+    }
+
     #[test]
     fn normalize_stub_body_defaults_empty_to_object() {
         assert_eq!(normalize_stub_body(""), "{}");
@@ -1649,4 +1793,51 @@ mod tests {
             report.requests.iter().map(|r| &r.url).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn render_mode_feeds_live_data_into_the_dom() {
+        // A pure-CSR page: an inline script fetches data and writes it into the
+        // mounted DOM. In RENDER mode the ApiFetcher answers with real JSON, so the
+        // serialized DOM carries the fetched content. (In Observe mode the fetch is
+        // stubbed with `[]` and the DOM stays empty — that is the thrill.com class
+        // of failure this whole path fixes.)
+        let html = r#"<html><body><div id="app"></div><script>
+            fetch("/api/title")
+                .then(function (r) { return r.json(); })
+                .then(function (d) { document.getElementById("app").textContent = d.title; });
+        </script></body></html>"#;
+        let mut api = HashMap::new();
+        api.insert(
+            "https://csr.example.com/api/title".to_string(),
+            (200u16, r#"{"title":"LIVE DATA"}"#.to_string()),
+        );
+        let report = run_capture_render(
+            "https://csr.example.com/",
+            html,
+            &CaptureConfig {
+                capture_window_ms: 500,
+                quiesce_ms: 20,
+                max_intercepts: 8,
+                stub_response_json: "[]".to_string(),
+            },
+            null_fetcher(),
+            api_fetcher(api),
+        );
+        let dom = report.rendered_html.unwrap_or_default();
+        assert!(
+            dom.contains("LIVE DATA"),
+            "Render mode must feed the live fetch response into the DOM; dom={dom:?}, logs={:?}",
+            report.logs
+        );
+        // The data request was still recorded (discover works in Render mode too).
+        assert!(
+            report
+                .requests
+                .iter()
+                .any(|r| r.url == "https://csr.example.com/api/title"),
+            "the live data request must still be recorded: {:?}",
+            report.requests.iter().map(|r| &r.url).collect::<Vec<_>>()
+        );
+    }
 }
+

@@ -186,10 +186,13 @@
     const base = (w.location && w.location.href) || url;
     try { return ops.op_resolve_url(base, String(u)); } catch (_) { return String(u); }
   }
-  function record(via, method, u, headers, bodyStr) {
+  // Async: op_raze_fetch records the request (always) and, in Render mode, may
+  // fetch it live via draco-net and return the REAL {status,headers,body}. Awaits
+  // that op and parses its JSON; on any failure falls back to the synthetic stub.
+  async function record(via, method, u, headers, bodyStr) {
     const req = { via, method: (method || "GET").toUpperCase(), url: absolutize(u), headers: headers || [], body: bodyStr == null ? null : String(bodyStr) };
     let respJson;
-    try { respJson = ops.op_raze_fetch(JSON.stringify(req)); } catch (_) { respJson = null; }
+    try { respJson = await ops.op_raze_fetch(JSON.stringify(req)); } catch (_) { respJson = null; }
     if (!respJson) return { status: 200, headers: [["content-type", "application/json"]], body: stubBody };
     try { return JSON.parse(respJson); } catch (_) { return { status: 200, headers: [["content-type", "application/json"]], body: stubBody }; }
   }
@@ -230,7 +233,7 @@
       clone() { return makeResponse(stub, finalUrl); },
     };
   }
-  const doFetch = function fetch(input, init) {
+  const doFetch = async function fetch(input, init) {
     init = init || {};
     let u, method = init.method || "GET", headers = headersToPairs(init.headers), body = init.body;
     if (input && typeof input === "object" && "url" in input) {
@@ -239,8 +242,8 @@
       if ((!init.headers || headers.length === 0) && input.headers) headers = headersToPairs(input.headers);
       if (init.body == null && input.body != null) body = input.body;
     } else { u = String(input); }
-    const stub = record("fetch", method, u, headers, bodyToString(body));
-    return Promise.resolve(makeResponse(stub, absolutize(u)));
+    const stub = await record("fetch", method, u, headers, bodyToString(body));
+    return makeResponse(stub, absolutize(u));
   };
   g.fetch = doFetch;
   try { w.fetch = doFetch; } catch (_) {}
@@ -259,8 +262,10 @@
     abort() { this._ab = true; this._emit("abort"); }
     send(body) {
       if (this._ab) return;
-      const stub = record("xhr", this._m, this._u, this._h, body == null ? null : bodyToString(body));
-      queueMicrotask(() => {
+      // record() is async (it may fetch live in Render mode); deliver on resolve.
+      // The arrow callback preserves `this`; delivery is a microtask/turn later,
+      // same observable ordering as the old queueMicrotask path.
+      record("xhr", this._m, this._u, this._h, body == null ? null : bodyToString(body)).then((stub) => {
         if (this._ab) return;
         this.status = (stub && stub.status) || 200; this.statusText = this.status === 200 ? "OK" : "";
         this._rh = (stub && stub.headers) || [];
@@ -296,7 +301,10 @@
       this.onclose = null;
       this._l = Object.create(null);
       try {
-        record("fetch", defaultMethod, u, [["accept", "text/event-stream"]], null);
+        // Fire-and-forget: record the streaming endpoint (discover cares about it).
+        // record() is async now; swallow any rejection since the stream is inert.
+        const p = record("fetch", defaultMethod, u, [["accept", "text/event-stream"]], null);
+        if (p && typeof p.then === "function") p.catch(function () {});
       } catch (_) {}
     };
     Ctor.prototype.addEventListener = function (t, fn) {

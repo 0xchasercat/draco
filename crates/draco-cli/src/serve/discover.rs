@@ -87,6 +87,7 @@ pub(crate) async fn discover_handler(
             None => state.defaults.respect_robots,
         },
         runtime_log: req.runtime_log.unwrap_or(state.defaults.runtime_log),
+        force_render: false,
         ..state.defaults.clone()
     };
 
