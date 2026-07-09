@@ -250,18 +250,24 @@ pub(crate) fn discover_endpoints(
     target_url: &str,
     allow_unsafe: bool,
 ) -> Vec<DiscoveredEndpoint> {
-    use crate::ranking::{is_safe_method, is_streaming_endpoint, score_request, MIN_VIABLE_SCORE};
+    use crate::ranking::{
+        is_read_style_post, is_safe_method, is_streaming_endpoint, score_request, MIN_VIABLE_SCORE,
+    };
 
     let mut out: Vec<DiscoveredEndpoint> = capture
         .candidates
         .iter()
         .map(|c| {
             let score = score_request(c, Some(target_url));
-            // Streaming endpoints (SSE/WebSocket) are reported but never flagged
-            // replayable — replaying an infinite stream hangs until timeout.
+            // Must mirror `best_replayable`'s eligibility EXACTLY, or the catalog's
+            // `replayable` flag contradicts what rank/replay actually does (a
+            // read-style POST like a GraphQL/JSON-RPC query — or thrill's
+            // `POST /tickets` with a JSON content-type — is replayed, so it must be
+            // flagged replayable here too). Streaming endpoints are reported but
+            // never replayable: replaying an infinite stream hangs until timeout.
             let replayable = score >= MIN_VIABLE_SCORE
                 && !is_streaming_endpoint(c)
-                && (is_safe_method(&c.method) || allow_unsafe);
+                && (allow_unsafe || is_safe_method(&c.method) || is_read_style_post(c));
             DiscoveredEndpoint {
                 method: c.method.clone(),
                 url: c.url.clone(),
@@ -574,7 +580,9 @@ mod prod {
         let cfg = capture_config(config);
         let report = match mode {
             // Observe: data requests are stubbed (discover; SSR/hybrid fast path).
-            CaptureMode::Observe => draco_runtime::run_capture(url, &html, &cfg, script_fetcher),
+            CaptureMode::Observe => {
+                draco_runtime::run_capture(url, &html, &cfg, script_fetcher)
+            }
             // Render: the page's safe data requests hit the live network so a
             // pure-CSR shell's content materializes. API fetches share the same
             // subresource posture (clamped timeout, dropped delay, shared cookie
@@ -666,13 +674,10 @@ mod prod {
             // released on drop. The semaphore is never closed, so `acquire_owned`
             // only errors in impossible conditions — treat as a spawn error, don't
             // panic.
-            let _permit =
-                self.permits.clone().acquire_owned().await.map_err(|e| {
-                    jail_error(JailKind::Spawn, format!("pool semaphore closed: {e}"))
-                })?;
-            ProdTier2Capture
-                .capture(url, html, config, opts, mode)
-                .await
+            let _permit = self.permits.clone().acquire_owned().await.map_err(|e| {
+                jail_error(JailKind::Spawn, format!("pool semaphore closed: {e}"))
+            })?;
+            ProdTier2Capture.capture(url, html, config, opts, mode).await
         }
     }
 }
@@ -785,6 +790,26 @@ mod tests {
         assert_eq!(eps[0].method, "GET");
         assert_eq!(eps[0].via, InterceptVia::Fetch);
         assert!(eps[0].headers.iter().any(|(k, _)| k == "accept"));
+    }
+
+    #[test]
+    fn discover_flags_read_style_post_replayable() {
+        // A JSON-content-type POST (a GraphQL/JSON-RPC read, or thrill.com's
+        // `POST /api/websocket-manager/v1/tickets`) IS replayed by rank_and_replay,
+        // so the discovery catalog's `replayable` flag must agree — the two must
+        // never contradict (the pre-fix catalog flagged it false yet replay ran it).
+        let capture = capture_of(vec![Candidate {
+            method: "POST".into(),
+            url: "https://api.example.com/graphql".into(),
+            headers: vec![("content-type".into(), "application/json".into())],
+            via: InterceptVia::Fetch,
+        }]);
+        let eps = discover_endpoints(&capture, "https://api.example.com/", false);
+        assert_eq!(eps.len(), 1);
+        assert!(
+            eps[0].replayable,
+            "a read-style JSON POST must be flagged replayable (mirror best_replayable): {eps:?}"
+        );
     }
 
     #[test]
