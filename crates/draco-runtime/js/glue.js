@@ -162,6 +162,103 @@
     try { w.PerformanceObserver = g.PerformanceObserver; } catch (_) {}
   }
 
+  // Web Animations API shim (Element.animate / getAnimations). happy-dom ships
+  // neither, and Svelte 5's transition runtime calls `element.animate(...)`
+  // inside its effect flush — the TypeError aborts the component tree MID-MOUNT,
+  // so everything transition-wrapped (typically the page's main content) never
+  // renders while transition-free regions (footers) do. The shim is inert and
+  // COMPLETION-BIASED: we don't render pixels, so every animation reports
+  // "finished" almost immediately and hydration proceeds at full speed.
+  //
+  // Timing contract: finish is scheduled ~20ms out (one rAF tick — our rAF is
+  // setTimeout(16) — plus slack), so handlers attached right after `animate()`
+  // returns AND handlers attached inside a first rAF both land before finish.
+  // `onfinish` is an accessor: assigned AFTER finish already fired → invoked
+  // async immediately, so late subscribers cannot hang a transition. `finished`
+  // is a promise resolving with the animation. cancel()/finish() settle early;
+  // cancel resolves `finished` too (spec rejects, but an inert shim must never
+  // hang a transition chain or spray unhandled rejections into the logs).
+  (function installWebAnimations() {
+    const ElementCtor = g.Element || (w && w.Element);
+    if (!ElementCtor || !ElementCtor.prototype) return;
+    if (typeof ElementCtor.prototype.animate === "function") return; // real impl wins
+    function makeAnimation(effectTarget) {
+      const a = {
+        effect: { target: effectTarget },
+        playState: "running",
+        currentTime: 0,
+        startTime: 0,
+        playbackRate: 1,
+        pending: false,
+        _onfinish: null,
+        _oncancel: null,
+        _listeners: Object.create(null),
+        _finished: false,
+        _resolveFinished: null,
+      };
+      a.finished = new Promise((resolve) => { a._resolveFinished = resolve; });
+      const fire = (type) => {
+        const ev = { type, target: a, currentTarget: a, timelineTime: 0 };
+        const h = type === "finish" ? a._onfinish : type === "cancel" ? a._oncancel : null;
+        if (typeof h === "function") { try { h.call(a, ev); } catch (_) {} }
+        const ls = a._listeners[type];
+        if (ls) for (const fn of ls.slice()) { try { fn.call(a, ev); } catch (_) {} }
+      };
+      const settle = (state) => {
+        if (a._finished) return;
+        a._finished = true;
+        a.playState = state;
+        try { a._resolveFinished(a); } catch (_) {}
+        fire(state === "finished" ? "finish" : "cancel");
+        // A cancel still settles `finished` so awaiting code never hangs.
+        if (state !== "finished") { /* resolved above */ }
+      };
+      Object.defineProperty(a, "onfinish", {
+        configurable: true,
+        get() { return a._onfinish; },
+        set(fn) {
+          a._onfinish = fn;
+          // Late subscription after finish: invoke async so the caller's
+          // transition chain still completes.
+          if (a._finished && a.playState === "finished" && typeof fn === "function") {
+            setTimeout(() => { try { fn.call(a, { type: "finish", target: a }); } catch (_) {} }, 0);
+          }
+        },
+      });
+      Object.defineProperty(a, "oncancel", {
+        configurable: true,
+        get() { return a._oncancel; },
+        set(fn) { a._oncancel = fn; },
+      });
+      a.addEventListener = function (t, fn) { if (typeof fn === "function") (a._listeners[t] || (a._listeners[t] = [])).push(fn); };
+      a.removeEventListener = function (t, fn) { const ls = a._listeners[t]; if (!ls) return; const i = ls.indexOf(fn); if (i >= 0) ls.splice(i, 1); };
+      a.play = function () { if (!a._finished) a.playState = "running"; };
+      a.pause = function () { if (!a._finished) a.playState = "paused"; };
+      a.reverse = function () {};
+      a.updatePlaybackRate = function () {};
+      a.commitStyles = function () {};
+      a.persist = function () {};
+      a.finish = function () { settle("finished"); };
+      a.cancel = function () { settle("idle"); };
+      // Auto-finish shortly after creation (see timing contract above).
+      setTimeout(() => settle("finished"), 20);
+      return a;
+    }
+    ElementCtor.prototype.animate = function () { return makeAnimation(this); };
+    if (typeof ElementCtor.prototype.getAnimations !== "function") {
+      ElementCtor.prototype.getAnimations = function () { return []; };
+    }
+    const DocCtor = g.Document || (w && w.Document);
+    if (DocCtor && DocCtor.prototype && typeof DocCtor.prototype.getAnimations !== "function") {
+      try { DocCtor.prototype.getAnimations = function () { return []; }; } catch (_) {}
+    }
+    if (typeof g.Animation === "undefined") {
+      // Bare-constructor form (`new Animation(effect)`) some motion libs probe.
+      g.Animation = function Animation() { return makeAnimation(null); };
+      try { w.Animation = g.Animation; } catch (_) {}
+    }
+  })();
+
   // 3. fetch / XHR interceptor → op_raze_fetch. Reuse happy-dom's Headers when
   //    present; otherwise a tiny shim below.
   function headersToPairs(h) {

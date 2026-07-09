@@ -320,9 +320,12 @@ const MAX_RUNTIME_LOGS: usize = 32;
 const MAX_LOG_CHARS: usize = 1_024;
 
 impl CaptureState {
-    /// Append one diagnostic line, enforcing the count cap and truncating overlong
-    /// lines on a char boundary. Silently drops lines past the cap — the first
-    /// failures are the diagnostic signal; a flood repeats them.
+    /// Append one diagnostic line, enforcing the count cap, truncating overlong
+    /// lines on a char boundary, and **deduplicating exact repeats**. A framework
+    /// warning emitted once per component (e.g. a CSS-variable warn ×25) would
+    /// otherwise exhaust the line budget and evict the one error that explains the
+    /// failure; each distinct line carries all the diagnostic signal its repeats
+    /// would. Silently drops lines past the cap.
     fn push_log(&mut self, line: &str) {
         if self.logs.len() >= MAX_RUNTIME_LOGS {
             return;
@@ -330,6 +333,10 @@ impl CaptureState {
         let mut s: String = line.chars().take(MAX_LOG_CHARS).collect();
         if s.len() < line.len() {
             s.push('…');
+        }
+        // Bounded scan (≤ MAX_RUNTIME_LOGS entries): an exact repeat adds nothing.
+        if self.logs.iter().any(|l| *l == s) {
+            return;
         }
         self.logs.push(s);
     }
@@ -462,7 +469,10 @@ async fn op_raze_fetch(
 /// dropped before the `.await` (no `Ref` may be held across it).
 #[deno_core::op2]
 #[string]
-async fn op_raze_load_script(state: Rc<RefCell<OpState>>, #[string] url: String) -> Option<String> {
+async fn op_raze_load_script(
+    state: Rc<RefCell<OpState>>,
+    #[string] url: String,
+) -> Option<String> {
     let (fetcher, inflight) = {
         let op_state = state.borrow();
         let cap = op_state.borrow::<Rc<RefCell<CaptureState>>>().clone();
@@ -767,7 +777,8 @@ async fn run_capture_inner(
         .filter(|(_, s)| !s.inline)
         .map(|(i, s)| (i, resolve_script_url(url, &s.payload)))
         .collect();
-    let fetched = futures::future::join_all(external.iter().map(|(_, u)| fetcher.fetch(u))).await;
+    let fetched =
+        futures::future::join_all(external.iter().map(|(_, u)| fetcher.fetch(u))).await;
     let mut ext_bytes: HashMap<usize, Vec<u8>> = HashMap::new();
     for ((i, _), bytes) in external.iter().zip(fetched) {
         if let Some(b) = bytes {
@@ -1835,4 +1846,71 @@ mod tests {
             report.requests.iter().map(|r| &r.url).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn web_animations_shim_lets_transition_code_complete() {
+        // Svelte 5 transitions call element.animate() inside the effect flush and
+        // continue only when the animation finishes; the pre-shim TypeError
+        // aborted the mount mid-tree (thrill.com rendered only its footer). The
+        // shim must (a) exist, (b) fire onfinish (completion-biased), and
+        // (c) answer getAnimations() — proven by fetches gated on each.
+        let html = r#"<html><body><div id="app"></div><script>
+            var el = document.getElementById("app");
+            if (typeof el.getAnimations === "function" && el.getAnimations().length === 0) {
+                fetch("/api/get-animations-ok");
+            }
+            var a = el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 200 });
+            a.onfinish = function () { fetch("/api/after-animate"); };
+        </script></body></html>"#;
+        let report = run_capture(
+            "https://anim.example.com/",
+            html,
+            &CaptureConfig {
+                capture_window_ms: 800,
+                quiesce_ms: 100,
+                max_intercepts: 8,
+                stub_response_json: "{}".to_string(),
+            },
+            null_fetcher(),
+        );
+        let urls: Vec<&str> = report.requests.iter().map(|r| r.url.as_str()).collect();
+        assert!(
+            urls.contains(&"https://anim.example.com/api/get-animations-ok"),
+            "getAnimations() must exist and return []: {urls:?}, logs={:?}",
+            report.logs
+        );
+        assert!(
+            urls.contains(&"https://anim.example.com/api/after-animate"),
+            "animate().onfinish must fire (completion-biased shim): {urls:?}, logs={:?}",
+            report.logs
+        );
+    }
+
+    #[test]
+    fn push_log_dedupes_exact_repeats() {
+        // A framework warn repeated per-component must not exhaust the log budget
+        // and evict the one distinct error that explains a failure.
+        let mut cs = CaptureState {
+            requests: Vec::new(),
+            max_intercepts: 8,
+            stub_body: "{}".to_string(),
+            fetcher: null_fetcher(),
+            api_fetcher: None,
+            inflight: Rc::new(Cell::new(0)),
+            rendered_html: None,
+            logs: Vec::new(),
+        };
+        for _ in 0..50 {
+            cs.push_log("[console.warn] No --breakpoint-sm value found in CSS variables");
+        }
+        cs.push_log("[exception] TypeError: e.animate is not a function");
+        assert_eq!(
+            cs.logs.len(),
+            2,
+            "repeats deduped, distinct line retained: {:?}",
+            cs.logs
+        );
+        assert!(cs.logs[1].contains("animate"), "{:?}", cs.logs);
+    }
 }
+
