@@ -316,7 +316,7 @@ struct CaptureState {
 /// Hard bounds on collected diagnostic log lines, so a pathological page (e.g. a
 /// `console.error` in a render loop) cannot balloon the report or the IPC frames
 /// that carry it.
-const MAX_RUNTIME_LOGS: usize = 32;
+const MAX_RUNTIME_LOGS: usize = 96;
 const MAX_LOG_CHARS: usize = 1_024;
 
 impl CaptureState {
@@ -423,6 +423,7 @@ async fn op_raze_fetch(
 
     // Render mode: try a live response. `None` (Observe mode, or a request the
     // policy declined) falls through to the synthetic stub below.
+    let render_mode = api_fetcher.is_some();
     let live = match api_fetcher {
         Some(f) => {
             inflight.set(inflight.get() + 1);
@@ -432,6 +433,27 @@ async fn op_raze_fetch(
         }
         None => None,
     };
+
+    // Observability (surfaced under `--runtime-log`): record what the broker did
+    // with THIS request — the one signal that says whether a data-driven page's
+    // fetch actually fired and what came back. `live` = a real draco-net response
+    // (Render mode, request allowed by policy); `stub(declined/failed)` = Render
+    // mode but the policy withheld it or the live fetch failed; `stub(observe)` =
+    // Observe mode's built-in synthetic stub. Logged in a short borrow that opens
+    // and closes after every `.await` above.
+    let (log_status, log_len, log_kind) = match &live {
+        Some(r) => (r.status, r.body.len(), "live"),
+        None if render_mode => (200u16, stub_body.len(), "stub(declined/failed)"),
+        None => (200u16, stub_body.len(), "stub(observe)"),
+    };
+    {
+        let op_state = state.borrow();
+        let cap = op_state.borrow::<Rc<RefCell<CaptureState>>>().clone();
+        cap.borrow_mut().push_log(&format!(
+            "[raze.fetch] {} {} → {log_status} ({log_len}b, {log_kind})",
+            api_req.method, api_req.url
+        ));
+    }
 
     let resp = match live {
         Some(r) => {
@@ -482,6 +504,14 @@ async fn op_raze_load_script(
     inflight.set(inflight.get() + 1);
     let bytes = fetcher.fetch(&url).await;
     inflight.set(inflight.get().saturating_sub(1));
+    // A dynamic `<script src>` chunk that couldn't be fetched fires the page-side
+    // `onerror` — but from the outside that looks like a silent stall. Surface the
+    // miss so `--runtime-log` shows a failed chunk that would break hydration.
+    if bytes.is_none() {
+        let op_state = state.borrow();
+        let cap = op_state.borrow::<Rc<RefCell<CaptureState>>>().clone();
+        cap.borrow_mut().push_log(&format!("[raze.chunk] MISS {url}"));
+    }
     bytes.map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
@@ -619,6 +649,8 @@ struct MapModuleLoader {
     fetcher: Rc<dyn ScriptFetcher>,
     /// Shared in-flight-load counter (see [`CaptureState::inflight`]).
     inflight: Rc<Cell<u32>>,
+    /// Capture state, for surfacing module-load misses as diagnostics.
+    cap: Rc<RefCell<CaptureState>>,
 }
 
 impl ModuleLoader for MapModuleLoader {
@@ -640,6 +672,7 @@ impl ModuleLoader for MapModuleLoader {
         let modules = self.modules.clone();
         let fetcher = self.fetcher.clone();
         let inflight = self.inflight.clone();
+        let cap = self.cap.clone();
         let spec = module_specifier.clone();
 
         ModuleLoadResponse::Async(
@@ -663,7 +696,11 @@ impl ModuleLoader for MapModuleLoader {
                 }
 
                 // 3. Genuinely unavailable: reject THIS import honestly instead of
-                //    poisoning the graph with a silent empty module.
+                //    poisoning the graph with a silent empty module. Surface the
+                //    miss — a route/entry chunk that fails to load stalls hydration
+                //    and would otherwise look like an unexplained empty render.
+                cap.borrow_mut()
+                    .push_log(&format!("[raze.module] MISS {key}"));
                 Err(JsErrorBox::generic(format!(
                     "draco: failed to load module (no on-demand fetch could \
                      retrieve it): {key}"
@@ -734,6 +771,7 @@ async fn run_capture_inner(
             modules: modules.clone(),
             fetcher: fetcher.clone(),
             inflight: inflight.clone(),
+            cap: cap.clone(),
         })),
         ..Default::default()
     });
@@ -962,6 +1000,12 @@ async fn drive_capture_window(
     // chunks concurrently, the window must not quiesce (the async analogue of the
     // old blocking loader keeping the single thread busy).
     let inflight = cap.borrow().inflight.clone();
+    // Why the window ended (surfaced as a `[raze.window]` diagnostic): "drained"
+    // (event loop empty — no pending ops/timers/promises), "quiesce" (no new
+    // activity for quiesce_ms), "hard-cap" (hit capture_window_ms), or
+    // "loop-error". Distinguishes a timing stall (window closed before a late
+    // async fetch fired) from a genuine run to the cap.
+    let mut close_reason: &'static str = "quiesce";
 
     loop {
         // Poll one tick of the event loop with a self-contained waker.
@@ -971,6 +1015,7 @@ async fn drive_capture_window(
             Poll::Ready(Ok(())) => {
                 // Event loop fully drained: no pending ops/timers/promises.
                 // This is a clean, natural quiesce.
+                close_reason = "drained";
                 break;
             }
             Poll::Ready(Err(e)) => {
@@ -979,6 +1024,7 @@ async fn drive_capture_window(
                 eprintln!("draco-runtime: {line}");
                 cap.borrow_mut().push_log(&line);
                 loop_threw = true;
+                close_reason = "loop-error";
                 break;
             }
             Poll::Pending => {
@@ -1003,7 +1049,8 @@ async fn drive_capture_window(
 
         // Hard cap first.
         if start.elapsed() >= hard_cap {
-            return classify_window_close(cap, threw_in_page, loop_threw, /*hard_cap=*/ true);
+            close_reason = "hard-cap";
+            break;
         }
 
         // Quiesce: only start counting the streak once *something* has been
@@ -1014,13 +1061,29 @@ async fn drive_capture_window(
         // new intercepts — otherwise a `setInterval` would pin the window open
         // to the hard cap.
         if last_activity.elapsed() >= quiesce {
+            close_reason = "quiesce";
             break;
         }
 
         tokio::time::sleep(tick).await;
     }
 
-    classify_window_close(cap, threw_in_page, loop_threw, /*hard_cap=*/ false)
+    // Summarize the window close (surfaced under `--runtime-log`): the reason, the
+    // wall-clock spent, how many fetch/XHR requests were captured, and whether any
+    // script/module load was still outstanding when we stopped. A "drained"/
+    // "quiesce" close with 0 requests and a late-firing page is the fingerprint of
+    // an event-loop stall before the data fetch dispatched.
+    let elapsed_ms = start.elapsed().as_millis();
+    {
+        let n = cap.borrow().requests.len();
+        let infl = inflight.get();
+        cap.borrow_mut().push_log(&format!(
+            "[raze.window] closed via {close_reason} after {elapsed_ms}ms; \
+             {n} request(s) captured, {infl} load(s) inflight"
+        ));
+    }
+
+    classify_window_close(cap, threw_in_page, loop_threw, close_reason == "hard-cap")
 }
 
 /// Poll the deno_core event loop exactly once using a no-op-ish waker. We drive
