@@ -632,7 +632,11 @@ async fn do_exec(
 
     let (logs, result) = {
         let mut cs = cap.borrow_mut();
-        let logs = cs.logs.get(log_start..).map(|s| s.to_vec()).unwrap_or_default();
+        let logs = cs
+            .logs
+            .get(log_start..)
+            .map(|s| s.to_vec())
+            .unwrap_or_default();
         let result = cs.exec_result.take().map(|s| {
             serde_json::from_str::<serde_json::Value>(&s)
                 .unwrap_or_else(|_| serde_json::Value::String(s.clone()))

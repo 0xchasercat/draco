@@ -174,7 +174,11 @@ async fn exec_returns_serialized_value() {
         .await
         .expect("exec delivered");
     assert!(rep.ok, "should not throw: {:?}", rep.error);
-    assert_eq!(rep.result, Some(serde_json::json!(3)), "return value captured");
+    assert_eq!(
+        rep.result,
+        Some(serde_json::json!(3)),
+        "return value captured"
+    );
 
     // A DOM node returned is *described*, never dropped.
     let rep = session
@@ -251,11 +255,7 @@ async fn navigate_swaps_the_loaded_page() {
         .expect("session opens");
 
     // Page one is loaded.
-    let before = session
-        .serialize()
-        .await
-        .expect("serialize")
-        .expect("html");
+    let before = session.serialize().await.expect("serialize").expect("html");
     assert!(before.contains("Interact Smoke"), "page one loaded");
 
     // Navigate to page two.
@@ -267,12 +267,11 @@ async fn navigate_swaps_the_loaded_page() {
     assert_eq!(nav.url.as_deref(), Some("https://example.test/page2"));
 
     // Page two is now loaded; page one is gone.
-    let after = session
-        .serialize()
-        .await
-        .expect("serialize")
-        .expect("html");
-    assert!(after.contains("page-two-content"), "page two rendered: {after:.160}");
+    let after = session.serialize().await.expect("serialize").expect("html");
+    assert!(
+        after.contains("page-two-content"),
+        "page two rendered: {after:.160}"
+    );
     assert!(
         !after.contains("Interact Smoke"),
         "the previous page was torn down"
@@ -298,7 +297,10 @@ async fn navigate_without_page_fetcher_reports_unavailable() {
 
     // Session still works afterward.
     let html = session.serialize().await.expect("serialize").expect("html");
-    assert!(html.contains("Interact Smoke"), "original page still loaded");
+    assert!(
+        html.contains("Interact Smoke"),
+        "original page still loaded"
+    );
 
     session.close().await.expect("close");
 }
