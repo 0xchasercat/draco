@@ -55,6 +55,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use deno_core::{JsRuntime, RuntimeOptions};
+use futures::future::LocalBoxFuture;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
@@ -63,15 +64,39 @@ use crate::{
     CaptureState, MapModuleLoader, ScriptFetcher, GLUE_JS, SNAPSHOT,
 };
 
-/// Build the isolate's `!Send` fetchers **on the session thread**.
+/// Fetch a top-level document for an in-session navigation, cookie-aware.
 ///
-/// `Rc<dyn ScriptFetcher>` / `Rc<dyn ApiFetcher>` cannot cross the thread
-/// boundary, so the caller hands over a `Send` closure that constructs them in
-/// place. `draco-core` closes over its pooled client + the session's shared cookie
-/// jar (all `Send`) and returns the `Rc` wrappers. `None` for the [`ApiFetcher`] =
-/// Observe mode (synthetic stubs); `Some` = Render mode (live data).
-pub type FetcherFactory =
-    Box<dyn FnOnce() -> (Rc<dyn ScriptFetcher>, Option<Rc<dyn ApiFetcher>>) + Send + 'static>;
+/// Distinct from [`ScriptFetcher`] (code loads) and [`ApiFetcher`] (the page's own
+/// data requests): this fetches the *next page's* HTML when the session navigates,
+/// through `draco-net` **with the session's shared cookie jar**, so a `Set-Cookie`
+/// (login, CSRF, session id) from one page rides to the next — the browser-tab
+/// behaviour that makes multi-page interact flows work. Returns the final URL after
+/// redirects plus the HTML, or `None` if the fetch failed. `draco-core` implements
+/// it; `None` on the session (no page fetcher supplied) disables navigation.
+pub trait PageFetcher {
+    fn fetch_page<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, Option<(String, String)>>;
+}
+
+/// The `!Send` fetcher set a session runs on, built **on the session thread**.
+///
+/// `Rc<dyn …>` fetchers cannot cross the thread boundary, so the caller hands over
+/// a `Send` [`FetcherFactory`] closure that constructs them in place. `draco-core`
+/// closes over its pooled client + the session's shared cookie jar (all `Send`) and
+/// returns the `Rc` wrappers. Built once at open and reused for every navigation
+/// re-hydrate, so the cookie jar (captured inside them) persists for the session.
+pub struct SessionFetchers {
+    /// Script/module/chunk byte source (always present).
+    pub scripts: Rc<dyn ScriptFetcher>,
+    /// The page's own data requests: `Some` = Render mode (live), `None` = Observe
+    /// (synthetic stubs).
+    pub api: Option<Rc<dyn ApiFetcher>>,
+    /// Top-level document fetch for navigation: `Some` enables `navigate`, `None`
+    /// disables it (e.g. a single-page interact with no navigation).
+    pub page: Option<Rc<dyn PageFetcher>>,
+}
+
+/// A `Send` closure that builds the [`SessionFetchers`] on the session thread.
+pub type FetcherFactory = Box<dyn FnOnce() -> SessionFetchers + Send + 'static>;
 
 /// Inputs to open a session. All fields are `Send` (the `!Send` fetchers arrive via
 /// the [`FetcherFactory`], not here).
@@ -85,9 +110,7 @@ pub struct SessionConfig {
     pub capture: CaptureConfig,
 }
 
-/// What a turn produced. Slice 3 adds `result: serde_json::Value` (the serialized
-/// completion value, honoring `full`/`maxBytes`); slice 4 adds
-/// `navigated: Option<(String, String)>`.
+/// What a turn produced. Slice 4 adds `navigated: Option<(String, String)>`.
 #[derive(Debug, Clone, Default)]
 pub struct ExecReport {
     /// `false` if the script threw at evaluation time (the throw text is in
@@ -95,10 +118,41 @@ pub struct ExecReport {
     pub ok: bool,
     /// Evaluation-time throw, if any.
     pub error: Option<String>,
+    /// The turn's completion value — whatever the JS `return`ed — serialized to
+    /// JSON under the size budget (see [`ExecOptions`]). `None` when the turn
+    /// returned `undefined`/nothing (or threw). DOM nodes/functions/cycles are
+    /// *described* rather than dropped; an over-budget value becomes a
+    /// `{ "__truncated": true, "bytes", "maxBytes", "preview" }` descriptor unless
+    /// `full` was set. This is the devtools-console return value.
+    pub result: Option<serde_json::Value>,
     /// Page-side diagnostic/console lines emitted *during this turn* (the delta of
     /// [`CaptureState::logs`] over the turn) — the "console output" half of the
     /// devtools console.
     pub logs: Vec<String>,
+}
+
+/// Per-turn `exec` knobs.
+#[derive(Debug, Clone)]
+pub struct ExecOptions {
+    /// After the JS eval + microtask drain, pump the event loop to quiesce so DOM
+    /// updates from triggered fetches land before the caller reads back. Default
+    /// `true`; `false` returns right after the microtask drain.
+    pub settle: bool,
+    /// Return the completion value untruncated regardless of `max_bytes`.
+    pub full: bool,
+    /// Approximate size budget (JS string length) for the serialized result; over
+    /// budget yields a truncation descriptor unless `full`. Default 256 KiB.
+    pub max_bytes: usize,
+}
+
+impl Default for ExecOptions {
+    fn default() -> Self {
+        Self {
+            settle: true,
+            full: false,
+            max_bytes: 262_144,
+        }
+    }
 }
 
 /// Why a session call failed at the plumbing level (distinct from a page-JS throw,
@@ -125,19 +179,35 @@ impl std::error::Error for SessionError {}
 
 /// One instruction for the session thread. Each carries its own reply channel.
 enum Command {
-    /// Evaluate `js` in page global scope; if `settle`, pump to quiesce afterwards
-    /// so DOM updates from triggered fetches land before the caller reads back.
+    /// Evaluate `js` in page global scope under `opts` (settle + result budget).
     Exec {
         js: String,
-        settle: bool,
+        opts: ExecOptions,
         reply: oneshot::Sender<ExecReport>,
     },
     /// Serialize the live hydrated DOM (`document.documentElement.outerHTML`).
     Serialize {
         reply: oneshot::Sender<Option<String>>,
     },
+    /// Navigate to `url`: fetch the next document (cookie-aware), tear down the
+    /// current isolate, and re-hydrate in place.
+    Navigate {
+        url: String,
+        reply: oneshot::Sender<NavReport>,
+    },
     /// Tear the isolate down and end the thread.
     Close { reply: oneshot::Sender<()> },
+}
+
+/// Outcome of a [`Session::navigate`].
+#[derive(Debug, Clone, Default)]
+pub struct NavReport {
+    /// `true` if the new document was fetched and re-hydrated.
+    pub ok: bool,
+    /// The final URL after redirects (present on success).
+    pub url: Option<String>,
+    /// Why navigation failed (no page fetcher, fetch failed, or re-hydrate threw).
+    pub error: Option<String>,
 }
 
 /// A live interact session: a `Send` handle to the isolate running on its own
@@ -198,13 +268,13 @@ impl Session {
         }
     }
 
-    /// Run `js` in page global scope. `settle = true` pumps the event loop to
-    /// quiesce after the microtask drain (the default the daemon uses); `false`
-    /// returns right after the drain. Returns the console lines produced this turn.
-    pub async fn exec(&self, js: String, settle: bool) -> Result<ExecReport, SessionError> {
+    /// Run `js` in page global scope (as an async body, so it may `await` and
+    /// `return` a value). Returns the completion value (serialized under
+    /// `opts`), the console lines produced this turn, and any evaluation throw.
+    pub async fn exec(&self, js: String, opts: ExecOptions) -> Result<ExecReport, SessionError> {
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
-            .send(Command::Exec { js, settle, reply })
+            .send(Command::Exec { js, opts, reply })
             .map_err(|_| SessionError::Closed)?;
         rx.await.map_err(|_| SessionError::Closed)
     }
@@ -215,6 +285,20 @@ impl Session {
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::Serialize { reply })
+            .map_err(|_| SessionError::Closed)?;
+        rx.await.map_err(|_| SessionError::Closed)
+    }
+
+    /// Navigate the session to `url`: fetch the next document through the session's
+    /// cookie-aware page fetcher, tear down the current isolate, and re-hydrate the
+    /// new page in the same session (so cookies set so far ride along). Returns a
+    /// [`NavReport`]; `ok = false` if no page fetcher was supplied, the fetch
+    /// failed, or the new page failed to boot. The session stays usable either way
+    /// (on failure the previous page remains loaded).
+    pub async fn navigate(&self, url: String) -> Result<NavReport, SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::Navigate { url, reply })
             .map_err(|_| SessionError::Closed)?;
         rx.await.map_err(|_| SessionError::Closed)
     }
@@ -249,11 +333,16 @@ impl Drop for Session {
 /// The session thread's entry: hydrate once, then service commands until closed.
 async fn actor_main(
     config: SessionConfig,
-    fetchers: FetcherFactory,
+    fetchers_factory: FetcherFactory,
     ready_tx: oneshot::Sender<Result<(), String>>,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
 ) {
-    let (mut runtime, cap, _modules, _inflight) = match hydrate(&config, fetchers).await {
+    // Build the `!Send` fetchers once, on this thread; reuse them for the initial
+    // hydrate and every navigation re-hydrate (so the cookie jar inside them
+    // persists across pages).
+    let fetchers = fetchers_factory();
+
+    let (mut runtime, mut cap) = match hydrate(&config, &fetchers).await {
         Ok(parts) => parts,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
@@ -279,14 +368,62 @@ async fn actor_main(
             maybe_cmd = cmd_rx.recv() => {
                 match maybe_cmd {
                     None => break, // all handles dropped -> tear down
-                    Some(Command::Exec { js, settle, reply }) => {
-                        let report = do_exec(&mut runtime, &cap, &config.capture, &js, settle).await;
+                    Some(Command::Exec { js, opts, reply }) => {
+                        let report = do_exec(&mut runtime, &cap, &config.capture, &js, &opts).await;
                         let _ = reply.send(report);
                     }
                     Some(Command::Serialize { reply }) => {
                         serialize_dom(&mut runtime);
                         let html = cap.borrow().rendered_html.clone();
                         let _ = reply.send(html);
+                    }
+                    Some(Command::Navigate { url, reply }) => {
+                        let report = match &fetchers.page {
+                            None => NavReport {
+                                ok: false,
+                                url: None,
+                                error: Some(
+                                    "navigation unavailable (no page fetcher)".to_string(),
+                                ),
+                            },
+                            Some(page) => match page.fetch_page(&url).await {
+                                None => NavReport {
+                                    ok: false,
+                                    url: None,
+                                    error: Some(format!("failed to fetch {url}")),
+                                },
+                                Some((final_url, html)) => {
+                                    // Re-hydrate a fresh isolate with the new document,
+                                    // reusing the same fetchers (cookies persist). On
+                                    // success the old isolate is dropped (replaced); on
+                                    // failure the current page stays loaded.
+                                    let nav_cfg = SessionConfig {
+                                        url: final_url.clone(),
+                                        html,
+                                        capture: config.capture.clone(),
+                                    };
+                                    match hydrate(&nav_cfg, &fetchers).await {
+                                        Ok((new_rt, new_cap)) => {
+                                            runtime = new_rt;
+                                            cap = new_cap;
+                                            pump_to_quiesce(&mut runtime, &cap, &config.capture)
+                                                .await;
+                                            NavReport {
+                                                ok: true,
+                                                url: Some(final_url),
+                                                error: None,
+                                            }
+                                        }
+                                        Err(e) => NavReport {
+                                            ok: false,
+                                            url: None,
+                                            error: Some(format!("re-hydrate failed: {e}")),
+                                        },
+                                    }
+                                }
+                            },
+                        };
+                        let _ = reply.send(report);
                     }
                     Some(Command::Close { reply }) => {
                         let _ = reply.send(());
@@ -311,20 +448,14 @@ async fn actor_main(
 /// reuses all of its primitives.
 async fn hydrate(
     config: &SessionConfig,
-    fetchers: FetcherFactory,
-) -> Result<
-    (
-        JsRuntime,
-        Rc<RefCell<CaptureState>>,
-        Rc<RefCell<HashMap<String, Vec<u8>>>>,
-        Rc<Cell<u32>>,
-    ),
-    String,
-> {
+    fetchers: &SessionFetchers,
+) -> Result<(JsRuntime, Rc<RefCell<CaptureState>>), String> {
     crate::ensure_v8_flags();
 
-    // Build the `!Send` fetchers ON this thread.
-    let (fetcher, api_fetcher) = fetchers();
+    // The `!Send` fetchers were built on this thread at open and are reused for
+    // every navigation re-hydrate (so their cookie jar persists). Cheap Rc clones.
+    let fetcher = fetchers.scripts.clone();
+    let api_fetcher = fetchers.api.clone();
 
     let stub_body = normalize_stub_body(&config.capture.stub_response_json);
     let modules: Rc<RefCell<HashMap<String, Vec<u8>>>> = Rc::new(RefCell::new(HashMap::new()));
@@ -340,6 +471,7 @@ async fn hydrate(
         content_activity: Rc::new(Cell::new(0)),
         rendered_html: None,
         logs: Vec::new(),
+        exec_result: None,
         started: Instant::now(),
     }));
 
@@ -453,52 +585,141 @@ async fn hydrate(
         "try { globalThis.__dracoFireLifecycle(); } catch (_) {}",
     );
 
-    Ok((runtime, cap, modules, inflight))
+    Ok((runtime, cap))
 }
 
-/// Evaluate one turn's JS in page global scope, then (optionally) settle.
+/// Evaluate one turn's JS in page global scope, capture its completion value, then
+/// (optionally) settle.
 ///
-/// Slice 3 will replace the wrapper with one that captures the completion value
-/// through a new op and returns it as `ExecReport.result` under the `full`/
-/// `maxBytes` budget; for now the turn's observable output is its console lines.
+/// The turn's `js` is the body of an async function, so it may `await` and must
+/// `return` to yield a value (Firecrawl-`executeJavascript` semantics). The
+/// wrapper awaits that body, serializes the value **page-side** under the size
+/// budget (DOM nodes/functions/cycles described, not dropped; over-budget →
+/// truncation descriptor unless `full`), and hands the JSON back through
+/// `op_raze_exec_result`. Everything is in page-reachable scope only — no host
+/// bindings — so an errant turn can throw or loop but never escape the isolate.
 async fn do_exec(
     runtime: &mut JsRuntime,
     cap: &Rc<RefCell<CaptureState>>,
     cfg: &CaptureConfig,
     js: &str,
-    settle: bool,
+    opts: &ExecOptions,
 ) -> ExecReport {
     let log_start = cap.borrow().logs.len();
+    // Clear any stale result so a turn that returns `undefined` reads back `None`.
+    cap.borrow_mut().exec_result = None;
 
-    // Wrap as an async IIFE so a turn can `await` (fetch, dynamic import, timers).
-    // The completion value resolves on the event loop; the settle pump below drives
-    // it. Errors are reported, never fatal to the session.
-    let wrapped = format!("(async () => {{\n{js}\n}})();");
+    // Budget the page-side serializer applies. `full` lifts it effectively to
+    // infinity (a finite JS number larger than any real result length).
+    let budget: f64 = if opts.full {
+        f64::from(u32::MAX)
+    } else {
+        opts.max_bytes as f64
+    };
+    let wrapped = build_exec_wrapper(js, budget);
     let mut error = None;
     if let Err(e) = runtime.execute_script("draco:interact:exec", wrapped) {
         error = Some(e.to_string());
         cap.borrow_mut().push_log(&format!("exec threw: {e}"));
     }
 
-    // Always drain microtasks at least once so a purely-synchronous turn's effects
-    // (and a resolved async IIFE with no pending I/O) are visible immediately.
+    // Always drain microtasks at least once so a purely-synchronous turn's value
+    // (and DOM effects) are captured immediately; settle drives async turns.
     let _ = poll_once(runtime);
-    if settle {
+    if opts.settle {
         pump_to_quiesce(runtime, cap, cfg).await;
     }
 
-    let logs = {
-        let cs = cap.borrow();
-        cs.logs
+    let (logs, result) = {
+        let mut cs = cap.borrow_mut();
+        let logs = cs
+            .logs
             .get(log_start..)
             .map(|s| s.to_vec())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let result = cs.exec_result.take().map(|s| {
+            serde_json::from_str::<serde_json::Value>(&s)
+                .unwrap_or_else(|_| serde_json::Value::String(s.clone()))
+        });
+        (logs, result)
     };
     ExecReport {
         ok: error.is_none(),
         error,
+        result,
         logs,
     }
+}
+
+/// Build the page-side exec wrapper: run the turn as an async body, then serialize
+/// its return value to JSON under `budget` and hand it to `op_raze_exec_result`.
+/// A `undefined` return calls no op (the caller reads back `None`); a throw is
+/// reported through the same channel as an `{ "__error": ... }` value while the
+/// turn's `error`/logs still carry the raw throw.
+fn build_exec_wrapper(js: &str, budget: f64) -> String {
+    // `MAXB` and the user body are the only interpolated parts; everything else is
+    // a fixed, self-contained serializer (no dependency on glue additions).
+    format!(
+        r#"(async () => {{
+  const MAXB = {budget};
+  let __v;
+  try {{
+    __v = await (async () => {{
+{js}
+}})();
+  }} catch (e) {{
+    try {{ Deno.core.ops.op_raze_exec_result(JSON.stringify({{ __error: (e && e.stack) ? String(e.stack) : String(e) }})); }} catch (_e) {{}}
+    return;
+  }}
+  if (__v === undefined) return;
+  const seen = new WeakSet();
+  function desc(x, depth) {{
+    if (x === null) return null;
+    const t = typeof x;
+    if (t === "number" || t === "boolean" || t === "string") return x;
+    if (t === "bigint") return String(x);
+    if (t === "function") return {{ __fn: x.name || "anonymous" }};
+    if (t === "symbol") return String(x);
+    if (t !== "object") return String(x);
+    if (typeof x.nodeType === "number" && (x.nodeType === 1 || x.nodeType === 3 || x.nodeType === 9)) {{
+      const tag = String(x.tagName || x.nodeName || "").toLowerCase();
+      const o = {{ __node: tag }};
+      if (x.id) o.id = x.id;
+      let cls = (x.getAttribute && x.getAttribute("class")) || x.className;
+      if (cls && typeof cls === "string") o.class = cls;
+      const txt = String(x.textContent || "");
+      o.text = txt.length > 120 ? txt.slice(0, 120) : txt;
+      if (x.getAttribute) {{ const h = x.getAttribute("href"); if (h) o.href = h; }}
+      return o;
+    }}
+    if (seen.has(x)) return {{ __cycle: true }};
+    seen.add(x);
+    if (depth > 6) return {{ __truncated: "depth" }};
+    if (Array.isArray(x)) {{
+      const n = Math.min(x.length, 1000);
+      const a = [];
+      for (let i = 0; i < n; i++) a.push(desc(x[i], depth + 1));
+      if (x.length > n) a.push({{ __truncated: "length", total: x.length }});
+      return a;
+    }}
+    const o = {{}};
+    let c = 0;
+    for (const k in x) {{
+      if (!Object.prototype.hasOwnProperty.call(x, k)) continue;
+      if (c++ > 200) {{ o.__truncated = "keys"; break; }}
+      try {{ o[k] = desc(x[k], depth + 1); }} catch (_e) {{ o[k] = {{ __error: true }}; }}
+    }}
+    return o;
+  }}
+  let json;
+  try {{ json = JSON.stringify(desc(__v, 0)); }} catch (e) {{ json = JSON.stringify({{ __error: String(e) }}); }}
+  if (json === undefined) return;
+  if (json.length > MAXB) {{
+    json = JSON.stringify({{ __truncated: true, bytes: json.length, maxBytes: MAXB, preview: json.slice(0, MAXB) }});
+  }}
+  try {{ Deno.core.ops.op_raze_exec_result(json); }} catch (_e) {{}}
+}})();"#
+    )
 }
 
 /// Pump the event loop until it quiesces (no new content activity for `quiesce_ms`
