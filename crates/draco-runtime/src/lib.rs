@@ -80,6 +80,10 @@ use serde::Deserialize;
 
 use draco_types::{InterceptVia, RuntimeOutcome};
 
+/// Interact sessions — a resumable isolate driven turn-by-turn (v0.17.0).
+/// Reuses this module's capture primitives; see `session` for the actor model.
+pub mod session;
+
 // ===================================================================
 // Public API (Slice 4 wires this into the jail child)
 // ===================================================================
