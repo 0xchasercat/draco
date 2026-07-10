@@ -1,0 +1,1445 @@
+//! Firecrawl-compatible metasearch core for `POST /v1/search`.
+//!
+//! This module deliberately contains no axum handler. It owns the reusable
+//! search machinery only: engine request construction, defensive SERP parsing,
+//! concurrent fan-out, URL canonicalization, and reciprocal-rank consensus.
+//! The REST, CLI, and MCP surfaces can all call the same public API.
+//!
+//! Search engines are independent failure domains. A timeout, transport error,
+//! non-2xx response, or parse miss from one engine is recorded in
+//! [`EngineOutcome`] and never prevents useful results from the others. Every
+//! request uses `draco-net`; DuckDuckGo's HTML endpoint is the sole POST engine
+//! and therefore uses `draco_net::replay`, while the GET engines use
+//! `draco_net::fetch_target`.
+//!
+//! SERP parsing intentionally uses a small defensive scanner rather than a DOM
+//! dependency. Engine pages are external, unstable input: missing attributes or
+//! malformed markup skip a hit instead of panicking.
+
+use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+
+use base64::Engine as _;
+use draco_net::{fetch_target, replay, SessionOpts};
+use draco_types::HttpRequestSpec;
+use url::{form_urlencoded, Url};
+
+/// Recommended independent timeout for each built-in engine fetch.
+pub const DEFAULT_PER_ENGINE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// One result returned by an individual engine or the consensus merger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchHit {
+    pub title: String,
+    pub description: String,
+    pub url: String,
+    pub engine: &'static str,
+    /// One-based position in `engine`'s result list.
+    pub rank: usize,
+    /// Every `(engine, rank)` that contributed to this canonical result.
+    /// Parsers populate one entry; [`consensus`] replaces it with the full,
+    /// engine-deduplicated contribution set for Draco diagnostics.
+    pub contributors: Vec<(&'static str, usize)>,
+}
+
+/// Engine-neutral search parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchParams {
+    pub query: String,
+    /// Requested consensus result count. The caller owns the public API clamp
+    /// (Firecrawl default 5, maximum 100).
+    pub limit: usize,
+    /// Firecrawl/Google-style time filter. Reserved for engines that can map it
+    /// without inventing semantics; currently best-effort and not forwarded.
+    pub tbs: Option<String>,
+    /// Best-effort location hint. Engines disagree on its format, so adapters
+    /// may leave it unused rather than silently reinterpret it.
+    pub location: Option<String>,
+}
+
+impl Default for SearchParams {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            limit: 5,
+            tbs: None,
+            location: None,
+        }
+    }
+}
+
+/// HTTP method required by a search engine request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpMethod {
+    Get,
+    Post,
+}
+
+/// A swappable search-engine adapter.
+///
+/// Implementations construct one request and parse one response. Network I/O
+/// stays in [`search_all`] so every adapter gets identical timeout and failure
+/// handling.
+pub trait SearchEngine: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn build_url(&self, params: &SearchParams) -> String;
+
+    fn method(&self) -> HttpMethod {
+        HttpMethod::Get
+    }
+
+    fn body(&self, _params: &SearchParams) -> Option<String> {
+        None
+    }
+
+    /// Parse an engine response. `base_url` is the final response URL when the
+    /// transport supplied one, and is used to absolutize relative result URLs.
+    fn parse(&self, html: &str, base_url: &str) -> Vec<SearchHit>;
+}
+
+/// DuckDuckGo's non-JavaScript HTML endpoint.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DuckDuckGo;
+
+/// Bing's server-rendered web SERP.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Bing;
+
+/// Brave Search's server-rendered web SERP.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Brave;
+
+/// Mojeek's server-rendered web SERP.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Mojeek;
+
+/// Per-engine terminal status for one fan-out operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineStatus {
+    Ok(usize),
+    Timeout,
+    Http(u16),
+    Error(String),
+    Empty,
+}
+
+/// Diagnostic outcome for one engine. Failures are intentionally data, not a
+/// top-level error: callers decide whether an all-engine failure should become
+/// an HTTP error response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineOutcome {
+    pub name: &'static str,
+    pub status: EngineStatus,
+}
+
+/// The four built-in v0.16.0 engines in stable diagnostic order.
+pub fn default_engines() -> Vec<Box<dyn SearchEngine + Send + Sync>> {
+    vec![
+        Box::new(DuckDuckGo),
+        Box::new(Bing),
+        Box::new(Brave),
+        Box::new(Mojeek),
+    ]
+}
+
+impl SearchEngine for DuckDuckGo {
+    fn name(&self) -> &'static str {
+        "duckduckgo"
+    }
+
+    fn build_url(&self, _params: &SearchParams) -> String {
+        "https://html.duckduckgo.com/html/".to_string()
+    }
+
+    fn method(&self) -> HttpMethod {
+        HttpMethod::Post
+    }
+
+    fn body(&self, params: &SearchParams) -> Option<String> {
+        let mut serializer = form_urlencoded::Serializer::new(String::new());
+        serializer.append_pair("q", &params.query);
+        serializer.append_pair("b", "");
+        Some(serializer.finish())
+    }
+
+    fn parse(&self, html: &str, base_url: &str) -> Vec<SearchHit> {
+        // DuckDuckGo's HTML endpoint contract uses `a.result__a` followed by a
+        // `result__snippet` node. The supplied 2026-07-10 capture is an anomaly
+        // challenge generated by an incorrect GET request and contains neither;
+        // the fixture-positive test is therefore ignored and this selector
+        // contract is covered with representative static markup instead.
+        let starts = tag_ranges(html, "a")
+            .into_iter()
+            .filter(|(start, end)| has_class_token(&html[*start..*end], "result__a"))
+            .collect::<Vec<_>>();
+        let mut hits = Vec::new();
+
+        for (position, (start, end)) in starts.iter().copied().enumerate() {
+            let block_end = starts
+                .get(position + 1)
+                .map(|(next, _)| *next)
+                .unwrap_or(html.len());
+            let tag = &html[start..end];
+            let Some(raw_href) = attr_value(tag, "href") else {
+                continue;
+            };
+            let Some(title_html) = element_inner(html, end, "a") else {
+                continue;
+            };
+            let title = clean_text(title_html);
+            if title.is_empty() {
+                continue;
+            }
+            let Some(url) = absolutize_result_url(raw_href, base_url, true) else {
+                continue;
+            };
+            let block = &html[start..block_end];
+            let description = first_text_by_classes(block, &["result__snippet"])
+                .unwrap_or_default();
+            let rank = position + 1;
+            hits.push(engine_hit(
+                self.name(),
+                rank,
+                title,
+                description,
+                url,
+            ));
+        }
+        hits
+    }
+}
+
+impl SearchEngine for Bing {
+    fn name(&self) -> &'static str {
+        "bing"
+    }
+
+    fn build_url(&self, params: &SearchParams) -> String {
+        build_query_url("https://www.bing.com/search", &params.query)
+    }
+
+    fn parse(&self, html: &str, base_url: &str) -> Vec<SearchHit> {
+        // Stable Bing markup is `li.b_algo`, with the primary link under
+        // `h2 > a` and copy in `.b_caption p` or `.b_algoSlug`. The supplied
+        // 2026-07-10 datacenter capture has no `b_algo` or `h2`: it is a full
+        // Cloudflare Turnstile challenge shell. Returning empty for that exact
+        // variant is expected and lets the other engines continue.
+        let starts = tag_ranges(html, "li")
+            .into_iter()
+            .filter(|(start, end)| has_class_token(&html[*start..*end], "b_algo"))
+            .collect::<Vec<_>>();
+        let mut hits = Vec::new();
+
+        for (position, (start, _)) in starts.iter().copied().enumerate() {
+            let block_end = starts
+                .get(position + 1)
+                .map(|(next, _)| *next)
+                .unwrap_or(html.len());
+            let block = &html[start..block_end];
+            let Some((raw_href, title)) = first_anchor_in_tag(block, "h2") else {
+                continue;
+            };
+            let Some(url) = absolutize_result_url(&raw_href, base_url, false) else {
+                continue;
+            };
+
+            let description = first_class_start(block, &["b_caption"])
+                .and_then(|caption| first_text_for_tag(&block[caption..], "p"))
+                .or_else(|| first_text_by_classes(block, &["b_algoSlug"]))
+                .unwrap_or_default();
+            let rank = position + 1;
+            hits.push(engine_hit(
+                self.name(),
+                rank,
+                title,
+                description,
+                url,
+            ));
+        }
+        hits
+    }
+}
+
+impl SearchEngine for Brave {
+    fn name(&self) -> &'static str {
+        "brave"
+    }
+
+    fn build_url(&self, params: &SearchParams) -> String {
+        build_query_url("https://search.brave.com/search", &params.query)
+    }
+
+    fn parse(&self, html: &str, base_url: &str) -> Vec<SearchHit> {
+        // Verified against the rich 2026-07-10 fixture: 20 web results are
+        // `div` nodes with the stable `snippet` class token and
+        // `data-type="web"`. Svelte hash classes are intentionally ignored.
+        // The primary link has stable class token `l1`, the title has `title`
+        // plus `search-snippet-title`, and ordinary result copy has `content`,
+        // `desktop-default-regular`, and `t-primary` tokens.
+        let starts = tag_ranges(html, "div")
+            .into_iter()
+            .filter(|(start, end)| {
+                let tag = &html[*start..*end];
+                has_class_token(tag, "snippet")
+                    && attr_value(tag, "data-type")
+                        .is_some_and(|value| value.eq_ignore_ascii_case("web"))
+            })
+            .collect::<Vec<_>>();
+        let mut hits = Vec::new();
+
+        for (position, (start, _)) in starts.iter().copied().enumerate() {
+            let block_end = starts
+                .get(position + 1)
+                .map(|(next, _)| *next)
+                .unwrap_or(html.len());
+            let block = &html[start..block_end];
+            let Some((raw_href, anchor_title)) = first_anchor(block, Some("l1")) else {
+                continue;
+            };
+            let title = first_text_by_classes(block, &["title", "search-snippet-title"])
+                .filter(|value| !value.is_empty())
+                .unwrap_or(anchor_title);
+            if title.is_empty() {
+                continue;
+            }
+            let Some(url) = absolutize_result_url(&raw_href, base_url, false) else {
+                continue;
+            };
+            let description = first_text_by_classes(
+                block,
+                &["content", "desktop-default-regular", "t-primary"],
+            )
+            .unwrap_or_default();
+            let rank = position + 1;
+            hits.push(engine_hit(
+                self.name(),
+                rank,
+                title,
+                description,
+                url,
+            ));
+        }
+        hits
+    }
+}
+
+impl SearchEngine for Mojeek {
+    fn name(&self) -> &'static str {
+        "mojeek"
+    }
+
+    fn build_url(&self, params: &SearchParams) -> String {
+        build_query_url("https://www.mojeek.com/search", &params.query)
+    }
+
+    fn parse(&self, html: &str, base_url: &str) -> Vec<SearchHit> {
+        // Mojeek documents standard results under `ul.results-standard > li`,
+        // with `a.title` (or `h2 > a`) and a following paragraph. The supplied
+        // 2026-07-10 fixture is a 337-byte automated-query 403, so this positive
+        // markup could not be fixture-verified; the block body must simply miss
+        // the list and return empty without panicking.
+        let Some(list_start) = first_class_start_for_tag(html, "ul", &["results-standard"])
+        else {
+            return Vec::new();
+        };
+        let list_tail = &html[list_start..];
+        let list_end = find_ascii_case_insensitive(list_tail, "</ul>")
+            .unwrap_or(list_tail.len());
+        let list = &list_tail[..list_end];
+        let starts = tag_ranges(list, "li");
+        let mut hits = Vec::new();
+
+        for (position, (start, _)) in starts.iter().copied().enumerate() {
+            let block_end = starts
+                .get(position + 1)
+                .map(|(next, _)| *next)
+                .unwrap_or(list.len());
+            let block = &list[start..block_end];
+            let title_link = first_anchor(block, Some("title"))
+                .or_else(|| first_anchor_in_tag(block, "h2"));
+            let Some((raw_href, title)) = title_link else {
+                continue;
+            };
+            let Some(url) = absolutize_result_url(&raw_href, base_url, false) else {
+                continue;
+            };
+            let description = first_text_for_tag(block, "p").unwrap_or_default();
+            let rank = position + 1;
+            hits.push(engine_hit(
+                self.name(),
+                rank,
+                title,
+                description,
+                url,
+            ));
+        }
+        hits
+    }
+}
+
+/// Canonical grouping key for consensus deduplication.
+///
+/// The key intentionally ignores the HTTP/HTTPS scheme so equivalent public
+/// URLs returned with different schemes can merge. It lowercases the host,
+/// drops default ports and fragments, removes a trailing path slash, strips
+/// common tracking parameters (`utm_*`, `ref`, and `fbclid`), and preserves the
+/// path plus every meaningful query pair.
+pub fn canonical_key(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    let parsed = Url::parse(raw).or_else(|_| Url::parse(&format!("https://{raw}")));
+    let Ok(url) = parsed else {
+        return fallback_canonical_key(raw);
+    };
+    let Some(host) = url.host_str() else {
+        return fallback_canonical_key(raw);
+    };
+
+    let mut key = host.to_ascii_lowercase();
+    if let Some(port) = url.port() {
+        key.push(':');
+        key.push_str(&port.to_string());
+    }
+
+    let path = url.path().trim_end_matches('/');
+    if !path.is_empty() {
+        if !path.starts_with('/') {
+            key.push('/');
+        }
+        key.push_str(path);
+    }
+
+    let meaningful = url
+        .query_pairs()
+        .filter(|(name, _)| !is_tracking_param(name))
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    if !meaningful.is_empty() {
+        let mut serializer = form_urlencoded::Serializer::new(String::new());
+        for (name, value) in meaningful {
+            serializer.append_pair(&name, &value);
+        }
+        key.push('?');
+        key.push_str(&serializer.finish());
+    }
+    key
+}
+
+/// Merge engine hits by [`canonical_key`] using reciprocal rank.
+///
+/// Each canonical group scores `sum(1 / rank)` across distinct engines. If an
+/// engine emitted the same URL twice, only its best rank contributes. The
+/// representative is selected by lowest rank, then richer title/description,
+/// then deterministic URL/title/engine order. `limit` is applied only after all
+/// groups have merged and sorted.
+pub fn consensus(hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
+    #[derive(Debug)]
+    struct Group {
+        representative: SearchHit,
+        contributions: BTreeMap<&'static str, usize>,
+    }
+
+    let mut groups: HashMap<String, Group> = HashMap::new();
+    for hit in hits {
+        let key = canonical_key(&hit.url);
+        let key = if key.is_empty() {
+            hit.url.trim().to_ascii_lowercase()
+        } else {
+            key
+        };
+        let source_contributions = if hit.contributors.is_empty() {
+            vec![(hit.engine, hit.rank.max(1))]
+        } else {
+            hit.contributors
+                .iter()
+                .map(|(engine, rank)| (*engine, (*rank).max(1)))
+                .collect()
+        };
+
+        match groups.get_mut(&key) {
+            Some(group) => {
+                for (engine, rank) in source_contributions {
+                    group
+                        .contributions
+                        .entry(engine)
+                        .and_modify(|current| *current = (*current).min(rank))
+                        .or_insert(rank);
+                }
+                if better_representative(&hit, &group.representative) {
+                    group.representative = hit;
+                }
+            }
+            None => {
+                let mut contributions = BTreeMap::new();
+                for (engine, rank) in source_contributions {
+                    contributions
+                        .entry(engine)
+                        .and_modify(|current: &mut usize| *current = (*current).min(rank))
+                        .or_insert(rank);
+                }
+                groups.insert(
+                    key,
+                    Group {
+                        representative: hit,
+                        contributions,
+                    },
+                );
+            }
+        }
+    }
+
+    let mut merged = groups
+        .into_values()
+        .map(|group| {
+            let score = group
+                .contributions
+                .values()
+                .map(|rank| 1.0 / *rank as f64)
+                .sum::<f64>();
+            let best_rank = group
+                .contributions
+                .values()
+                .copied()
+                .min()
+                .unwrap_or(usize::MAX);
+            let mut representative = group.representative;
+            representative.contributors = group.contributions.into_iter().collect();
+            (score, best_rank, representative)
+        })
+        .collect::<Vec<_>>();
+
+    merged.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.url.cmp(&right.2.url))
+            .then_with(|| left.2.title.cmp(&right.2.title))
+            .then_with(|| left.2.engine.cmp(right.2.engine))
+    });
+    merged
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, hit)| hit)
+        .collect()
+}
+
+/// Fan out across all engines with default [`SessionOpts`], merge successful
+/// results, and return one diagnostic outcome per engine.
+pub async fn search_all(
+    params: &SearchParams,
+    engines: &[Box<dyn SearchEngine + Send + Sync>],
+    per_engine_timeout: Duration,
+) -> (Vec<SearchHit>, Vec<EngineOutcome>) {
+    search_all_with_session(
+        params,
+        engines,
+        per_engine_timeout,
+        &SessionOpts::default(),
+    )
+    .await
+}
+
+/// Fan out with caller-provided network options. REST/CLI/MCP integration should
+/// use this form to inherit Draco's proxy, robots posture, headers, and request
+/// timeout while preserving the independent outer per-engine timeout.
+pub async fn search_all_with_session(
+    params: &SearchParams,
+    engines: &[Box<dyn SearchEngine + Send + Sync>],
+    per_engine_timeout: Duration,
+    session: &SessionOpts,
+) -> (Vec<SearchHit>, Vec<EngineOutcome>) {
+    search_all_with_fetcher(
+        params,
+        engines,
+        per_engine_timeout,
+        session,
+        Arc::new(NetFetcher),
+    )
+    .await
+}
+
+#[derive(Debug, Clone)]
+struct EngineRequest {
+    method: HttpMethod,
+    url: String,
+    body: Option<String>,
+}
+
+#[derive(Debug)]
+struct EngineResponse {
+    status: u16,
+    final_url: String,
+    body: String,
+}
+
+type FetchFuture = Pin<Box<dyn Future<Output = Result<EngineResponse, String>> + Send>>;
+
+trait EngineFetcher: Send + Sync {
+    fn fetch(self: Arc<Self>, request: EngineRequest, session: SessionOpts) -> FetchFuture;
+}
+
+#[derive(Debug)]
+struct NetFetcher;
+
+impl EngineFetcher for NetFetcher {
+    fn fetch(self: Arc<Self>, request: EngineRequest, session: SessionOpts) -> FetchFuture {
+        Box::pin(async move {
+            let response = match request.method {
+                HttpMethod::Get => fetch_target(&request.url, &session)
+                    .await
+                    .map_err(|error| format!("{error:?}"))?,
+                HttpMethod::Post => {
+                    let body = request.body.unwrap_or_default();
+                    let spec = HttpRequestSpec {
+                        method: "POST".to_string(),
+                        url: request.url,
+                        headers: vec![(
+                            "content-type".to_string(),
+                            "application/x-www-form-urlencoded".to_string(),
+                        )],
+                        body_b64: Some(
+                            base64::engine::general_purpose::STANDARD.encode(body.as_bytes()),
+                        ),
+                    };
+                    replay(&spec, &session)
+                        .await
+                        .map_err(|error| format!("{error:?}"))?
+                }
+            };
+            Ok(EngineResponse {
+                status: response.meta.status,
+                final_url: response.meta.final_url,
+                body: String::from_utf8_lossy(&response.body).into_owned(),
+            })
+        })
+    }
+}
+
+async fn search_all_with_fetcher<F>(
+    params: &SearchParams,
+    engines: &[Box<dyn SearchEngine + Send + Sync>],
+    per_engine_timeout: Duration,
+    session: &SessionOpts,
+    fetcher: Arc<F>,
+) -> (Vec<SearchHit>, Vec<EngineOutcome>)
+where
+    F: EngineFetcher + 'static,
+{
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, engine) in engines.iter().enumerate() {
+        let request = EngineRequest {
+            method: engine.method(),
+            url: engine.build_url(params),
+            body: engine.body(params),
+        };
+        let fetcher = fetcher.clone();
+        let session = session.clone();
+        tasks.spawn(async move {
+            let result = tokio::time::timeout(
+                per_engine_timeout,
+                fetcher.fetch(request, session),
+            )
+            .await;
+            (index, result)
+        });
+    }
+
+    let mut all_hits = Vec::new();
+    let mut indexed_outcomes: Vec<Option<EngineOutcome>> = vec![None; engines.len()];
+    while let Some(joined) = tasks.join_next().await {
+        let Ok((index, timed)) = joined else {
+            // A task panic/cancellation cannot identify its engine from the
+            // JoinError alone. Missing slots are filled deterministically below.
+            continue;
+        };
+        let engine = &engines[index];
+        let status = match timed {
+            Err(_) => EngineStatus::Timeout,
+            Ok(Err(error)) => EngineStatus::Error(error),
+            Ok(Ok(response)) if !(200..300).contains(&response.status) => {
+                EngineStatus::Http(response.status)
+            }
+            Ok(Ok(response)) => {
+                let base_url = if response.final_url.is_empty() {
+                    engine.build_url(params)
+                } else {
+                    response.final_url
+                };
+                let hits = engine.parse(&response.body, &base_url);
+                if hits.is_empty() {
+                    EngineStatus::Empty
+                } else {
+                    let count = hits.len();
+                    all_hits.extend(hits);
+                    EngineStatus::Ok(count)
+                }
+            }
+        };
+        indexed_outcomes[index] = Some(EngineOutcome {
+            name: engine.name(),
+            status,
+        });
+    }
+
+    let outcomes = indexed_outcomes
+        .into_iter()
+        .enumerate()
+        .map(|(index, outcome)| {
+            outcome.unwrap_or_else(|| EngineOutcome {
+                name: engines[index].name(),
+                status: EngineStatus::Error("engine task failed to join".to_string()),
+            })
+        })
+        .collect();
+    (consensus(all_hits, params.limit), outcomes)
+}
+
+fn engine_hit(
+    engine: &'static str,
+    rank: usize,
+    title: String,
+    description: String,
+    url: String,
+) -> SearchHit {
+    SearchHit {
+        title,
+        description,
+        url,
+        engine,
+        rank,
+        contributors: vec![(engine, rank)],
+    }
+}
+
+fn build_query_url(base: &str, query: &str) -> String {
+    match Url::parse(base) {
+        Ok(mut url) => {
+            url.query_pairs_mut().append_pair("q", query);
+            url.to_string()
+        }
+        Err(_) => {
+            let encoded = form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
+            format!("{base}?q={encoded}")
+        }
+    }
+}
+
+fn is_tracking_param(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("utm_") || matches!(name.as_str(), "ref" | "fbclid")
+}
+
+fn fallback_canonical_key(raw: &str) -> String {
+    raw.split('#')
+        .next()
+        .unwrap_or(raw)
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn better_representative(candidate: &SearchHit, current: &SearchHit) -> bool {
+    candidate.rank < current.rank
+        || (candidate.rank == current.rank
+            && (hit_richness(candidate) > hit_richness(current)
+                || (hit_richness(candidate) == hit_richness(current)
+                    && (&candidate.url, &candidate.title, candidate.engine)
+                        < (&current.url, &current.title, current.engine))))
+}
+
+fn hit_richness(hit: &SearchHit) -> usize {
+    hit.title.trim().len() + hit.description.trim().len()
+}
+
+fn absolutize_result_url(raw: &str, base_url: &str, unwrap_ddg: bool) -> Option<String> {
+    let raw = decode_html_entities(raw).trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut url = Url::parse(&raw).or_else(|_| Url::parse(base_url)?.join(&raw)).ok()?;
+    if unwrap_ddg
+        && url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("duckduckgo.com")
+                || host.eq_ignore_ascii_case("html.duckduckgo.com")
+        })
+        && url.path().starts_with("/l/")
+    {
+        if let Some(target) = url
+            .query_pairs()
+            .find(|(name, _)| name.eq_ignore_ascii_case("uddg"))
+            .map(|(_, value)| value.into_owned())
+            .and_then(|value| Url::parse(&value).ok())
+        {
+            url = target;
+        }
+    }
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    Some(url.to_string())
+}
+
+// ===================================================================
+// Minimal defensive HTML scanner
+// ===================================================================
+
+/// Byte ranges for opening tags named `wanted`, including `<` and `>`.
+fn tag_ranges(html: &str, wanted: &str) -> Vec<(usize, usize)> {
+    let bytes = html.as_bytes();
+    let wanted = wanted.as_bytes();
+    let mut ranges = Vec::new();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let Some(relative) = bytes[at..].iter().position(|byte| *byte == b'<') else {
+            break;
+        };
+        let start = at + relative;
+        let mut name_start = start + 1;
+        if name_start >= bytes.len()
+            || matches!(bytes[name_start], b'/' | b'!' | b'?' | b'%')
+        {
+            at = name_start;
+            continue;
+        }
+        while name_start < bytes.len() && bytes[name_start].is_ascii_whitespace() {
+            name_start += 1;
+        }
+        if !bytes_at_eq_ignore_ascii_case(bytes, name_start, wanted) {
+            at = name_start.saturating_add(1);
+            continue;
+        }
+        let after_name = name_start + wanted.len();
+        if after_name >= bytes.len()
+            || !(bytes[after_name].is_ascii_whitespace()
+                || matches!(bytes[after_name], b'>' | b'/'))
+        {
+            at = after_name;
+            continue;
+        }
+        let Some(end) = find_tag_end(bytes, after_name) else {
+            break;
+        };
+        ranges.push((start, end + 1));
+        at = end + 1;
+    }
+    ranges
+}
+
+fn bytes_at_eq_ignore_ascii_case(bytes: &[u8], start: usize, wanted: &[u8]) -> bool {
+    bytes
+        .get(start..start.saturating_add(wanted.len()))
+        .is_some_and(|slice| slice.eq_ignore_ascii_case(wanted))
+}
+
+fn find_tag_end(bytes: &[u8], mut at: usize) -> Option<usize> {
+    let mut quote = None;
+    while at < bytes.len() {
+        match (quote, bytes[at]) {
+            (Some(open), byte) if byte == open => quote = None,
+            (None, b'\'' | b'"') => quote = Some(bytes[at]),
+            (None, b'>') => return Some(at),
+            _ => {}
+        }
+        at += 1;
+    }
+    None
+}
+
+fn attr_value<'a>(tag: &'a str, wanted: &str) -> Option<&'a str> {
+    let bytes = tag.as_bytes();
+    let mut at = 1usize;
+    while at < bytes.len()
+        && !bytes[at].is_ascii_whitespace()
+        && !matches!(bytes[at], b'>' | b'/')
+    {
+        at += 1;
+    }
+
+    while at < bytes.len() {
+        while at < bytes.len()
+            && (bytes[at].is_ascii_whitespace() || matches!(bytes[at], b'/'))
+        {
+            at += 1;
+        }
+        if at >= bytes.len() || bytes[at] == b'>' {
+            break;
+        }
+        let name_start = at;
+        while at < bytes.len()
+            && (bytes[at].is_ascii_alphanumeric() || matches!(bytes[at], b'-' | b'_' | b':'))
+        {
+            at += 1;
+        }
+        if at == name_start {
+            at += 1;
+            continue;
+        }
+        let name = &tag[name_start..at];
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        if at >= bytes.len() || bytes[at] != b'=' {
+            continue;
+        }
+        at += 1;
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        if at >= bytes.len() {
+            break;
+        }
+        let (value_start, value_end) = if matches!(bytes[at], b'\'' | b'"') {
+            let quote = bytes[at];
+            at += 1;
+            let start = at;
+            while at < bytes.len() && bytes[at] != quote {
+                at += 1;
+            }
+            let end = at;
+            at = at.saturating_add(1);
+            (start, end)
+        } else {
+            let start = at;
+            while at < bytes.len()
+                && !bytes[at].is_ascii_whitespace()
+                && !matches!(bytes[at], b'>' | b'/')
+            {
+                at += 1;
+            }
+            (start, at)
+        };
+        if name.eq_ignore_ascii_case(wanted) {
+            return tag.get(value_start..value_end);
+        }
+    }
+    None
+}
+
+fn has_class_token(tag: &str, token: &str) -> bool {
+    attr_value(tag, "class")
+        .is_some_and(|classes| classes.split_ascii_whitespace().any(|item| item == token))
+}
+
+fn has_class_tokens(tag: &str, tokens: &[&str]) -> bool {
+    tokens.iter().all(|token| has_class_token(tag, token))
+}
+
+fn first_class_start(html: &str, tokens: &[&str]) -> Option<usize> {
+    let mut at = 0usize;
+    while at < html.len() {
+        let relative = html[at..].find('<')?;
+        let start = at + relative;
+        let end = find_tag_end(html.as_bytes(), start + 1)? + 1;
+        let raw = &html[start..end];
+        if !raw.starts_with("</") && has_class_tokens(raw, tokens) {
+            return Some(start);
+        }
+        at = end;
+    }
+    None
+}
+
+fn first_class_start_for_tag(html: &str, tag: &str, tokens: &[&str]) -> Option<usize> {
+    tag_ranges(html, tag)
+        .into_iter()
+        .find(|(start, end)| has_class_tokens(&html[*start..*end], tokens))
+        .map(|(start, _)| start)
+}
+
+fn element_inner<'a>(html: &'a str, open_end: usize, tag: &str) -> Option<&'a str> {
+    let tail = html.get(open_end..)?;
+    let close = format!("</{tag}");
+    let relative = find_ascii_case_insensitive(tail, &close)?;
+    tail.get(..relative)
+}
+
+fn first_text_for_tag(html: &str, tag: &str) -> Option<String> {
+    let (_, end) = tag_ranges(html, tag).into_iter().next()?;
+    let inner = element_inner(html, end, tag)?;
+    let text = clean_text(inner);
+    (!text.is_empty()).then_some(text)
+}
+
+fn first_text_by_classes(html: &str, tokens: &[&str]) -> Option<String> {
+    let start = first_class_start(html, tokens)?;
+    let end = find_tag_end(html.as_bytes(), start + 1)? + 1;
+    let tag = tag_name(&html[start..end])?;
+    let inner = element_inner(html, end, tag)?;
+    let text = clean_text(inner);
+    (!text.is_empty()).then_some(text)
+}
+
+fn first_anchor_in_tag(html: &str, tag: &str) -> Option<(String, String)> {
+    let (_, open_end) = tag_ranges(html, tag).into_iter().next()?;
+    let inner = element_inner(html, open_end, tag)?;
+    first_anchor(inner, None)
+}
+
+fn first_anchor(html: &str, class: Option<&str>) -> Option<(String, String)> {
+    for (start, end) in tag_ranges(html, "a") {
+        let raw_tag = &html[start..end];
+        if class.is_some_and(|token| !has_class_token(raw_tag, token)) {
+            continue;
+        }
+        let Some(href) = attr_value(raw_tag, "href") else {
+            continue;
+        };
+        let Some(inner) = element_inner(html, end, "a") else {
+            continue;
+        };
+        let title = clean_text(inner);
+        if title.is_empty() || href.trim().is_empty() {
+            continue;
+        }
+        return Some((decode_html_entities(href), title));
+    }
+    None
+}
+
+fn tag_name(tag: &str) -> Option<&str> {
+    let bytes = tag.as_bytes();
+    let mut start = 1usize;
+    while start < bytes.len() && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    let mut end = start;
+    while end < bytes.len() && bytes[end].is_ascii_alphanumeric() {
+        end += 1;
+    }
+    (end > start).then(|| &tag[start..end])
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn clean_text(fragment: &str) -> String {
+    let bytes = fragment.as_bytes();
+    let mut plain = String::with_capacity(fragment.len());
+    let mut at = 0usize;
+    while at < bytes.len() {
+        if bytes[at] == b'<' {
+            match find_tag_end(bytes, at + 1) {
+                Some(end) => {
+                    at = end + 1;
+                    plain.push(' ');
+                    continue;
+                }
+                None => break,
+            }
+        }
+        let Some(ch) = fragment[at..].chars().next() else {
+            break;
+        };
+        plain.push(ch);
+        at += ch.len_utf8();
+    }
+    decode_html_entities(&plain)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn decode_html_entities(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let entity_start = amp + 1;
+        let Some(relative_end) = rest[entity_start..].find(';') else {
+            out.push_str(&rest[amp..]);
+            return out;
+        };
+        let entity_end = entity_start + relative_end;
+        if relative_end > 16 {
+            out.push('&');
+            rest = &rest[entity_start..];
+            continue;
+        }
+        let entity = &rest[entity_start..entity_end];
+        match decode_entity(entity) {
+            Some(ch) => out.push(ch),
+            None => out.push_str(&rest[amp..=entity_end]),
+        }
+        rest = &rest[entity_end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn decode_entity(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" | "#39" => Some('\''),
+        "nbsp" => Some(' '),
+        _ => {
+            let value = entity
+                .strip_prefix("#x")
+                .or_else(|| entity.strip_prefix("#X"))
+                .and_then(|digits| u32::from_str_radix(digits, 16).ok())
+                .or_else(|| {
+                    entity
+                        .strip_prefix('#')
+                        .and_then(|digits| digits.parse::<u32>().ok())
+                })?;
+            char::from_u32(value)
+        }
+    }
+}
+
+// ===================================================================
+// Offline tests
+// ===================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BRAVE_FIXTURE: &str = include_str!("../../tests/fixtures/search/brave.html");
+    const BING_FIXTURE: &str = include_str!("../../tests/fixtures/search/bing.html");
+    const DDG_FIXTURE: &str = include_str!("../../tests/fixtures/search/ddg.html");
+    const MOJEEK_FIXTURE: &str = include_str!("../../tests/fixtures/search/mojeek.html");
+
+    #[test]
+    fn brave_fixture_yields_well_formed_web_hits() {
+        let hits = Brave.parse(BRAVE_FIXTURE, "https://search.brave.com/search");
+        assert!(hits.len() >= 5, "expected rich fixture, got {}", hits.len());
+        assert!(hits.iter().all(|hit| {
+            !hit.title.trim().is_empty()
+                && Url::parse(&hit.url).is_ok()
+                && hit.rank > 0
+                && hit.engine == "brave"
+        }));
+        assert_eq!(
+            hits.first().map(|hit| hit.url.as_str()),
+            Some("https://www.scrapingbee.com/blog/web-scraping-rust/")
+        );
+    }
+
+    #[test]
+    fn bing_fixture_documents_turnstile_variant_as_empty() {
+        assert!(!BING_FIXTURE.contains("b_algo"));
+        assert!(BING_FIXTURE.contains("turnstile-widget"));
+        assert!(Bing
+            .parse(BING_FIXTURE, "https://www.bing.com/search")
+            .is_empty());
+    }
+
+    #[test]
+    fn bing_documented_markup_parses_without_dom_dependency() {
+        let html = r#"
+            <ol id="b_results">
+              <li class="b_algo"><h2><a href="https://example.com/a">Alpha</a></h2>
+                <div class="b_caption"><p>First <strong>description</strong>.</p></div></li>
+              <li class="b_algo"><h2><a href="/relative">Beta</a></h2>
+                <div class="b_algoSlug">Second description.</div></li>
+            </ol>
+        "#;
+        let hits = Bing.parse(html, "https://www.bing.com/search?q=rust");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "Alpha");
+        assert_eq!(hits[0].description, "First description.");
+        assert_eq!(hits[1].url, "https://www.bing.com/relative");
+        assert_eq!(hits[1].rank, 2);
+    }
+
+    #[test]
+    fn mojeek_403_fixture_is_empty_without_panicking() {
+        assert!(MOJEEK_FIXTURE.contains("403 - Forbidden"));
+        assert!(MOJEEK_FIXTURE.contains("automated queries"));
+        assert!(Mojeek
+            .parse(MOJEEK_FIXTURE, "https://www.mojeek.com/search")
+            .is_empty());
+    }
+
+    #[test]
+    fn mojeek_documented_markup_parses_defensively() {
+        let html = r#"
+            <ul class="results-standard">
+              <li><a class="title" href="https://example.com/a">Alpha</a><p>First result.</p></li>
+              <li><h2><a href="/b">Beta</a></h2><p>Second result.</p></li>
+            </ul>
+        "#;
+        let hits = Mojeek.parse(html, "https://www.mojeek.com/search?q=rust");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].description, "First result.");
+        assert_eq!(hits[1].url, "https://www.mojeek.com/b");
+    }
+
+    #[test]
+    #[ignore = "2026-07-10 fixture is a DDG anomaly challenge, not a POST result page"]
+    fn duckduckgo_fixture_positive_parse_when_replaced_with_post_capture() {
+        let hits = DuckDuckGo.parse(DDG_FIXTURE, "https://html.duckduckgo.com/html/");
+        assert!(!hits.is_empty());
+    }
+
+    #[test]
+    fn duckduckgo_documented_markup_and_redirect_parse() {
+        let html = r#"
+            <div class="result results_links">
+              <h2><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Frust%3Futm_source%3Dddg">Rust &amp; scraping</a></h2>
+              <a class="result__snippet">A <b>defensive</b> parser.</a>
+            </div>
+        "#;
+        let hits = DuckDuckGo.parse(html, "https://html.duckduckgo.com/html/");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "Rust & scraping");
+        assert_eq!(hits[0].description, "A defensive parser.");
+        assert!(hits[0].url.starts_with("https://example.com/rust"));
+    }
+
+    #[test]
+    fn engine_request_shapes_encode_query() {
+        let params = SearchParams {
+            query: "rust web scraper".to_string(),
+            ..SearchParams::default()
+        };
+        assert_eq!(DuckDuckGo.method(), HttpMethod::Post);
+        assert_eq!(
+            DuckDuckGo.body(&params).as_deref(),
+            Some("q=rust+web+scraper&b=")
+        );
+        assert!(Bing.build_url(&params).contains("q=rust+web+scraper"));
+        assert!(Brave.build_url(&params).contains("q=rust+web+scraper"));
+        assert!(Mojeek.build_url(&params).contains("q=rust+web+scraper"));
+    }
+
+    #[test]
+    fn canonical_key_collapses_scheme_root_slash_and_tracking() {
+        let expected = "example.com";
+        assert_eq!(canonical_key("http://Example.com/"), expected);
+        assert_eq!(canonical_key("https://example.com"), expected);
+        assert_eq!(canonical_key("example.com/?utm_source=x"), expected);
+        assert_eq!(
+            canonical_key("https://EXAMPLE.com:443/path/?q=rust&utm_medium=cpc&ref=x#part"),
+            "example.com/path?q=rust"
+        );
+        assert_eq!(
+            canonical_key("http://example.com:8080/path?fbclid=x&keep=yes"),
+            "example.com:8080/path?keep=yes"
+        );
+    }
+
+    #[test]
+    fn consensus_uses_cross_engine_reciprocal_rank_before_limit() {
+        let hits = vec![
+            hit("solo", 1, "Solo", "", "https://solo.example/"),
+            hit("bing", 2, "Shared", "short", "https://shared.example/a"),
+            hit(
+                "brave",
+                3,
+                "Shared richer title",
+                "A much richer description",
+                "http://SHARED.example/a/?utm_source=brave",
+            ),
+            hit(
+                "mojeek",
+                4,
+                "Shared",
+                "third source",
+                "https://shared.example/a#fragment",
+            ),
+            hit("ddg", 4, "Other", "", "https://other.example/"),
+        ];
+
+        let all = consensus(hits.clone(), 10);
+        assert_eq!(all.len(), 3);
+        assert_eq!(canonical_key(&all[0].url), "shared.example/a");
+        assert_eq!(all[0].contributors.len(), 3);
+        assert_eq!(all[0].rank, 2);
+        assert_eq!(all[1].engine, "solo");
+
+        let limited = consensus(hits, 1);
+        assert_eq!(limited.len(), 1);
+        assert_eq!(canonical_key(&limited[0].url), "shared.example/a");
+    }
+
+    #[test]
+    fn consensus_prefers_richer_representative_when_best_ranks_tie() {
+        let merged = consensus(
+            vec![
+                hit("bing", 2, "Short", "", "https://example.com/a"),
+                hit(
+                    "brave",
+                    2,
+                    "A richer result title",
+                    "with useful descriptive context",
+                    "http://EXAMPLE.com/a/?utm_source=brave",
+                ),
+            ],
+            10,
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].engine, "brave");
+        assert_eq!(merged[0].title, "A richer result title");
+    }
+
+    #[test]
+    fn consensus_counts_one_best_rank_per_engine() {
+        let merged = consensus(
+            vec![
+                hit("brave", 5, "A", "", "https://example.com/a"),
+                hit("brave", 2, "A", "", "https://example.com/a/"),
+                hit("bing", 4, "A", "", "https://example.com/a"),
+            ],
+            10,
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].contributors, vec![("bing", 4), ("brave", 2)]);
+        assert_eq!(merged[0].rank, 2);
+    }
+
+    #[derive(Debug)]
+    struct FakeEngine {
+        name: &'static str,
+        url: &'static str,
+    }
+
+    impl SearchEngine for FakeEngine {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn build_url(&self, _params: &SearchParams) -> String {
+            self.url.to_string()
+        }
+
+        fn parse(&self, html: &str, _base_url: &str) -> Vec<SearchHit> {
+            if html == "hit" {
+                vec![hit(
+                    self.name,
+                    1,
+                    "Good result",
+                    "",
+                    "https://good.example/result",
+                )]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeFetcher;
+
+    impl EngineFetcher for FakeFetcher {
+        fn fetch(self: Arc<Self>, request: EngineRequest, _session: SessionOpts) -> FetchFuture {
+            Box::pin(async move {
+                if request.url.ends_with("/timeout") {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    return Ok(fake_response(200, "late"));
+                }
+                if request.url.ends_with("/error") {
+                    return Err("synthetic transport error".to_string());
+                }
+                if request.url.ends_with("/http") {
+                    return Ok(fake_response(503, "unavailable"));
+                }
+                if request.url.ends_with("/good") {
+                    return Ok(fake_response(200, "hit"));
+                }
+                Ok(fake_response(200, "no results"))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_keeps_good_results_when_peers_timeout_error_http_or_empty() {
+        let engines: Vec<Box<dyn SearchEngine + Send + Sync>> = vec![
+            Box::new(FakeEngine {
+                name: "good",
+                url: "https://fake.test/good",
+            }),
+            Box::new(FakeEngine {
+                name: "timeout",
+                url: "https://fake.test/timeout",
+            }),
+            Box::new(FakeEngine {
+                name: "error",
+                url: "https://fake.test/error",
+            }),
+            Box::new(FakeEngine {
+                name: "empty",
+                url: "https://fake.test/empty",
+            }),
+            Box::new(FakeEngine {
+                name: "http",
+                url: "https://fake.test/http",
+            }),
+        ];
+        let params = SearchParams {
+            query: "test".to_string(),
+            limit: 5,
+            ..SearchParams::default()
+        };
+        let (hits, outcomes) = search_all_with_fetcher(
+            &params,
+            &engines,
+            Duration::from_millis(5),
+            &SessionOpts::default(),
+            Arc::new(FakeFetcher),
+        )
+        .await;
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].engine, "good");
+        assert_eq!(outcomes.len(), 5);
+        assert_eq!(outcome(&outcomes, "good"), Some(&EngineStatus::Ok(1)));
+        assert_eq!(
+            outcome(&outcomes, "timeout"),
+            Some(&EngineStatus::Timeout)
+        );
+        assert!(matches!(
+            outcome(&outcomes, "error"),
+            Some(EngineStatus::Error(message)) if message.contains("synthetic")
+        ));
+        assert_eq!(outcome(&outcomes, "empty"), Some(&EngineStatus::Empty));
+        assert_eq!(outcome(&outcomes, "http"), Some(&EngineStatus::Http(503)));
+    }
+
+    fn hit(
+        engine: &'static str,
+        rank: usize,
+        title: &str,
+        description: &str,
+        url: &str,
+    ) -> SearchHit {
+        engine_hit(
+            engine,
+            rank,
+            title.to_string(),
+            description.to_string(),
+            url.to_string(),
+        )
+    }
+
+    fn fake_response(status: u16, body: &str) -> EngineResponse {
+        EngineResponse {
+            status,
+            final_url: "https://fake.test/final".to_string(),
+            body: body.to_string(),
+        }
+    }
+
+    fn outcome<'a>(outcomes: &'a [EngineOutcome], name: &str) -> Option<&'a EngineStatus> {
+        outcomes
+            .iter()
+            .find(|outcome| outcome.name == name)
+            .map(|outcome| &outcome.status)
+    }
+}
