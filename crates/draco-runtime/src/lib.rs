@@ -321,6 +321,11 @@ struct CaptureState {
     /// `op_raze_log` (glue) and the Rust-side script-throw sites; bounded by
     /// [`CaptureState::push_log`].
     logs: Vec<String>,
+    /// Serialized JSON of the most recent interact `exec` turn's completion value,
+    /// stashed by `op_raze_exec_result` and drained per turn. Unused by the
+    /// one-shot capture path (`run_capture`); it is the devtools-console return
+    /// channel for [`session`](crate::session).
+    exec_result: Option<String>,
     /// Monotonic clock for this capture, started at isolate construction. The
     /// `[raze.*]` diagnostics stamp `[+{ms}]` off it so `--runtime-log` reads as a
     /// timeline — when each fetch/chunk resolved and when the window closed — the
@@ -641,6 +646,17 @@ fn op_raze_dom(state: &mut OpState, #[string] html: String) {
     cap.borrow_mut().rendered_html = Some(html);
 }
 
+/// Receive the serialized JSON of an interact `exec` turn's completion value and
+/// stash it in [`CaptureState`] for [`session`](crate::session) to drain. Unused
+/// by the one-shot capture path; the devtools-console return channel. The page
+/// side already applies the size budget (`full`/`maxBytes`), so this stores the
+/// string verbatim.
+#[deno_core::op2(fast)]
+fn op_raze_exec_result(state: &mut OpState, #[string] json: String) {
+    let cap = state.borrow::<Rc<RefCell<CaptureState>>>().clone();
+    cap.borrow_mut().exec_result = Some(json);
+}
+
 /// Sleep `ms` milliseconds, then resolve. Backs the polyfill's timer scheduler.
 /// A pending `op_sleep` future keeps the deno_core event loop non-idle.
 ///
@@ -687,6 +703,7 @@ deno_core::extension!(
         op_resolve_url,
         op_raze_load_script,
         op_raze_dom,
+        op_raze_exec_result,
         op_raze_log,
     ],
     options = { cap: Rc<RefCell<CaptureState>> },
@@ -873,6 +890,7 @@ async fn run_capture_inner(
         content_activity: Rc::new(Cell::new(0)),
         rendered_html: None,
         logs: Vec::new(),
+        exec_result: None,
         started: Instant::now(),
     }));
 
@@ -2259,6 +2277,7 @@ mod tests {
             content_activity: Rc::new(Cell::new(0)),
             rendered_html: None,
             logs: Vec::new(),
+            exec_result: None,
             started: Instant::now(),
         };
         for _ in 0..50 {
