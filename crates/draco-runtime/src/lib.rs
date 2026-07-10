@@ -1029,8 +1029,7 @@ async fn run_capture_inner(
 
     // 3. Capture window: pump the event loop until quiescence or the hard cap.
     let t_window = Instant::now();
-    let (outcome, window_cpu) =
-        drive_capture_window(&mut runtime, &cap, cfg, threw_in_page).await;
+    let (outcome, window_cpu) = drive_capture_window(&mut runtime, &cap, cfg, threw_in_page).await;
     let window_ms = t_window.elapsed().as_millis();
     let window_cpu_ms = window_cpu.as_millis();
 
