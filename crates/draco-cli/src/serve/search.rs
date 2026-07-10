@@ -1398,6 +1398,310 @@ fn decode_entity(entity: &str) -> Option<char> {
 // Offline tests
 // ===================================================================
 
+// ===================================================================
+// REST surface — POST /v1/search
+// ===================================================================
+//
+// The handler lives here (not in a separate file) so the whole search
+// feature — core + surface — reads as one unit, mirroring `map.rs`. The CLI
+// and MCP riders reuse the public core plus the two small item-shaping helpers
+// below (`base_item` / `merge_scrape_fields`) so all three surfaces emit an
+// identical result shape.
+
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::Json;
+use draco_core::{extract_with_pool, session_opts, Config, FormatSet};
+use draco_types::Status;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tokio::sync::Semaphore;
+
+use super::{error_body, parse_formats, AppState};
+
+/// Overall search deadline (ms) when the caller sends no `timeout` — Firecrawl
+/// parity (`/v1/search` defaults to 60000).
+const DEFAULT_SEARCH_TIMEOUT_MS: u64 = 60_000;
+/// Per-engine SERP fetch budget (ms) applied to the shared session. Independent
+/// of, and shorter than, the overall deadline so one slow engine cannot consume
+/// the whole request.
+const SERP_FETCH_TIMEOUT_MS: u64 = 15_000;
+/// Max concurrent result-page scrapes when `scrapeOptions.formats` is requested.
+const SCRAPE_FANOUT: usize = 4;
+
+/// `POST /v1/search` request. Firecrawl-shaped; unknown fields are ignored
+/// (serde is non-strict here by design — the drop-in-friendliness ground rule).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SearchRequest {
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Time filter (`qdr:d`, …). Preserved and passed to engines that support
+    /// it; best-effort per engine.
+    #[serde(default)]
+    tbs: Option<String>,
+    /// Free-text geo target. Best-effort per engine.
+    #[serde(default)]
+    location: Option<String>,
+    /// Overall search deadline (ms). Defaults to 60000.
+    #[serde(default)]
+    timeout: Option<u64>,
+    /// When present with a non-empty `formats`, each result URL is run through
+    /// Draco's scrape ladder and the scrape fields are merged onto the hit.
+    #[serde(default)]
+    scrape_options: Option<ScrapeOptions>,
+    // ---- Draco extensions: posture for the SERP fetches ----
+    #[serde(default)]
+    proxy: Option<String>,
+    #[serde(default)]
+    ignore_robots: Option<bool>,
+}
+
+/// Subset of Firecrawl `scrapeOptions` Draco honors for per-result scraping.
+/// Mirrors the scrape handler's fields; unknown fields ignored.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ScrapeOptions {
+    #[serde(default)]
+    formats: Vec<String>,
+    #[serde(default)]
+    only_main_content: Option<bool>,
+    #[serde(default)]
+    wait_for: Option<u64>,
+    #[serde(default)]
+    capture_window_ms: Option<u64>,
+    #[serde(default)]
+    tier_max: Option<u8>,
+    #[serde(default)]
+    timeout: Option<u64>,
+    #[serde(default)]
+    include_tags: Option<Vec<String>>,
+    #[serde(default)]
+    exclude_tags: Option<Vec<String>>,
+    #[serde(default)]
+    headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    proxy: Option<String>,
+    #[serde(default)]
+    ignore_robots: Option<bool>,
+}
+
+pub(crate) async fn search_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SearchRequest>,
+) -> (StatusCode, Json<Value>) {
+    let query = req.query.trim();
+    if query.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(error_body("\"query\" must be a non-empty string")),
+        );
+    }
+    let limit = req.limit.unwrap_or(5).clamp(1, 100);
+
+    // Validate scrapeOptions.formats up front so an unknown/unsupported format
+    // fails the request before any network work (same 400/422 split as scrape).
+    let scrape_formats = match &req.scrape_options {
+        Some(opts) if !opts.formats.is_empty() => match parse_formats(&opts.formats) {
+            Ok(f) => Some(f),
+            Err(rej) => {
+                let code = if rej.unsupported {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                return (code, Json(error_body(&rej.message)));
+            }
+        },
+        _ => None,
+    };
+
+    let params = SearchParams {
+        query: query.to_string(),
+        limit,
+        tbs: req.tbs.clone(),
+        location: req.location.clone(),
+    };
+
+    // SERP session: inherit proxy posture, a per-engine HTTP budget, and a fresh
+    // operation-scoped cookie jar. robots is NOT respected for the SERP fetches
+    // by default: search engines disallow `/search` in robots.txt, and a
+    // metasearch fetches result pages like a browser (SearXNG does the same).
+    // The caller can force respect via `ignoreRobots: false`.
+    let serp_config = Config {
+        proxy: req.proxy.clone().or_else(|| state.defaults.proxy.clone()),
+        timeout_ms: SERP_FETCH_TIMEOUT_MS,
+        respect_robots: req.ignore_robots == Some(false),
+        force_render: false,
+        ..state.defaults.clone()
+    };
+    let session = session_opts(&serp_config);
+
+    let overall = Duration::from_millis(req.timeout.unwrap_or(DEFAULT_SEARCH_TIMEOUT_MS));
+    let engines = default_engines();
+    let fanout = search_all_with_session(&params, &engines, DEFAULT_PER_ENGINE_TIMEOUT, &session);
+    let (hits, outcomes) = match tokio::time::timeout(overall, fanout).await {
+        Ok(pair) => pair,
+        Err(_) => {
+            return (
+                StatusCode::REQUEST_TIMEOUT,
+                Json(error_body("search timed out before any engine returned")),
+            );
+        }
+    };
+
+    // Total engine failure → upstream error. Partial failure always returns the
+    // surviving engines' consensus (the whole point of the fan-out).
+    if !outcomes.iter().any(|o| matches!(o.status, EngineStatus::Ok(_))) {
+        let mut body = error_body("all search engines failed");
+        body["draco"] = json!({ "engines": outcomes_json(&outcomes) });
+        return (StatusCode::BAD_GATEWAY, Json(body));
+    }
+
+    let merged = consensus(hits, limit);
+
+    let data: Vec<Value> = match (&scrape_formats, &req.scrape_options) {
+        (Some(formats), Some(opts)) => {
+            scrape_results(&merged, formats.clone(), opts, &state).await
+        }
+        _ => merged.iter().map(|h| Value::Object(base_item(h))).collect(),
+    };
+
+    let body = json!({
+        "success": true,
+        "data": data,
+        "draco": { "engines": outcomes_json(&outcomes) },
+    });
+    (StatusCode::OK, Json(body))
+}
+
+/// Build a `Config` for scraping a single result URL from `scrapeOptions`,
+/// seeded by the daemon defaults.
+fn scrape_config(opts: &ScrapeOptions, formats: FormatSet, defaults: &Config) -> Config {
+    Config {
+        formats,
+        only_main_content: opts
+            .only_main_content
+            .unwrap_or(defaults.only_main_content),
+        include_tags: opts.include_tags.clone().unwrap_or_default(),
+        exclude_tags: opts.exclude_tags.clone().unwrap_or_default(),
+        headers: opts
+            .headers
+            .clone()
+            .map(|m| m.into_iter().collect())
+            .unwrap_or_default(),
+        proxy: opts.proxy.clone().or_else(|| defaults.proxy.clone()),
+        timeout_ms: opts.timeout.unwrap_or(defaults.timeout_ms),
+        tier_max: opts.tier_max.unwrap_or(defaults.tier_max),
+        capture_window_ms: opts
+            .capture_window_ms
+            .or(opts.wait_for)
+            .unwrap_or(defaults.capture_window_ms),
+        respect_robots: match opts.ignore_robots {
+            Some(ignore) => !ignore,
+            None => defaults.respect_robots,
+        },
+        force_render: false,
+        ..defaults.clone()
+    }
+}
+
+/// Scrape each result URL through the shared ladder, bounded by `SCRAPE_FANOUT`
+/// and the daemon's global gate, merging scrape fields onto each hit. Order is
+/// preserved; a per-URL scrape failure leaves the base title/description/url.
+async fn scrape_results(
+    merged: &[SearchHit],
+    formats: FormatSet,
+    opts: &ScrapeOptions,
+    state: &Arc<AppState>,
+) -> Vec<Value> {
+    let base = scrape_config(opts, formats, &state.defaults);
+    let sem = Arc::new(Semaphore::new(SCRAPE_FANOUT));
+    let mut tasks = tokio::task::JoinSet::new();
+    for (idx, hit) in merged.iter().enumerate() {
+        let mut item = base_item(hit);
+        let url = hit.url.clone();
+        let config = base.clone();
+        let state = state.clone();
+        let sem = sem.clone();
+        tasks.spawn(async move {
+            // Bound search-scrape concurrency locally, and each scrape still
+            // counts against the daemon's global gate (acquired only after the
+            // local permit, so 4 ≤ gate size can never deadlock).
+            let _local = sem.acquire_owned().await.ok();
+            let _gate = state.gate.acquire().await.ok();
+            let result = extract_with_pool(&url, &config, &state.tier2_pool).await;
+            if result.status == Status::Success {
+                merge_scrape_fields(&mut item, &result);
+            }
+            (idx, Value::Object(item))
+        });
+    }
+    let mut slots: Vec<Option<Value>> = vec![None; merged.len()];
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok((idx, value)) = joined {
+            slots[idx] = Some(value);
+        }
+    }
+    // Any panicked slot falls back to its base item so the result count is stable.
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(idx, slot)| slot.unwrap_or_else(|| Value::Object(base_item(&merged[idx]))))
+        .collect()
+}
+
+/// The flat `{ title, description, url }` result item every surface emits.
+pub(crate) fn base_item(hit: &SearchHit) -> serde_json::Map<String, Value> {
+    let mut item = serde_json::Map::new();
+    item.insert("title".into(), Value::String(hit.title.clone()));
+    item.insert("description".into(), Value::String(hit.description.clone()));
+    item.insert("url".into(), Value::String(hit.url.clone()));
+    item
+}
+
+/// Merge a successful scrape's `Document` fields onto a result item, keyed
+/// exactly as `to_firecrawl` keys them (markdown/html/rawHtml/links/json/metadata).
+pub(crate) fn merge_scrape_fields(item: &mut serde_json::Map<String, Value>, result: &ExtractionResult) {
+    if let Some(md) = &result.markdown {
+        item.insert("markdown".into(), Value::String(md.clone()));
+    }
+    if let Some(h) = &result.html {
+        item.insert("html".into(), Value::String(h.clone()));
+    }
+    if let Some(rh) = &result.raw_html {
+        item.insert("rawHtml".into(), Value::String(rh.clone()));
+    }
+    if let Some(links) = &result.links {
+        item.insert("links".into(), serde_json::to_value(links).unwrap_or(Value::Null));
+    }
+    if let Some(d) = &result.data {
+        item.insert("json".into(), d.clone());
+    }
+    if let Some(metadata) = &result.metadata {
+        item.insert("metadata".into(), metadata.clone());
+    }
+}
+
+/// Per-engine diagnostics for the `draco` extension block.
+pub(crate) fn outcomes_json(outcomes: &[EngineOutcome]) -> Value {
+    let rows: Vec<Value> = outcomes
+        .iter()
+        .map(|o| match &o.status {
+            EngineStatus::Ok(n) => json!({ "engine": o.name, "status": "ok", "results": n }),
+            EngineStatus::Empty => json!({ "engine": o.name, "status": "empty" }),
+            EngineStatus::Timeout => json!({ "engine": o.name, "status": "timeout" }),
+            EngineStatus::Http(code) => json!({ "engine": o.name, "status": "http", "code": code }),
+            EngineStatus::Error(msg) => json!({ "engine": o.name, "status": "error", "message": msg }),
+        })
+        .collect();
+    Value::Array(rows)
+}
+
+// `ExtractionResult` is referenced by the helpers above.
+use draco_types::ExtractionResult;
+
 #[cfg(test)]
 mod tests {
     use super::*;

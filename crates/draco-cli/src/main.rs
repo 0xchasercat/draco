@@ -286,6 +286,35 @@ enum Command {
         #[arg(long)]
         pretty: bool,
     },
+    /// Metasearch across several engines over plain HTTP (no browser), merged
+    /// by reciprocal-rank consensus so individual engine failures (captcha
+    /// walls, geo-blocks) degrade gracefully. Mirrors `POST /v1/search`.
+    #[cfg(feature = "serve")]
+    Search {
+        /// Search query.
+        query: String,
+        /// Max results to return after consensus (1–100).
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Scrape each result URL to these format(s); repeatable (e.g. `--format
+        /// markdown --format links`). Omit to return title/description/url only.
+        #[arg(long, value_enum)]
+        format: Vec<FormatArg>,
+        /// http/https/socks5 proxy URL for the SERP fetches.
+        #[arg(long)]
+        proxy: Option<String>,
+        /// Overall search deadline (ms).
+        #[arg(long, default_value_t = 60_000)]
+        timeout: u64,
+        /// Respect robots.txt on the SERP fetches. Off by default: search
+        /// engines disallow `/search` in robots.txt and a metasearch fetches
+        /// result pages like a browser (SearXNG does the same).
+        #[arg(long)]
+        respect_robots: bool,
+        /// Pretty-print the JSON envelope.
+        #[arg(long)]
+        pretty: bool,
+    },
     /// Run a persistent HTTP daemon exposing a Firecrawl-compatible REST API
     /// (`POST /v1/scrape`, `GET /health`). The process stays warm, so clients
     /// skip the per-scrape binary spawn.
@@ -657,6 +686,97 @@ async fn async_main() {
                     std::process::exit(1);
                 }
             }
+        }
+        #[cfg(feature = "serve")]
+        Command::Search {
+            query,
+            limit,
+            format,
+            proxy,
+            timeout,
+            respect_robots,
+            pretty,
+        } => {
+            use serve::search;
+            let q = query.trim();
+            if q.is_empty() {
+                eprintln!("draco search: query must be a non-empty string");
+                std::process::exit(1);
+            }
+            let limit = limit.clamp(1, 100);
+            let params = search::SearchParams {
+                query: q.to_string(),
+                limit,
+                tbs: None,
+                location: None,
+            };
+            // SERP session posture: reuse the same Config → SessionOpts mapping
+            // as the daemon; a per-engine HTTP budget, browser-like robots.
+            let serp_config = Config {
+                force_render: false,
+                proxy: proxy.clone(),
+                timeout_ms: 15_000,
+                respect_robots,
+                ..Config::default()
+            };
+            let session = draco_core::session_opts(&serp_config);
+            let engines = search::default_engines();
+            let overall = std::time::Duration::from_millis(timeout);
+            let fut = search::search_all_with_session(
+                &params,
+                &engines,
+                search::DEFAULT_PER_ENGINE_TIMEOUT,
+                &session,
+            );
+            let (hits, outcomes) = match tokio::time::timeout(overall, fut).await {
+                Ok(pair) => pair,
+                Err(_) => {
+                    eprintln!("draco search: timed out before any engine returned");
+                    std::process::exit(1);
+                }
+            };
+            if !outcomes
+                .iter()
+                .any(|o| matches!(o.status, search::EngineStatus::Ok(_)))
+            {
+                eprintln!("draco search: all search engines failed");
+                std::process::exit(1);
+            }
+            let merged = search::consensus(hits, limit);
+            let formats = formats_from_args(&format);
+            let mut data = Vec::with_capacity(merged.len());
+            if format.is_empty() {
+                for hit in &merged {
+                    data.push(Value::Object(search::base_item(hit)));
+                }
+            } else {
+                // The CLI has no warm pool: one-shot `extract` per result URL.
+                let scrape_config = Config {
+                    force_render: false,
+                    formats,
+                    proxy,
+                    ..Config::default()
+                };
+                for hit in &merged {
+                    let mut item = search::base_item(hit);
+                    let result = extract(&hit.url, &scrape_config).await;
+                    if result.status == Status::Success {
+                        search::merge_scrape_fields(&mut item, &result);
+                    }
+                    data.push(Value::Object(item));
+                }
+            }
+            let body = serde_json::json!({
+                "success": true,
+                "data": data,
+                "draco": { "engines": search::outcomes_json(&outcomes) },
+            });
+            let out = if pretty {
+                serde_json::to_string_pretty(&body).expect("serialize search result")
+            } else {
+                serde_json::to_string(&body).expect("serialize search result")
+            };
+            println!("{out}");
         }
         #[cfg(feature = "serve")]
         Command::Serve {
