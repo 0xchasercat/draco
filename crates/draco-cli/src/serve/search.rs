@@ -2146,3 +2146,81 @@ mod tests {
             .map(|outcome| &outcome.status)
     }
 }
+
+// Response-shaping helpers added by the REST/CLI/MCP wiring. Pure and
+// self-contained (no network, no AppState) — the handler-level 400/422
+// validation paths are covered by the router smoke tests under the daemon's
+// gate, where the compiler validates the AppState construction.
+#[cfg(test)]
+mod wiring_tests {
+    use super::*;
+
+    fn hit(title: &str, url: &str) -> SearchHit {
+        SearchHit {
+            title: title.to_string(),
+            description: "desc".to_string(),
+            url: url.to_string(),
+            engine: "brave",
+            rank: 1,
+            contributors: vec![("brave", 1)],
+        }
+    }
+
+    #[test]
+    fn base_item_is_title_description_url_only() {
+        let item = base_item(&hit("T", "https://example.com/"));
+        assert_eq!(item.len(), 3, "base item carries exactly title/description/url");
+        assert_eq!(item.get("title").and_then(|v| v.as_str()), Some("T"));
+        assert_eq!(item.get("description").and_then(|v| v.as_str()), Some("desc"));
+        assert_eq!(
+            item.get("url").and_then(|v| v.as_str()),
+            Some("https://example.com/")
+        );
+        // No scrape fields leak in when scrapeOptions wasn't requested.
+        assert!(item.get("markdown").is_none());
+        assert!(item.get("metadata").is_none());
+    }
+
+    #[test]
+    fn outcomes_json_maps_every_engine_status_variant() {
+        let outcomes = vec![
+            EngineOutcome {
+                name: "brave",
+                status: EngineStatus::Ok(5),
+            },
+            EngineOutcome {
+                name: "mojeek",
+                status: EngineStatus::Http(403),
+            },
+            EngineOutcome {
+                name: "bing",
+                status: EngineStatus::Timeout,
+            },
+            EngineOutcome {
+                name: "duckduckgo",
+                status: EngineStatus::Error("boom".to_string()),
+            },
+            EngineOutcome {
+                name: "baidu",
+                status: EngineStatus::Empty,
+            },
+        ];
+        let rows = outcomes_json(&outcomes);
+        let rows = rows.as_array().expect("engines is a JSON array");
+        assert_eq!(rows.len(), 5);
+
+        assert_eq!(rows[0]["engine"].as_str(), Some("brave"));
+        assert_eq!(rows[0]["status"].as_str(), Some("ok"));
+        assert_eq!(rows[0]["results"].as_u64(), Some(5));
+
+        assert_eq!(rows[1]["status"].as_str(), Some("http"));
+        assert_eq!(rows[1]["code"].as_u64(), Some(403));
+
+        assert_eq!(rows[2]["status"].as_str(), Some("timeout"));
+
+        assert_eq!(rows[3]["status"].as_str(), Some("error"));
+        assert_eq!(rows[3]["message"].as_str(), Some("boom"));
+
+        assert_eq!(rows[4]["status"].as_str(), Some("empty"));
+    }
+}
