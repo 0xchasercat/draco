@@ -125,6 +125,13 @@ pub struct ZapMeta;
 pub struct Yandex;
 
 /// Mojeek's server-rendered web SERP.
+///
+/// Kept implemented but intentionally OUT of [`default_engines`] — its live
+/// endpoint gates automated queries behind an Altcha challenge (HTTP 403), so it
+/// serves as the canonical failure-path fixture (exercised by the parser tests),
+/// not a default engine. `dead_code` is allowed because a bin crate does not
+/// treat test-only construction as a use.
+#[allow(dead_code)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Mojeek;
 
@@ -737,6 +744,11 @@ pub fn consensus(hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
 
 /// Fan out across all engines with default [`SessionOpts`], merge successful
 /// results, and return one diagnostic outcome per engine.
+///
+/// The non-session convenience entry; the REST/CLI/MCP adapters all use
+/// [`search_all_with_session`] to inherit Draco's proxy/robots/header posture, so
+/// this is unused in the bin build today — kept as the documented simple entry.
+#[allow(dead_code)]
 pub async fn search_all(
     params: &SearchParams,
     engines: &[Box<dyn SearchEngine + Send + Sync>],
@@ -1190,6 +1202,9 @@ fn first_attr_start(html: &str, attribute: &str, value: &str) -> Option<usize> {
     None
 }
 
+// Only reached from `Mojeek::parse`, which is test-only in the bin build (Mojeek
+// is not a default engine); allowed so the failure-path fixture keeps compiling.
+#[allow(dead_code)]
 fn first_class_start_for_tag(html: &str, tag: &str, tokens: &[&str]) -> Option<usize> {
     tag_ranges(html, tag)
         .into_iter()
@@ -1563,7 +1578,7 @@ pub(crate) async fn search_handler(
 
     let data: Vec<Value> = match (&scrape_formats, &req.scrape_options) {
         (Some(formats), Some(opts)) => {
-            scrape_results(&merged, formats.clone(), opts, &state).await
+            scrape_results(&merged, *formats, opts, &state).await
         }
         _ => merged.iter().map(|h| Value::Object(base_item(h))).collect(),
     };

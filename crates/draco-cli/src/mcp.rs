@@ -587,7 +587,7 @@ async fn call_search(
             for hit in &merged {
                 let mut item = search::base_item(hit);
                 let config = Config {
-                    formats: formats.clone(),
+                    formats,
                     ..defaults.clone()
                 };
                 let result = match pool {
