@@ -846,6 +846,9 @@ async fn run_capture_inner(
     api_fetcher: Option<Rc<dyn ApiFetcher>>,
 ) -> CaptureReport {
     let stub_body = normalize_stub_body(&cfg.stub_response_json);
+    // Phase clock: bucket runtime_ms into setup / scripts / window / serialize so
+    // `--runtime-log` shows where a heavy render spends its wall + V8-CPU time.
+    let t0 = Instant::now();
 
     // In-capture module registry + dedup cache (starts empty — no prefetch). The
     // module loader fills it on demand via `fetcher`; `<script type="module">`,
@@ -909,6 +912,8 @@ async fn run_capture_inner(
     //    is *not* fatal — later scripts and already-scheduled async work may still
     //    surface intercepts — but if it happens before anything is captured we
     //    remember it so the outcome is `Threw`.
+    let setup_ms = t0.elapsed().as_millis();
+    let t_scripts = Instant::now();
     let scripts = extract_scripts(html);
 
     // Kick off every external-script fetch CONCURRENTLY (resolved against the page
@@ -1020,12 +1025,33 @@ async fn run_capture_inner(
         "try { globalThis.__dracoFireLifecycle(); } catch (_) {}",
     );
 
+    let scripts_ms = t_scripts.elapsed().as_millis();
+
     // 3. Capture window: pump the event loop until quiescence or the hard cap.
-    let outcome = drive_capture_window(&mut runtime, &cap, cfg, threw_in_page).await;
+    let t_window = Instant::now();
+    let (outcome, window_cpu) =
+        drive_capture_window(&mut runtime, &cap, cfg, threw_in_page).await;
+    let window_ms = t_window.elapsed().as_millis();
+    let window_cpu_ms = window_cpu.as_millis();
 
     // 4. Serialize the hydrated DOM for the render-then-Markdown escalation, after
     //    the window so any content the framework mounted is present.
+    let t_serialize = Instant::now();
     serialize_dom(&mut runtime);
+    let serialize_ms = t_serialize.elapsed().as_millis();
+
+    // Phase breakdown (surfaced under `--runtime-log`): the raw material for the
+    // render-tier CPU question — how much of runtime_ms is initial script eval vs
+    // the capture window, and within the window how much is V8 executing (poll)
+    // vs idle-waiting on the network.
+    {
+        let total_ms = t0.elapsed().as_millis();
+        let idle_ms = window_ms.saturating_sub(window_cpu_ms);
+        cap.borrow_mut().push_log(&format!(
+            "[raze.phases] runtime {total_ms}ms = setup {setup_ms} + scripts {scripts_ms} \
+             + window {window_ms} (v8-cpu {window_cpu_ms} / idle {idle_ms}) + serialize {serialize_ms}"
+        ));
+    }
 
     let cs = cap.borrow();
     CaptureReport {
@@ -1089,10 +1115,15 @@ async fn drive_capture_window(
     cap: &Rc<RefCell<CaptureState>>,
     cfg: &CaptureConfig,
     threw_in_page: bool,
-) -> RuntimeOutcome {
+) -> (RuntimeOutcome, Duration) {
     let start = Instant::now();
     let hard_cap = Duration::from_millis(cfg.capture_window_ms);
     let quiesce = Duration::from_millis(cfg.quiesce_ms);
+    // Accumulated wall-time spent inside `poll_once` = time V8 was actually
+    // executing (a long synchronous JS task — hydration, a 2.5 MB JSON parse —
+    // blocks the poll for its whole duration). Its complement is idle wait between
+    // ticks. This is the CPU-bound-vs-wait-bound signal for the render tier.
+    let mut poll_busy = Duration::ZERO;
 
     // Small tick so we re-check the wall clock even while timers are pending.
     let tick = Duration::from_millis(quiesce_tick_ms(cfg.quiesce_ms));
@@ -1118,7 +1149,9 @@ async fn drive_capture_window(
 
     loop {
         // Poll one tick of the event loop with a self-contained waker.
+        let t_poll = Instant::now();
         let poll_res = poll_once(runtime);
+        poll_busy += t_poll.elapsed();
 
         match poll_res {
             Poll::Ready(Ok(())) => {
@@ -1189,14 +1222,16 @@ async fn drive_capture_window(
         let n = cs.requests.len();
         let infl = inflight.get();
         let t = cs.started.elapsed().as_millis();
+        let cpu_ms = poll_busy.as_millis();
         let line = format!(
-            "[+{t}ms] [raze.window] closed via {close_reason} (window {elapsed_ms}ms); \
-             {n} request(s) captured, {infl} load(s) inflight"
+            "[+{t}ms] [raze.window] closed via {close_reason} (window {elapsed_ms}ms, \
+             v8-cpu {cpu_ms}ms); {n} request(s) captured, {infl} load(s) inflight"
         );
         cs.push_log(&line);
     }
 
-    classify_window_close(cap, threw_in_page, loop_threw, close_reason == "hard-cap")
+    let outcome = classify_window_close(cap, threw_in_page, loop_threw, close_reason == "hard-cap");
+    (outcome, poll_busy)
 }
 
 /// Poll the deno_core event loop exactly once using a no-op-ish waker. We drive
