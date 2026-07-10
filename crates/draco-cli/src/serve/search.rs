@@ -112,6 +112,18 @@ pub struct Bing;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Brave;
 
+/// Baidu's server-rendered web SERP.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Baidu;
+
+/// ZapMeta's server-rendered metasearch SERP.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ZapMeta;
+
+/// Yandex's server-rendered web SERP.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Yandex;
+
 /// Mojeek's server-rendered web SERP.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Mojeek;
@@ -135,13 +147,19 @@ pub struct EngineOutcome {
     pub status: EngineStatus,
 }
 
-/// The four built-in v0.16.0 engines in stable diagnostic order.
+/// The six live v0.16.0 engines in stable diagnostic order.
+///
+/// [`Mojeek`] remains implemented for compatibility and failure-path tests but
+/// is excluded here: its supplied datacenter capture is a hard 403, so running
+/// it by default would add a predictably empty request rather than redundancy.
 pub fn default_engines() -> Vec<Box<dyn SearchEngine + Send + Sync>> {
     vec![
         Box::new(DuckDuckGo),
         Box::new(Bing),
         Box::new(Brave),
-        Box::new(Mojeek),
+        Box::new(Baidu),
+        Box::new(ZapMeta),
+        Box::new(Yandex),
     ]
 }
 
@@ -313,6 +331,194 @@ impl SearchEngine for Brave {
                 &["content", "desktop-default-regular", "t-primary"],
             )
             .unwrap_or_default();
+            let rank = position + 1;
+            hits.push(engine_hit(
+                self.name(),
+                rank,
+                title,
+                description,
+                url,
+            ));
+        }
+        hits
+    }
+}
+
+impl SearchEngine for Baidu {
+    fn name(&self) -> &'static str {
+        "baidu"
+    }
+
+    fn build_url(&self, params: &SearchParams) -> String {
+        match Url::parse("https://www.baidu.com/s") {
+            Ok(mut url) => {
+                url.query_pairs_mut()
+                    .append_pair("wd", &params.query)
+                    .append_pair("ie", "utf-8");
+                url.to_string()
+            }
+            Err(_) => format!(
+                "https://www.baidu.com/s?wd={}&ie=utf-8",
+                form_urlencoded::byte_serialize(params.query.as_bytes()).collect::<String>()
+            ),
+        }
+    }
+
+    fn parse(&self, html: &str, base_url: &str) -> Vec<SearchHit> {
+        // Verified against the 2026-07-10 fixture. Organic results are the nine
+        // `div.result.c-container` nodes; the tenth `c-container` is a
+        // `result-op` answer card and is intentionally excluded. Titles and
+        // Baidu redirect URLs live under `h3 > a`. All nine fixture snippets
+        // use `data-module="abstract"`; class-substring fallbacks cover Baidu's
+        // documented `content-right*` and `*abstract*` variants.
+        let starts = tag_ranges(html, "div")
+            .into_iter()
+            .filter(|(start, end)| {
+                let tag = &html[*start..*end];
+                has_class_token(tag, "result") && has_class_token(tag, "c-container")
+            })
+            .collect::<Vec<_>>();
+        let mut hits = Vec::new();
+
+        for (position, (start, _)) in starts.iter().copied().enumerate() {
+            let block_end = starts
+                .get(position + 1)
+                .map(|(next, _)| *next)
+                .unwrap_or(html.len());
+            let block = &html[start..block_end];
+            let Some((raw_href, title)) = first_anchor_in_tag(block, "h3") else {
+                continue;
+            };
+            // Baidu title URLs are intentionally retained as proxied
+            // `baidu.com/link?url=...` redirects. Resolving them requires a live
+            // follow and belongs outside this pure parser.
+            let Some(url) = absolutize_result_url(&raw_href, base_url, false) else {
+                continue;
+            };
+            let description = first_text_by_class_substring(block, "content-right")
+                .or_else(|| first_text_by_class_substring(block, "abstract"))
+                .or_else(|| first_text_by_attr(block, "data-module", "abstract"))
+                .unwrap_or_default();
+            let rank = position + 1;
+            hits.push(engine_hit(
+                self.name(),
+                rank,
+                title,
+                description,
+                url,
+            ));
+        }
+        hits
+    }
+}
+
+impl SearchEngine for ZapMeta {
+    fn name(&self) -> &'static str {
+        "zapmeta"
+    }
+
+    fn build_url(&self, params: &SearchParams) -> String {
+        build_query_url("https://www.zapmeta.com/search", &params.query)
+    }
+
+    fn parse(&self, html: &str, base_url: &str) -> Vec<SearchHit> {
+        // Verified against the 2026-07-10 fixture: exactly nine organic
+        // `<article>` results, each with a multiline-capable `h2 > a`, a `<p>`
+        // snippet, and a separate `organic-results__display-url-link`. The
+        // title link is canonical; the displayed-URL anchor is a fallback only.
+        let starts = tag_ranges(html, "article");
+        let mut hits = Vec::new();
+
+        for (position, (start, _)) in starts.iter().copied().enumerate() {
+            let block_end = starts
+                .get(position + 1)
+                .map(|(next, _)| *next)
+                .unwrap_or(html.len());
+            let block = &html[start..block_end];
+            let (title, raw_href) = match first_anchor_in_tag(block, "h2") {
+                Some((href, title)) => (Some(title), Some(href)),
+                None => (
+                    first_text_for_tag(block, "h2"),
+                    first_href_by_classes(block, &["organic-results__display-url-link"]),
+                ),
+            };
+            let (Some(title), Some(raw_href)) = (title, raw_href) else {
+                continue;
+            };
+            let Some(url) = absolutize_result_url(&raw_href, base_url, false) else {
+                continue;
+            };
+            let description = first_text_for_tag(block, "p").unwrap_or_default();
+            let rank = position + 1;
+            hits.push(engine_hit(
+                self.name(),
+                rank,
+                title,
+                description,
+                url,
+            ));
+        }
+        hits
+    }
+}
+
+impl SearchEngine for Yandex {
+    fn name(&self) -> &'static str {
+        "yandex"
+    }
+
+    fn build_url(&self, params: &SearchParams) -> String {
+        match Url::parse("https://yandex.com/search/") {
+            Ok(mut url) => {
+                url.query_pairs_mut().append_pair("text", &params.query);
+                url.to_string()
+            }
+            Err(_) => format!(
+                "https://yandex.com/search/?text={}",
+                form_urlencoded::byte_serialize(params.query.as_bytes()).collect::<String>()
+            ),
+        }
+    }
+
+    fn parse(&self, html: &str, base_url: &str) -> Vec<SearchHit> {
+        // Yandex's documented raw-HTML contract is `li.serp-item`, title under
+        // `h2 a` / `a.OrganicTitle-Link` / `a.Link`, copy under
+        // `.TextContainer` or an `OrganicText*` class, and URL paths under
+        // `.Path` / `Path-Item*`. The datacenter probe redirected to a captcha,
+        // so the successful shape is synthetic-tested rather than fixture-
+        // claimed. A challenge body contains no `serp-item` and returns empty.
+        let starts = tag_ranges(html, "li")
+            .into_iter()
+            .filter(|(start, end)| has_class_token(&html[*start..*end], "serp-item"))
+            .collect::<Vec<_>>();
+        let mut hits = Vec::new();
+
+        for (position, (start, _)) in starts.iter().copied().enumerate() {
+            let block_end = starts
+                .get(position + 1)
+                .map(|(next, _)| *next)
+                .unwrap_or(html.len());
+            let block = &html[start..block_end];
+            let title_link = first_anchor_in_tag(block, "h2")
+                .or_else(|| first_anchor(block, Some("OrganicTitle-Link")))
+                .or_else(|| first_anchor(block, Some("Link")));
+            let (title, raw_href) = match title_link {
+                Some((href, title)) => (Some(title), Some(href)),
+                None => (
+                    first_text_for_tag(block, "h2"),
+                    first_href_by_classes(block, &["Path"])
+                        .or_else(|| first_href_by_class_substring(block, "Path-Item")),
+                ),
+            };
+            let (Some(title), Some(raw_href)) = (title, raw_href) else {
+                continue;
+            };
+            let Some(url) = absolutize_result_url(&raw_href, base_url, false) else {
+                continue;
+            };
+            let description = first_text_by_classes(block, &["TextContainer"])
+                .or_else(|| first_text_by_class_substring(block, "OrganicText"))
+                .unwrap_or_default();
             let rank = position + 1;
             hits.push(engine_hit(
                 self.name(),
@@ -929,6 +1135,14 @@ fn has_class_tokens(tag: &str, tokens: &[&str]) -> bool {
     tokens.iter().all(|token| has_class_token(tag, token))
 }
 
+fn has_class_substring(tag: &str, needle: &str) -> bool {
+    attr_value(tag, "class").is_some_and(|classes| {
+        classes
+            .split_ascii_whitespace()
+            .any(|token| token.contains(needle))
+    })
+}
+
 fn first_class_start(html: &str, tokens: &[&str]) -> Option<usize> {
     let mut at = 0usize;
     while at < html.len() {
@@ -937,6 +1151,38 @@ fn first_class_start(html: &str, tokens: &[&str]) -> Option<usize> {
         let end = find_tag_end(html.as_bytes(), start + 1)? + 1;
         let raw = &html[start..end];
         if !raw.starts_with("</") && has_class_tokens(raw, tokens) {
+            return Some(start);
+        }
+        at = end;
+    }
+    None
+}
+
+fn first_class_substring_start(html: &str, needle: &str) -> Option<usize> {
+    let mut at = 0usize;
+    while at < html.len() {
+        let relative = html[at..].find('<')?;
+        let start = at + relative;
+        let end = find_tag_end(html.as_bytes(), start + 1)? + 1;
+        let raw = &html[start..end];
+        if !raw.starts_with("</") && has_class_substring(raw, needle) {
+            return Some(start);
+        }
+        at = end;
+    }
+    None
+}
+
+fn first_attr_start(html: &str, attribute: &str, value: &str) -> Option<usize> {
+    let mut at = 0usize;
+    while at < html.len() {
+        let relative = html[at..].find('<')?;
+        let start = at + relative;
+        let end = find_tag_end(html.as_bytes(), start + 1)? + 1;
+        let raw = &html[start..end];
+        if !raw.starts_with("</")
+            && attr_value(raw, attribute).is_some_and(|found| found == value)
+        {
             return Some(start);
         }
         at = end;
@@ -967,11 +1213,57 @@ fn first_text_for_tag(html: &str, tag: &str) -> Option<String> {
 
 fn first_text_by_classes(html: &str, tokens: &[&str]) -> Option<String> {
     let start = first_class_start(html, tokens)?;
+    text_at_tag_start(html, start)
+}
+
+fn first_text_by_class_substring(html: &str, needle: &str) -> Option<String> {
+    let start = first_class_substring_start(html, needle)?;
+    text_at_tag_start(html, start)
+}
+
+fn first_text_by_attr(html: &str, attribute: &str, value: &str) -> Option<String> {
+    let start = first_attr_start(html, attribute, value)?;
+    text_at_tag_start(html, start)
+}
+
+fn text_at_tag_start(html: &str, start: usize) -> Option<String> {
     let end = find_tag_end(html.as_bytes(), start + 1)? + 1;
     let tag = tag_name(&html[start..end])?;
     let inner = element_inner(html, end, tag)?;
     let text = clean_text(inner);
     (!text.is_empty()).then_some(text)
+}
+
+fn first_href_by_classes(html: &str, tokens: &[&str]) -> Option<String> {
+    for (start, end) in tag_ranges(html, "a") {
+        let raw_tag = &html[start..end];
+        if !has_class_tokens(raw_tag, tokens) {
+            continue;
+        }
+        let Some(href) = attr_value(raw_tag, "href") else {
+            continue;
+        };
+        if !href.trim().is_empty() {
+            return Some(decode_html_entities(href));
+        }
+    }
+    None
+}
+
+fn first_href_by_class_substring(html: &str, needle: &str) -> Option<String> {
+    for (start, end) in tag_ranges(html, "a") {
+        let raw_tag = &html[start..end];
+        if !has_class_substring(raw_tag, needle) {
+            continue;
+        }
+        let Some(href) = attr_value(raw_tag, "href") else {
+            continue;
+        };
+        if !href.trim().is_empty() {
+            return Some(decode_html_entities(href));
+        }
+    }
+    None
 }
 
 fn first_anchor_in_tag(html: &str, tag: &str) -> Option<(String, String)> {
@@ -1114,6 +1406,8 @@ mod tests {
     const BING_FIXTURE: &str = include_str!("../../tests/fixtures/search/bing.html");
     const DDG_FIXTURE: &str = include_str!("../../tests/fixtures/search/ddg.html");
     const MOJEEK_FIXTURE: &str = include_str!("../../tests/fixtures/search/mojeek.html");
+    const BAIDU_FIXTURE: &str = include_str!("../../tests/fixtures/search/baidu.html");
+    const ZAPMETA_FIXTURE: &str = include_str!("../../tests/fixtures/search/zapmeta.html");
 
     #[test]
     fn brave_fixture_yields_well_formed_web_hits() {
@@ -1129,6 +1423,104 @@ mod tests {
             hits.first().map(|hit| hit.url.as_str()),
             Some("https://www.scrapingbee.com/blog/web-scraping-rust/")
         );
+    }
+
+    #[test]
+    fn default_engine_set_uses_six_live_adapters_and_excludes_mojeek() {
+        let engines = default_engines();
+        let names = engines.iter().map(|engine| engine.name()).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "duckduckgo",
+                "bing",
+                "brave",
+                "baidu",
+                "zapmeta",
+                "yandex",
+            ]
+        );
+    }
+
+    #[test]
+    fn baidu_fixture_yields_organic_hits_with_proxied_urls() {
+        let hits = Baidu.parse(BAIDU_FIXTURE, "https://www.baidu.com/s?wd=test");
+        assert_eq!(
+            hits.len(),
+            9,
+            "fixture has nine div.result.c-container organic nodes"
+        );
+        assert!(hits.iter().all(|hit| {
+            !hit.title.trim().is_empty()
+                && !hit.description.trim().is_empty()
+                && hit.url.starts_with("http://www.baidu.com/link?url=")
+                && hit.engine == "baidu"
+                && hit.rank > 0
+        }));
+    }
+
+    #[test]
+    fn zapmeta_fixture_yields_all_nine_articles() {
+        let hits = ZapMeta.parse(ZAPMETA_FIXTURE, "https://www.zapmeta.com/search?q=test");
+        assert_eq!(hits.len(), 9);
+        assert!(hits.iter().all(|hit| {
+            !hit.title.trim().is_empty()
+                && !hit.description.trim().is_empty()
+                && Url::parse(&hit.url).is_ok()
+                && hit.engine == "zapmeta"
+                && hit.rank > 0
+        }));
+        assert_eq!(
+            hits.first().map(|hit| hit.url.as_str()),
+            Some("https://music.saconnects.org/star-search-2024-test-pieces/")
+        );
+    }
+
+    #[test]
+    fn yandex_challenge_body_is_empty_without_panicking() {
+        let challenge = r#"
+            <html><body><form action="/checkcaptcha">
+              <h1>Captcha</h1>
+            </form></body></html>
+        "#;
+        assert!(Yandex
+            .parse(challenge, "https://yandex.com/showcaptcha")
+            .is_empty());
+    }
+
+    #[test]
+    fn yandex_documented_markup_parses_synthetically() {
+        let html = r#"
+            <ol>
+              <li class="serp-item">
+                <h2>
+                  <a class="OrganicTitle-Link Link" href="https://example.com/one">
+                    Multiline <span>organic title</span>
+                  </a>
+                </h2>
+                <div class="TextContainer">First <b>Yandex</b> snippet.</div>
+                <a class="Path"><span class="Path-Item">example.com</span></a>
+              </li>
+              <li class="serp-item">
+                <a class="OrganicTitle-Link" href="/two">Fallback title</a>
+                <div class="OrganicText OrganicText-Vanilla">Second snippet.</div>
+              </li>
+            </ol>
+        "#;
+        let hits = Yandex.parse(html, "https://yandex.com/search/?text=test");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "Multiline organic title");
+        assert_eq!(hits[0].description, "First Yandex snippet.");
+        assert_eq!(hits[1].url, "https://yandex.com/two");
+        assert_eq!(hits[1].description, "Second snippet.");
+    }
+
+    #[test]
+    #[ignore = "no successful Yandex fixture: datacenter request redirected to captcha"]
+    fn yandex_positive_fixture_when_captured() {
+        let captured_html = std::env::var("DRACO_YANDEX_SERP_FIXTURE").unwrap_or_default();
+        let hits = Yandex.parse(&captured_html, "https://yandex.com/search/?text=test");
+        assert!(!hits.is_empty());
     }
 
     #[test]
@@ -1216,6 +1608,13 @@ mod tests {
         );
         assert!(Bing.build_url(&params).contains("q=rust+web+scraper"));
         assert!(Brave.build_url(&params).contains("q=rust+web+scraper"));
+        assert!(Baidu
+            .build_url(&params)
+            .contains("wd=rust+web+scraper&ie=utf-8"));
+        assert!(ZapMeta.build_url(&params).contains("q=rust+web+scraper"));
+        assert!(Yandex
+            .build_url(&params)
+            .contains("text=rust+web+scraper"));
         assert!(Mojeek.build_url(&params).contains("q=rust+web+scraper"));
     }
 
