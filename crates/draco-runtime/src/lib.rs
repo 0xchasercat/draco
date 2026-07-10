@@ -1578,10 +1578,20 @@ fn json_string_literal(s: &str) -> String {
     serde_json::Value::String(s.to_string()).to_string()
 }
 
-/// Pick a polling tick: fine enough to honor `quiesce_ms` without busy-spinning.
+/// Pick a polling tick for the capture loop's `Pending` sleep.
+///
+/// This bounds how long after an async op completes (a chunk/module `import()` or a
+/// data fetch landing) we take to poll again and run the JS it unblocks. With the
+/// no-op waker we drive timing ourselves, so this tick *is* the op-completion
+/// latency — and phase timing shows the render window is ~60% idle (network-bound),
+/// not CPU-bound, with that latency compounding across a page's sequential fetch
+/// chain. The old `quiesce_ms/4` gave a 50 ms tick for the render window (500 ms
+/// quiesce) — up to 50 ms of dead air after every fetch. A small fixed-ceiling tick
+/// reclaims most of it: idle polls are cheap (`poll_event_loop` returns fast when
+/// nothing is ready), so this is not a busy-spin, and the `>= 3 ms` floor keeps a
+/// pathological page from pegging a core. Quiesce is still honored to within a tick.
 fn quiesce_tick_ms(quiesce_ms: u64) -> u64 {
-    // ~1/4 of quiesce, clamped to [5, 50] ms.
-    (quiesce_ms / 4).clamp(5, 50)
+    (quiesce_ms / 50).clamp(3, 10)
 }
 
 #[cfg(test)]
@@ -1982,9 +1992,12 @@ mod tests {
 
     #[test]
     fn quiesce_tick_is_clamped() {
-        assert_eq!(quiesce_tick_ms(0), 5);
-        assert_eq!(quiesce_tick_ms(40), 10);
-        assert_eq!(quiesce_tick_ms(10_000), 50);
+        // Small, fixed-ceiling tick so op-completion latency stays low (the render
+        // window is network-bound, ~60% idle). Floored at 3 ms, ceilinged at 10 ms.
+        assert_eq!(quiesce_tick_ms(0), 3); // floor
+        assert_eq!(quiesce_tick_ms(300), 6); // default quiesce
+        assert_eq!(quiesce_tick_ms(500), 10); // render quiesce (was 50 ms)
+        assert_eq!(quiesce_tick_ms(10_000), 10); // ceiling
     }
 
     #[test]
