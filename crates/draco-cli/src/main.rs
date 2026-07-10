@@ -74,6 +74,22 @@ enum FormatArg {
     Both,
 }
 
+/// Optional final snapshot emitted when an interact command exits.
+#[cfg(feature = "tier2")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lower")]
+enum InteractFormatArg {
+    /// Current DOM converted to clean Markdown + metadata.
+    Markdown,
+    /// Current DOM cleaned and absolutized as main-content HTML.
+    Html,
+    /// Current serialized DOM without content cleaning.
+    #[value(name = "raw-html", alias = "rawhtml")]
+    RawHtml,
+    /// Every absolutized link in the current DOM.
+    Links,
+}
+
 /// Fold repeated `--format` values into a [`FormatSet`].
 ///
 /// An empty slice (the flag was never given) means "use the default",
@@ -249,6 +265,27 @@ enum Command {
         #[arg(long)]
         runtime_log: bool,
         /// Pretty-print the JSON envelope.
+        #[arg(long)]
+        pretty: bool,
+    },
+    /// Open a resumable DOM session and run JavaScript in page scope.
+    #[cfg(feature = "tier2")]
+    Interact {
+        /// Initial document URL.
+        url: String,
+        /// Run one JavaScript turn and exit instead of starting the line REPL.
+        #[arg(long = "exec")]
+        exec_js: Option<String>,
+        /// Emit one final serialized-DOM snapshot when the command exits.
+        #[arg(long, value_enum)]
+        format: Option<InteractFormatArg>,
+        /// http/https/socks5 proxy URL.
+        #[arg(long)]
+        proxy: Option<String>,
+        /// Total request timeout (ms).
+        #[arg(long, default_value_t = 30_000)]
+        timeout: u64,
+        /// Pretty-print JSON turn and snapshot envelopes.
         #[arg(long)]
         pretty: bool,
     },
@@ -483,6 +520,54 @@ fn render(result: &ExtractionResult, pretty: bool) -> String {
     }
 }
 
+#[cfg(feature = "tier2")]
+fn render_value(value: &Value, pretty: bool) -> String {
+    if pretty {
+        serde_json::to_string_pretty(value).expect("serialize interact result")
+    } else {
+        serde_json::to_string(value).expect("serialize interact result")
+    }
+}
+
+#[cfg(feature = "tier2")]
+fn exec_report_value(report: draco_core::ExecReport) -> Value {
+    serde_json::json!({
+        "success": report.ok,
+        "result": report.result,
+        "logs": report.logs,
+        "error": report.error,
+    })
+}
+
+#[cfg(feature = "tier2")]
+async fn interact_snapshot(
+    session: &draco_core::Session,
+    url: &str,
+    format: InteractFormatArg,
+) -> Result<ExtractionResult, String> {
+    let html = session
+        .serialize()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "session produced no DOM".to_string())?;
+    let formats = match format {
+        InteractFormatArg::Markdown => FormatSet::markdown_only(),
+        InteractFormatArg::Html => FormatSet {
+            html: true,
+            ..FormatSet::none()
+        },
+        InteractFormatArg::RawHtml => FormatSet {
+            raw_html: true,
+            ..FormatSet::none()
+        },
+        InteractFormatArg::Links => FormatSet {
+            links: true,
+            ..FormatSet::none()
+        },
+    };
+    Ok(draco_core::scrape_interact_html(url, &html, formats, true))
+}
+
 /// Decide what to print to stdout, and return it **with a trailing newline**.
 ///
 /// * A markdown-only [`FormatSet`] (the default) prints the raw `markdown`
@@ -625,6 +710,99 @@ async fn async_main() {
             let result = extract(&url, &config).await;
             println!("{}", render(&result, pretty));
             std::process::exit(status_to_exit_code(result.status));
+        }
+        #[cfg(feature = "tier2")]
+        Command::Interact {
+            url,
+            exec_js,
+            format,
+            proxy,
+            timeout,
+            pretty,
+        } => {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+
+            let config = Config {
+                formats: FormatSet::markdown_only(),
+                proxy,
+                timeout_ms: timeout,
+                force_render: false,
+                ..Config::default()
+            };
+            let session = match draco_core::open_interact_session(&url, &config).await {
+                Ok(session) => session,
+                Err(error) => {
+                    eprintln!("draco interact: {error:?}");
+                    std::process::exit(1);
+                }
+            };
+
+            let mut exit_code = 0;
+            if let Some(js) = exec_js {
+                match session.exec(js, draco_core::ExecOptions::default()).await {
+                    Ok(report) => {
+                        if !report.ok {
+                            exit_code = 1;
+                        }
+                        println!("{}", render_value(&exec_report_value(report), pretty));
+                    }
+                    Err(error) => {
+                        eprintln!("draco interact: {error}");
+                        exit_code = 1;
+                    }
+                }
+            } else {
+                eprintln!("draco interact: enter JavaScript; :quit or EOF closes the session");
+                let mut lines = BufReader::new(tokio::io::stdin()).lines();
+                loop {
+                    let line = match lines.next_line().await {
+                        Ok(Some(line)) => line,
+                        Ok(None) => break,
+                        Err(error) => {
+                            eprintln!("draco interact: stdin read: {error}");
+                            exit_code = 1;
+                            break;
+                        }
+                    };
+                    let js = line.trim();
+                    if matches!(js, ":quit" | ":exit") {
+                        break;
+                    }
+                    if js.is_empty() {
+                        continue;
+                    }
+                    match session
+                        .exec(js.to_string(), draco_core::ExecOptions::default())
+                        .await
+                    {
+                        Ok(report) => {
+                            println!("{}", render_value(&exec_report_value(report), pretty));
+                        }
+                        Err(error) => {
+                            eprintln!("draco interact: {error}");
+                            exit_code = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some(format) = format {
+                match interact_snapshot(&session, &url, format).await {
+                    Ok(result) => println!("{}", render(&result, pretty)),
+                    Err(error) => {
+                        eprintln!("draco interact: snapshot: {error}");
+                        exit_code = 1;
+                    }
+                }
+            }
+            if let Err(error) = session.close().await {
+                eprintln!("draco interact: close: {error}");
+                exit_code = 1;
+            }
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
         }
         #[cfg(feature = "serve")]
         Command::Map {
@@ -1279,6 +1457,37 @@ mod tests {
                 assert!(pretty);
             }
             _ => panic!("expected Command::Discover"),
+        }
+    }
+
+    #[cfg(feature = "tier2")]
+    #[test]
+    fn interact_command_parses_one_shot_and_snapshot_flags() {
+        let cli = Cli::try_parse_from([
+            "draco",
+            "interact",
+            "https://example.com",
+            "--exec",
+            "return document.title",
+            "--format",
+            "raw-html",
+            "--pretty",
+        ])
+        .expect("interact should parse");
+        match cli.command {
+            Command::Interact {
+                url,
+                exec_js,
+                format,
+                pretty,
+                ..
+            } => {
+                assert_eq!(url, "https://example.com");
+                assert_eq!(exec_js.as_deref(), Some("return document.title"));
+                assert_eq!(format, Some(InteractFormatArg::RawHtml));
+                assert!(pretty);
+            }
+            _ => panic!("expected Command::Interact"),
         }
     }
 
