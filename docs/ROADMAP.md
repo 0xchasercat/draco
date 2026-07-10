@@ -1,18 +1,18 @@
 # Draco Roadmap — current handoff
 
-Status as of **v0.13.6** (2026-07-06). This is the canonical takeover document for the next agent. It supersedes older v0.10-era roadmap notes and matches the repository state on `main` at tag `v0.13.6`.
+Status as of **v0.15.0** (2026-07-10). This is the canonical takeover document for the next agent. It supersedes older roadmap notes and matches the repository state on `main` at tag `v0.15.0`.
 
 Draco is a fast, stealth, native-Rust web scraper positioned as a lighter DOM-only alternative to Firecrawl / Browserbase. It is not a browser and must never fake browser-only outputs such as screenshots or actions.
 
 ## Ground rules for the next agent
 
 - Verify claims against the actual source and `docs/firecrawl-api-reference.md` before asserting Firecrawl parity.
-- Keep one clean code path. When replacing a design, delete the obsolete path rather than preserving legacy aliases or parallel implementations.
+- Keep one clean code path. When replacing a design, delete the obsolete path rather than preserving legacy aliases or parallel implementations. (This is how the OS jail went in v0.14 — amputated, not band-aided.)
 - Unknown/unrecognized request fields stay **accept-and-ignore** for drop-in friendliness; do not switch to Firecrawl's strict-Zod 400 behavior unless explicitly requested.
 - CLI verbs mirror REST: `scrape`, `discover`, `map`, then later `crawl`, `batch`, `search`. Do not resurrect the removed `extract` alias.
 - Draco is DOM-only. `screenshot`, `screenshot@fullPage`, `actions`, and other browser-only formats return explicit **422 needs-browser**, never fake payloads.
 - For substantial work: critique the plan first, record the agreed architecture here or in a companion design doc, implement on a feature branch, run fmt/check/build/test/clippy, commit, merge, tag, push, and scrub any temporary Git credentials.
-- The Linux jail cannot be fully red-team validated in the sandbox. Sandbox kernel/userns/Landlock constraints differ from bare metal; local gates still matter, but seccomp/Landlock runtime enforcement should be treated with evidence.
+- **Tier 2 containment is the in-process V8 isolate itself** (no host-capability bindings), plus the hosted-cloud infrastructure perimeter. There is no OS process jail to red-team any more; do not reintroduce one. Page JS cannot perform I/O regardless of platform — the only I/O it can cause is the fetches the engine explicitly brokers (script subresources always; data requests only in Render mode, under the mutation-safety policy).
 
 ## Shipped state by release
 
@@ -36,106 +36,64 @@ Draco is a fast, stealth, native-Rust web scraper positioned as a lighter DOM-on
 - Cookie isolation is preserved with a fresh per-call cookie jar attached to each request.
 - This fixed the prior fresh-client-per-fetch behavior and restored keep-alive / HTTP-2 pooling.
 
-### v0.9.0 — warm Tier 2 isolate pool for daemon
+### v0.9.0 – v0.12.1 — API surface build-out
 
-- The jailed child loops over multiple hydrate jobs until shutdown.
-- `Tier2Pool` reuses the worker process and sandbox, but creates a fresh snapshot-restored V8 isolate per scrape.
-- Daemon routes `/v1/scrape`, `/v1/crawl`, and `/mcp` through the pool.
-- CLI and stdio MCP remain one-shot.
-
-### v0.10.0 — API discovery/replay
-
-- `--format endpoints`, `POST /v1/discover`, and MCP `draco_discover` expose ranked API endpoint discovery.
-- `DiscoveredEndpoint` includes `method`, `url`, `via`, `score`, `replayable`, and `headers`.
-- `ExtractionResult.endpoints` and `Config.discover_endpoints` were added.
-- Discovery runs after Markdown/render consideration and before Tier 0 JSON fallback when requested.
-
-### v0.11.0 — API alignment and format surface
-
-- Replaced the old coarse `OutputFormat` with `FormatSet` for `{ markdown, html, rawHtml, links, json, endpoints }`.
-- `ExtractionResult` gained `html`, `rawHtml`, and `links`.
-- CLI renamed `extract` to `scrape`; the old verb was removed, not aliased.
-- CLI added `discover` and `map` verbs.
-- `--format` became repeatable and accepts both wire casing and kebab casing, including `rawHtml` / `raw-html`.
-- `onlyMainContent` and `waitFor` are honored.
-- Crawl `includePaths` / `excludePaths` now use regex semantics against URL pathname, with `regexOnFullURL` for full URL matching.
-- Map gained robots.txt `Sitemap:` discovery, `ignoreSitemap`, `sitemapOnly`, default `includeSubdomains: true`, and higher limit cap.
-- Browser-only formats return clear 422 needs-browser responses.
-- `docs/firecrawl-api-reference.md` was vendored as the parity reference.
-
-### v0.11.1 — field honoring
-
-- `includeTags` and `excludeTags` are honored on scrape surfaces and crawl `scrapeOptions`.
-- Custom `headers` are forwarded to outbound fetches, retries, and robots probes.
-- This completed the planned v0.11 request-field parity slice.
-
-### v0.12.0 — batch scrape and shared async job store
-
-- `POST /v1/batch/scrape` runs a list of URLs as one async job.
-- Batch scrape options are **flat at top level**, not nested under `scrapeOptions`.
-- `ignoreInvalidURLs` drops invalid non-http(s) URLs into `invalidURLs`.
-- Crawl and batch share `serve::jobs::JobStore`.
-- Status endpoints support pagination via `?skip=&limit=`, `next`, 10 MiB page cap, `creditsUsed`, and advisory `expiresAt`.
-- Crawl gained `GET /v1/crawl/{id}/errors`; batch has `GET /v1/batch/scrape/{id}/errors`.
-- Per-page failures are recorded.
-
-### v0.12.1 — robotsBlocked parity fix
-
-- `robotsBlocked` is now populated for crawl and batch `/errors` endpoints.
-- `draco-net` signals robots denial as `NetKind::Robots` instead of folding it into ordinary status failures.
-- Crawl and batch route robots-denied URLs to `robotsBlocked`, not `errors`.
+- **v0.9.0**: warm Tier 2 pool for the daemon (later superseded by the in-process engine in v0.14).
+- **v0.10.0**: API discovery/replay — `--format endpoints`, `POST /v1/discover`, MCP `draco_discover`; ranked `DiscoveredEndpoint` catalog.
+- **v0.11.0**: `FormatSet` (`markdown/html/rawHtml/links/json/endpoints`) replacing the coarse output enum; `extract`→`scrape` rename; repeatable `--format`; `onlyMainContent`/`waitFor` honored; map robots `Sitemap:` discovery.
+- **v0.11.1**: `includeTags`/`excludeTags` + custom `headers` honored across scrape/crawl surfaces.
+- **v0.12.0**: `POST /v1/batch/scrape` + shared async `JobStore`; paginated status; per-page errors.
+- **v0.12.1**: `robotsBlocked` parity (robots denial is its own `NetKind::Robots`, routed to `robotsBlocked` not `errors`).
 
 ### v0.13.0 — webhooks
 
-- Crawl and batch scrape requests accept `webhook` as either a bare URL string or `{ url, headers, metadata, events }`.
-- Four lifecycle events are supported: `started`, `page`, `completed`, `failed`.
-- The `events` filter uses bare names; emitted payload `type` is prefixed by job kind, e.g. `crawl.page`, `batch_scrape.completed`.
-- Payload shape is `{ success, type, id, data, metadata }`.
-- Delivery is fire-and-forget via `draco_net::replay`, with 10s deadline and retries at +1, +5, +15 minutes.
-- Webhook endpoints are never robots-gated.
-- v0.13.0 is **not** search. Search was resequenced to v0.14.0.
+- Crawl and batch scrape requests accept `webhook` as either a bare URL string or `{ url, headers, metadata, events }`; lifecycle events `started`/`page`/`completed`/`failed`; payload `{ success, type, id, data, metadata }`; fire-and-forget delivery with retries; never robots-gated.
 
-### v0.13.1 — discover/runtime patch
+### v0.13.1 – v0.13.13 — Tier 2 hydration hardening (the SPA saga)
 
-- Fixed Linux hardened jail failures where `draco discover` died before returning a result.
-- Default seccomp denylist now allows `clone3` because modern libc may use it for ordinary thread creation. `execve` / `execveat` remain killed, so a cloned task cannot become a new program image.
-- Jailed child `RLIMIT_AS` was raised to 64 GiB to permit current deno_core/V8 Oilpan virtual cage reservations. RSS remains small; this is a virtual address-space cap, not a resident-memory target.
-- The W^X `mprotect(PROT_EXEC)` guard remains in place.
-- Fixed classic inline SvelteKit/Vite boot scripts by executing inline classic scripts under an absolute page-derived synthetic script URL instead of non-base `draco:page[i]`. This fixes relative dynamic imports such as `import("./_app/...")`.
-- Module graph prefetching now seeds from `<script src>`, `<link rel="modulepreload">`, `<link rel="preload" as="script">`, and inline-script string-literal imports.
-- Local Chaser/SvelteKit-shaped fixtures validated hardened discover capture. Full gates were green: 344 tests, 0 failed.
+A long run of fixes making the (then jailed, jitless) Tier 2 isolate hydrate real code-split SPAs: absolute synthetic script URLs for inline SvelteKit/Vite boot; webpack/Next dynamic-chunk execution + supervisor-mediated on-demand chunk loading; a Performance API shim; wall-time budgets + `--runtime-log` diagnostics (v0.13.6); frame-identity unification (`window===self===globalThis===top`); honest ESM loading + backfilled DOM element constructors; critical-path prefetch prioritization; `EventSource`/`WebSocket`/SSE no longer aborting hydration and no longer blind-replayed (streaming endpoints); and cross-operation cookie persistence (v0.13.13). All within the OS-jail architecture that v0.14 then replaced.
 
-### v0.13.2 – v0.13.5 — Next.js/webpack dynamic-chunk saga (bluff.com)
+### v0.13.14 — concurrent on-demand chunk prewarmer
 
-- **v0.13.2**: the air-gapped isolate now *executes* dynamically appended `<script src>` chunks itself (glue hooks `appendChild`/`insertBefore`/`append`; `op_raze_resource` exposes the prefetched resource map) instead of firing a false `ChunkLoadError`. Prefetch follows webpack/Next chunk-loader references inside fetched bundles.
-- **v0.13.3**: broadened chunk prefetch to split id→basename / id→hash webpack maps (hash threshold ≥ 12 hex).
-- **v0.13.4**: replaced static-prefetch-only chunks with a **supervisor-mediated dynamic script loader** — `op_raze_load_script` rides new `LoadScript`/`Script` IPC frames; the supervisor fetches via draco-net; the isolate still never touches the network. Capture window clamped to 2 500 ms supervisor-side.
-- **v0.13.5**: browser-ish Performance API shim (no-op `getEntriesByType`/`mark`/`measure`/…, `PerformanceObserver` class) so telemetry/web-vitals chunks (e.g. Sentry) stop aborting hydration.
+- A per-job prewarmer fetched a requested chunk's dependency closure concurrently in the background, hiding the jail's per-chunk IPC latency. Superseded weeks later by v0.14's in-process async loader (the prewarmer and its import-graph machinery were deleted).
 
-### v0.13.6 — Tier 2 wall-time budgets + runtime diagnostics
+### v0.13.15 — JIT enabled
 
-- **Why**: on live code-split sites the 2 500 ms capture clamp did not bound wall time — `prefetch_scripts` fetched up to 64 chunk candidates *sequentially* (30 s session timeout each) inside the `runtime.capture` step, and synchronous `LoadScript` services could not be preempted mid-JS-turn (observed: 24.7 s `runtime_ms` on bluff.com from macOS).
-- Prefetch is now a **wave-parallel BFS** (8 concurrent over the borrowed fetcher) with a 5 s wall budget and a 2.5 s per-subresource timeout clamp (politeness delay dropped for subresources). Recorded as its own `runtime.prefetch` trace step, so `runtime.capture` times the capture alone.
-- `LoadScript` servicing has a 4 s per-job wall budget (past it the supervisor answers `ok: false` immediately) and the same per-fetch clamp.
-- A markdown-only scrape that produced **empty** markdown (empty client-rendered shell) now prints the JSON envelope instead of a single blank line.
-- **`--runtime-log`** (CLI scrape+discover) / **`runtimeLog`** (daemon, MCP): surfaces the isolate's page-side diagnostics — glue-swallowed exceptions/rejections, `console.error`/`console.warn`, page-script throws — as `runtime.log` trace steps. New `op_raze_log`; lines are count/length-bounded child-side and ride as `Error`-level `Log` frames before the terminal `Result`. This is the tool for diagnosing *why* a page hydrates to 0 endpoints.
-- Fixture-verified (42-chunk delayed SPA + 8 s hung chunk, hardened jail): `runtime_ms` 16 680 → 3 878 ms; endpoint discovery intact.
-- Known follow-up: `cargo test --no-default-features` has pre-existing failures (tier2-gated helpers referenced by ungated tests) — the lean gate is build-only today.
+- Dropped `--jitless`; lifted the jail's W^X `mprotect` guard so JIT could map code. SPA hydration had been 3–10× too slow jitless, blowing the chunk budget. (The jail itself went one release later.)
+
+### v0.14.0 — in-process async engine (the jail is deleted)
+
+- **Amputate, don't band-aid.** The OS process jail (fork/exec + userns/netns air-gap + seccomp + Landlock + per-chunk blocking IPC) was the root cause of Tier 2's serialized, budget-strangled chunk loading. It is **gone entirely** — the `draco-jail` crate (9 files), `prewarm.rs`, and the prefetch/import-graph machinery were removed.
+- V8 now runs **in-process** on a current-thread tokio runtime behind an async `ScriptFetcher` seam: `op_raze_load_script` is a real async op and the module loader awaits the fetcher, so `import()`/chunk loads fan out **concurrently** on the event loop like a browser's network stack. Initial external `<script src>` fetched concurrently, executed in document order; an in-flight-load counter keeps the capture window from quiescing mid-load.
+- Containment is the isolate itself (no host-capability bindings) plus the infrastructure perimeter. `--no-jail`/`--strict-sandbox` remain as inert CLI no-ops. `Tier2Pool` is now a semaphore bounding concurrent isolates.
+- **Process-global immutable chunk cache**: 512 MiB RAM LRU + 2 GiB disk (`~/.cache/draco/chunks`), collision-safe, never worse than a miss; hashed SPA chunks fetched once across scrapes. Data responses are never cached.
+
+### v0.15.0 — Tier 2 Render mode (pure-CSR SPAs render their content)
+
+- **Render mode.** Pure-CSR SPAs paint only after client-side data fetches resolve; Tier 2 stubbed those (right for `discover`, fast for SSR/hybrid), so `scrape` got an empty DOM. The isolate now has two fetch modes: **Observe** (unchanged — record + synthetic stub; used by `discover` and the JSON tier) and **Render** — the page's *safe* data requests (`GET`/`HEAD`, read-style `POST`/`PUT`) are fetched **live** through `draco_net::replay` (pooled client + shared cookie jar) and the page sees the real status/headers/body incl. non-2xx. Mutation-safety reused verbatim from ranking; streaming/analytics never live; `--allow-unsafe-replay` honored. The existing thin/skeleton-shell escalation triggers Render automatically (hidden `--force-render`). Measured: thrill.com 478-char footer → full 42,823-char lobby.
+- **Five hydration fixes** that Render mode surfaced: `document.currentScript` points at the real parsed node (SvelteKit mount target, #14); completion-biased Web Animations shim (Svelte 5 transitions); injected `<script type="module">` routed through `import()`; completion-biased IntersectionObserver/ResizeObserver (lazy-load sections); document lifecycle dispatch (`readystatechange`/`DOMContentLoaded`/`load` + `readyState` shadowing).
+- **Render observability** (`--runtime-log`): `[raze.fetch]`/`[raze.chunk]`/`[raze.module]`/`[raze.window]` diagnostics stamped `[+ms]` from capture start; log budget 32→96, deduped.
+- **Mode-aware capture window**: Observe keeps the tight ~2.5 s cap; Render gets an 8 s floor / 15 s ceiling (a ceiling, not a wait — quiesce ends it early).
+- **Content-activity quiesce**: an `is_tracker()` denylist (analytics/session-replay/ad/bot-detection vendors) means trackers are recorded + fetched live but don't hold the capture window open. Every render closes at [last content fetch + quiesce]. Measured: target.com render tier 3999 ms → 2348 ms (−41%), identical content; thrill (real data dependency) unaffected.
+- **`discover` replayable-flag alignment** (one eligibility rule feeds catalog + replay) and **stdout JSON cleanliness** (timer/MessagePort errors → `runtime.log`, never stdout).
 
 ## Current capability matrix
 
-- Scrape: shipped.
+- Scrape (Markdown + render-then-Markdown for CSR SPAs): shipped.
 - Map: shipped.
 - Crawl: shipped.
 - Batch scrape: shipped.
 - MCP: scrape and discover shipped; map/batch/search MCP riders remain to add as needed.
 - API discovery: shipped and patched.
 - Webhooks: shipped.
-- Search: **not shipped**. This is the next major feature, now planned as v0.14.0.
+- Tier 2 render mode: shipped (v0.15.0).
+- Search: **not shipped**. This remains the next major net-new feature (planned below as v0.16.0).
 
-## Next major release: v0.14.0 — search / metasearch
+## Next major release: v0.16.0 — search / metasearch
 
-Search is the remaining net-new engine. The goal is Firecrawl-compatible search through Draco's own stealth HTTP stack, not an external search API dependency.
+Search is the remaining net-new engine, and it is the recommended next major feature now that the Tier 2 engine is solid. The goal is Firecrawl-compatible search through Draco's own stealth HTTP stack, not an external search API dependency.
+
+(Note: this plan was originally drafted as "v0.14.0" in the older roadmap; v0.14/v0.15 were instead spent on the in-process engine rewrite and Render mode, so search is renumbered to v0.16.0. The design below is unchanged and still current.)
 
 ### Product contract
 
@@ -218,14 +176,14 @@ Use a SearXNG-like simple reciprocal-rank consensus:
 - Sort by score descending, then by best rank, then deterministic URL/title tie-breakers.
 - Apply `limit` after consensus.
 
-Do not over-engineer ranking in v0.14.0. The key property is fault tolerance with understandable behavior.
+Do not over-engineer ranking in v0.16.0. The key property is fault tolerance with understandable behavior.
 
 ### Scrape integration
 
 If `scrapeOptions.formats` is present and non-empty:
 
 - For each selected result URL, call the existing scrape ladder with a `Config` derived from `scrapeOptions`.
-- Reuse v0.11+ `FormatSet`; do not create a parallel output enum.
+- Reuse `FormatSet`; do not create a parallel output enum.
 - Respect `onlyMainContent`, `includeTags`, `excludeTags`, `headers`, `waitFor`, `timeout`, and the DOM-only 422 behavior already implemented for scrape.
 - Bound concurrency so search+scrape cannot explode work. Use the daemon gate or a local bounded `JoinSet`.
 - Partial scrape failures should not necessarily fail the entire search; include the SERP hit and omit scrape fields or include a Draco extension error, depending on Firecrawl reference and existing response conventions.
@@ -254,79 +212,36 @@ Add:
 
 ### MCP rider
 
-After REST/CLI search is stable, add `draco_search` to MCP with a schema mirroring `POST /v1/search`.
+After REST/CLI search is stable, add `draco_search` to MCP with a schema mirroring `POST /v1/search`. Do this as a rider, not as a standalone architecture fork.
 
-Do this as a rider, not as a standalone architecture fork.
+### Tests to add
 
-### Tests to add for v0.14.0
+Unit tests: engine parser fixtures per engine; URL canonicalization + duplicate merge; consensus scoring with partial engine failure; limit default/max; request validation; `scrapeOptions`→`Config` mapping.
 
-Unit tests:
+Integration-ish tests: mock/fake engines with overlapping results; REST `POST /v1/search` happy path; CLI `draco search` output shape; search with scrape formats using local fixture pages; partial engine failure still returns consensus results.
 
-- Engine parser fixtures for each initial engine.
-- URL canonicalization and duplicate merge.
-- Consensus scoring with partial engine failure.
-- Limit default and max behavior.
-- Request validation.
-- `scrapeOptions` to `Config` mapping.
+Gates before ship: `cargo fmt --all -- --check`, `cargo check --no-default-features`, `cargo build --workspace`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`.
 
-Integration-ish tests:
+### Implementation slices
 
-- Mock/fake engines returning overlapping results.
-- REST `POST /v1/search` happy path.
-- CLI `draco search` output shape.
-- Search with scrape formats using local fixture pages.
-- Partial engine failure still returns consensus results.
+1. **Design confirmation** — re-read the search section of `docs/firecrawl-api-reference.md`; confirm response shape + scrapeOptions behavior; record any intentional divergence here before coding.
+2. **Core search types + consensus** — internal `SearchHit`, normalized URL key, consensus scorer, tests. No network yet.
+3. **Engine trait + first parser fixtures** — DuckDuckGo HTML first; saved fixture tests; Bing/Brave/Mojeek after the trait is stable.
+4. **draco-net fan-out** — `JoinSet` concurrent fetch; tolerate per-engine network/parser errors; diagnostics in Draco extension data if appropriate.
+5. **REST endpoint** — `POST /v1/search` parsing, validation, timeout handling, serialization.
+6. **ScrapeOptions integration** — convert to `Config`/`FormatSet`; bound scrape concurrency; local-page tests.
+7. **CLI** — `draco search` matching REST options; consistent JSON output shape.
+8. **MCP rider** — `draco_search` after REST/CLI are green.
+9. **Docs, changelog, version, ship** — README usage; CHANGELOG v0.16.0; bump version; full gates; feature branch → merge → tag → push.
 
-Gates before ship:
+## Performance backlog (post-v0.15.0)
 
-- `cargo fmt --all -- --check`
-- `cargo check --no-default-features`
-- `cargo build --workspace`
-- `cargo test --workspace`
-- `cargo clippy --workspace --all-targets -- -D warnings`
+The Tier 2 render tier is now correct and its window management is deterministic (every render closes at [last content fetch + quiesce]). The remaining cost is dominated by **CPU-bound hydration** — heavy SPAs peg ~80% of one core running the app's own JS. Candidate work, in rough priority order:
 
-### v0.14.0 implementation slices
-
-1. **Design confirmation**
-   - Re-read `docs/firecrawl-api-reference.md` search section.
-   - Confirm exact response shape and scrapeOptions behavior.
-   - Record any intentional divergence in this roadmap before coding.
-
-2. **Core search types and consensus**
-   - Define internal `SearchHit`, normalized URL key, consensus scorer, and tests.
-   - No network yet.
-
-3. **Engine trait and first parser fixtures**
-   - Implement DuckDuckGo HTML first.
-   - Add saved fixture tests.
-   - Add Bing/Brave/Mojeek after the trait is stable.
-
-4. **draco-net fan-out**
-   - Use `JoinSet` to fetch engines concurrently.
-   - Tolerate per-engine network/parser errors.
-   - Return diagnostics in Draco extension data if appropriate.
-
-5. **REST endpoint**
-   - Add `POST /v1/search` request parsing, validation, timeout handling, and response serialization.
-
-6. **ScrapeOptions integration**
-   - Convert search `scrapeOptions` to existing scrape `Config` / `FormatSet`.
-   - Bound scrape concurrency.
-   - Add tests with local pages.
-
-7. **CLI**
-   - Add `draco search` matching REST options.
-   - Keep output shape consistent with other CLI JSON output.
-
-8. **MCP rider**
-   - Add `draco_search` after REST/CLI are green.
-
-9. **Docs, changelog, version, ship**
-   - README usage.
-   - CHANGELOG v0.14.0.
-   - Bump version.
-   - Full gates.
-   - Feature branch, merge to main, tag, push.
+1. **Profile the render tier's CPU** — determine whether the time is in happy-dom's DOM implementation, the glue/polyfills, or the page's own hydration; that decides whether a meaningful engine-side win exists or we're at parity with the page's real cost.
+2. **Quiesce trim** — the render quiesce tail is 500 ms; ~350 ms would shave ~150 ms/render at a small early-close risk.
+3. **DOM-growth fallback** — generalize `is_tracker()` so an *unlisted* beacon that doesn't grow the DOM also can't hold the window.
+4. **`Deno`/isServer fidelity** — `globalThis.Deno` (deno_core's op bridge) leaks into page scope, so libraries like TanStack Query mis-detect a server environment. Hide it from page scripts without breaking op resolution.
 
 ## Known constraints and non-goals
 
@@ -336,14 +251,12 @@ Gates before ship:
 - Do not overfit to Google; Google failure must be a normal partial failure.
 - Do not make live SERP availability required for unit tests. Use fixtures.
 - Keep `--no-default-features` build working; serve-specific deps must remain properly gated.
+- Do not reintroduce the OS process jail. Tier 2 containment is the no-host-bindings isolate + the infrastructure perimeter.
 - Keep async job store semantics unchanged unless search explicitly needs async jobs; initial search can be synchronous request/response with timeout.
 
 ## Suggested immediate next step
 
-Before coding v0.14.0, do a short search-design spike:
+Two viable tracks; pick per priority:
 
-1. Read Firecrawl's search reference in `docs/firecrawl-api-reference.md`.
-2. Fetch or save sample SERP HTML for DuckDuckGo, Bing, Brave, and Mojeek.
-3. Confirm which engines are reachable through `draco-net` in the dev environment.
-4. Decide exact response shape for partial failures and scrapeOptions failures.
-5. Update this roadmap with any confirmed divergences, then implement the slices above.
+- **Search (v0.16.0)** — the next net-new feature. Do the short design spike first: read Firecrawl's search reference in `docs/firecrawl-api-reference.md`; save sample SERP HTML for DuckDuckGo/Bing/Brave/Mojeek; confirm which engines are reachable through `draco-net` in the dev environment; decide the exact partial-failure and scrapeOptions-failure response shape; then implement the slices above.
+- **Render-tier performance** — profile the CPU-bound hydration (backlog item 1) before committing to an optimization, so the work is evidence-driven rather than speculative.
