@@ -133,7 +133,9 @@ enum Command {
         reply: oneshot::Sender<ExecReport>,
     },
     /// Serialize the live hydrated DOM (`document.documentElement.outerHTML`).
-    Serialize { reply: oneshot::Sender<Option<String>> },
+    Serialize {
+        reply: oneshot::Sender<Option<String>>,
+    },
     /// Tear the isolate down and end the thread.
     Close { reply: oneshot::Sender<()> },
 }
@@ -189,7 +191,9 @@ impl Session {
             // The thread dropped the sender without reporting readiness (panicked).
             Err(_) => {
                 let _ = join.join();
-                Err(SessionError::Hydrate("session thread exited during boot".to_string()))
+                Err(SessionError::Hydrate(
+                    "session thread exited during boot".to_string(),
+                ))
             }
         }
     }
@@ -378,8 +382,7 @@ async fn hydrate(
         .filter(|(_, s)| !s.inline)
         .map(|(i, s)| (i, resolve_script_url(&config.url, &s.payload)))
         .collect();
-    let fetched =
-        futures::future::join_all(external.iter().map(|(_, u)| fetcher.fetch(u))).await;
+    let fetched = futures::future::join_all(external.iter().map(|(_, u)| fetcher.fetch(u))).await;
     let mut ext_bytes: HashMap<usize, Vec<u8>> = HashMap::new();
     for ((i, _), bytes) in external.iter().zip(fetched) {
         if let Some(b) = bytes {
@@ -419,7 +422,8 @@ async fn hydrate(
                         .borrow_mut()
                         .insert(spec_url.as_str().to_string(), source.into_bytes());
                     if let Err(e) = eval_module(&mut runtime, &spec_url).await {
-                        cap.borrow_mut().push_log(&format!("module script {i} threw: {e}"));
+                        cap.borrow_mut()
+                            .push_log(&format!("module script {i} threw: {e}"));
                     }
                 }
                 Err(e) => {
@@ -434,7 +438,8 @@ async fn hydrate(
                 format!("draco:page[{i}]")
             };
             if let Err(e) = runtime.execute_script(name, source) {
-                cap.borrow_mut().push_log(&format!("page script {i} threw: {e}"));
+                cap.borrow_mut()
+                    .push_log(&format!("page script {i} threw: {e}"));
             }
         }
     }
@@ -484,7 +489,10 @@ async fn do_exec(
 
     let logs = {
         let cs = cap.borrow();
-        cs.logs.get(log_start..).map(|s| s.to_vec()).unwrap_or_default()
+        cs.logs
+            .get(log_start..)
+            .map(|s| s.to_vec())
+            .unwrap_or_default()
     };
     ExecReport {
         ok: error.is_none(),
