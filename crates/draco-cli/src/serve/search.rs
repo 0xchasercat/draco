@@ -222,16 +222,10 @@ impl SearchEngine for DuckDuckGo {
                 continue;
             };
             let block = &html[start..block_end];
-            let description = first_text_by_classes(block, &["result__snippet"])
-                .unwrap_or_default();
+            let description =
+                first_text_by_classes(block, &["result__snippet"]).unwrap_or_default();
             let rank = position + 1;
-            hits.push(engine_hit(
-                self.name(),
-                rank,
-                title,
-                description,
-                url,
-            ));
+            hits.push(engine_hit(self.name(), rank, title, description, url));
         }
         hits
     }
@@ -276,13 +270,7 @@ impl SearchEngine for Bing {
                 .or_else(|| first_text_by_classes(block, &["b_algoSlug"]))
                 .unwrap_or_default();
             let rank = position + 1;
-            hits.push(engine_hit(
-                self.name(),
-                rank,
-                title,
-                description,
-                url,
-            ));
+            hits.push(engine_hit(self.name(), rank, title, description, url));
         }
         hits
     }
@@ -333,19 +321,11 @@ impl SearchEngine for Brave {
             let Some(url) = absolutize_result_url(&raw_href, base_url, false) else {
                 continue;
             };
-            let description = first_text_by_classes(
-                block,
-                &["content", "desktop-default-regular", "t-primary"],
-            )
-            .unwrap_or_default();
+            let description =
+                first_text_by_classes(block, &["content", "desktop-default-regular", "t-primary"])
+                    .unwrap_or_default();
             let rank = position + 1;
-            hits.push(engine_hit(
-                self.name(),
-                rank,
-                title,
-                description,
-                url,
-            ));
+            hits.push(engine_hit(self.name(), rank, title, description, url));
         }
         hits
     }
@@ -407,13 +387,7 @@ impl SearchEngine for Baidu {
                 .or_else(|| first_text_by_attr(block, "data-module", "abstract"))
                 .unwrap_or_default();
             let rank = position + 1;
-            hits.push(engine_hit(
-                self.name(),
-                rank,
-                title,
-                description,
-                url,
-            ));
+            hits.push(engine_hit(self.name(), rank, title, description, url));
         }
         hits
     }
@@ -457,13 +431,7 @@ impl SearchEngine for ZapMeta {
             };
             let description = first_text_for_tag(block, "p").unwrap_or_default();
             let rank = position + 1;
-            hits.push(engine_hit(
-                self.name(),
-                rank,
-                title,
-                description,
-                url,
-            ));
+            hits.push(engine_hit(self.name(), rank, title, description, url));
         }
         hits
     }
@@ -527,13 +495,7 @@ impl SearchEngine for Yandex {
                 .or_else(|| first_text_by_class_substring(block, "OrganicText"))
                 .unwrap_or_default();
             let rank = position + 1;
-            hits.push(engine_hit(
-                self.name(),
-                rank,
-                title,
-                description,
-                url,
-            ));
+            hits.push(engine_hit(self.name(), rank, title, description, url));
         }
         hits
     }
@@ -554,13 +516,11 @@ impl SearchEngine for Mojeek {
         // 2026-07-10 fixture is a 337-byte automated-query 403, so this positive
         // markup could not be fixture-verified; the block body must simply miss
         // the list and return empty without panicking.
-        let Some(list_start) = first_class_start_for_tag(html, "ul", &["results-standard"])
-        else {
+        let Some(list_start) = first_class_start_for_tag(html, "ul", &["results-standard"]) else {
             return Vec::new();
         };
         let list_tail = &html[list_start..];
-        let list_end = find_ascii_case_insensitive(list_tail, "</ul>")
-            .unwrap_or(list_tail.len());
+        let list_end = find_ascii_case_insensitive(list_tail, "</ul>").unwrap_or(list_tail.len());
         let list = &list_tail[..list_end];
         let starts = tag_ranges(list, "li");
         let mut hits = Vec::new();
@@ -571,8 +531,8 @@ impl SearchEngine for Mojeek {
                 .map(|(next, _)| *next)
                 .unwrap_or(list.len());
             let block = &list[start..block_end];
-            let title_link = first_anchor(block, Some("title"))
-                .or_else(|| first_anchor_in_tag(block, "h2"));
+            let title_link =
+                first_anchor(block, Some("title")).or_else(|| first_anchor_in_tag(block, "h2"));
             let Some((raw_href, title)) = title_link else {
                 continue;
             };
@@ -581,13 +541,7 @@ impl SearchEngine for Mojeek {
             };
             let description = first_text_for_tag(block, "p").unwrap_or_default();
             let rank = position + 1;
-            hits.push(engine_hit(
-                self.name(),
-                rank,
-                title,
-                description,
-                url,
-            ));
+            hits.push(engine_hit(self.name(), rank, title, description, url));
         }
         hits
     }
@@ -754,13 +708,7 @@ pub async fn search_all(
     engines: &[Box<dyn SearchEngine + Send + Sync>],
     per_engine_timeout: Duration,
 ) -> (Vec<SearchHit>, Vec<EngineOutcome>) {
-    search_all_with_session(
-        params,
-        engines,
-        per_engine_timeout,
-        &SessionOpts::default(),
-    )
-    .await
+    search_all_with_session(params, engines, per_engine_timeout, &SessionOpts::default()).await
 }
 
 /// Fan out with caller-provided network options. REST/CLI/MCP integration should
@@ -859,11 +807,8 @@ where
         let fetcher = fetcher.clone();
         let session = session.clone();
         tasks.spawn(async move {
-            let result = tokio::time::timeout(
-                per_engine_timeout,
-                fetcher.fetch(request, session),
-            )
-            .await;
+            let result =
+                tokio::time::timeout(per_engine_timeout, fetcher.fetch(request, session)).await;
             (index, result)
         });
     }
@@ -979,7 +924,9 @@ fn absolutize_result_url(raw: &str, base_url: &str, unwrap_ddg: bool) -> Option<
     if raw.is_empty() {
         return None;
     }
-    let mut url = Url::parse(&raw).or_else(|_| Url::parse(base_url)?.join(&raw)).ok()?;
+    let mut url = Url::parse(&raw)
+        .or_else(|_| Url::parse(base_url)?.join(&raw))
+        .ok()?;
     if unwrap_ddg
         && url.host_str().is_some_and(|host| {
             host.eq_ignore_ascii_case("duckduckgo.com")
@@ -1018,9 +965,7 @@ fn tag_ranges(html: &str, wanted: &str) -> Vec<(usize, usize)> {
         };
         let start = at + relative;
         let mut name_start = start + 1;
-        if name_start >= bytes.len()
-            || matches!(bytes[name_start], b'/' | b'!' | b'?' | b'%')
-        {
+        if name_start >= bytes.len() || matches!(bytes[name_start], b'/' | b'!' | b'?' | b'%') {
             at = name_start;
             continue;
         }
@@ -1071,17 +1016,13 @@ fn find_tag_end(bytes: &[u8], mut at: usize) -> Option<usize> {
 fn attr_value<'a>(tag: &'a str, wanted: &str) -> Option<&'a str> {
     let bytes = tag.as_bytes();
     let mut at = 1usize;
-    while at < bytes.len()
-        && !bytes[at].is_ascii_whitespace()
-        && !matches!(bytes[at], b'>' | b'/')
+    while at < bytes.len() && !bytes[at].is_ascii_whitespace() && !matches!(bytes[at], b'>' | b'/')
     {
         at += 1;
     }
 
     while at < bytes.len() {
-        while at < bytes.len()
-            && (bytes[at].is_ascii_whitespace() || matches!(bytes[at], b'/'))
-        {
+        while at < bytes.len() && (bytes[at].is_ascii_whitespace() || matches!(bytes[at], b'/')) {
             at += 1;
         }
         if at >= bytes.len() || bytes[at] == b'>' {
@@ -1192,8 +1133,7 @@ fn first_attr_start(html: &str, attribute: &str, value: &str) -> Option<usize> {
         let start = at + relative;
         let end = find_tag_end(html.as_bytes(), start + 1)? + 1;
         let raw = &html[start..end];
-        if !raw.starts_with("</")
-            && attr_value(raw, attribute).is_some_and(|found| found == value)
+        if !raw.starts_with("</") && attr_value(raw, attribute).is_some_and(|found| found == value)
         {
             return Some(start);
         }
@@ -1568,7 +1508,10 @@ pub(crate) async fn search_handler(
 
     // Total engine failure → upstream error. Partial failure always returns the
     // surviving engines' consensus (the whole point of the fan-out).
-    if !outcomes.iter().any(|o| matches!(o.status, EngineStatus::Ok(_))) {
+    if !outcomes
+        .iter()
+        .any(|o| matches!(o.status, EngineStatus::Ok(_)))
+    {
         let mut body = error_body("all search engines failed");
         body["draco"] = json!({ "engines": outcomes_json(&outcomes) });
         return (StatusCode::BAD_GATEWAY, Json(body));
@@ -1577,9 +1520,7 @@ pub(crate) async fn search_handler(
     let merged = consensus(hits, limit);
 
     let data: Vec<Value> = match (&scrape_formats, &req.scrape_options) {
-        (Some(formats), Some(opts)) => {
-            scrape_results(&merged, *formats, opts, &state).await
-        }
+        (Some(formats), Some(opts)) => scrape_results(&merged, *formats, opts, &state).await,
         _ => merged.iter().map(|h| Value::Object(base_item(h))).collect(),
     };
 
@@ -1596,9 +1537,7 @@ pub(crate) async fn search_handler(
 fn scrape_config(opts: &ScrapeOptions, formats: FormatSet, defaults: &Config) -> Config {
     Config {
         formats,
-        only_main_content: opts
-            .only_main_content
-            .unwrap_or(defaults.only_main_content),
+        only_main_content: opts.only_main_content.unwrap_or(defaults.only_main_content),
         include_tags: opts.include_tags.clone().unwrap_or_default(),
         exclude_tags: opts.exclude_tags.clone().unwrap_or_default(),
         headers: opts
@@ -1678,7 +1617,10 @@ pub(crate) fn base_item(hit: &SearchHit) -> serde_json::Map<String, Value> {
 
 /// Merge a successful scrape's `Document` fields onto a result item, keyed
 /// exactly as `to_firecrawl` keys them (markdown/html/rawHtml/links/json/metadata).
-pub(crate) fn merge_scrape_fields(item: &mut serde_json::Map<String, Value>, result: &ExtractionResult) {
+pub(crate) fn merge_scrape_fields(
+    item: &mut serde_json::Map<String, Value>,
+    result: &ExtractionResult,
+) {
     if let Some(md) = &result.markdown {
         item.insert("markdown".into(), Value::String(md.clone()));
     }
@@ -1689,7 +1631,10 @@ pub(crate) fn merge_scrape_fields(item: &mut serde_json::Map<String, Value>, res
         item.insert("rawHtml".into(), Value::String(rh.clone()));
     }
     if let Some(links) = &result.links {
-        item.insert("links".into(), serde_json::to_value(links).unwrap_or(Value::Null));
+        item.insert(
+            "links".into(),
+            serde_json::to_value(links).unwrap_or(Value::Null),
+        );
     }
     if let Some(d) = &result.data {
         item.insert("json".into(), d.clone());
@@ -1708,7 +1653,9 @@ pub(crate) fn outcomes_json(outcomes: &[EngineOutcome]) -> Value {
             EngineStatus::Empty => json!({ "engine": o.name, "status": "empty" }),
             EngineStatus::Timeout => json!({ "engine": o.name, "status": "timeout" }),
             EngineStatus::Http(code) => json!({ "engine": o.name, "status": "http", "code": code }),
-            EngineStatus::Error(msg) => json!({ "engine": o.name, "status": "error", "message": msg }),
+            EngineStatus::Error(msg) => {
+                json!({ "engine": o.name, "status": "error", "message": msg })
+            }
         })
         .collect();
     Value::Array(rows)
@@ -1747,17 +1694,13 @@ mod tests {
     #[test]
     fn default_engine_set_uses_six_live_adapters_and_excludes_mojeek() {
         let engines = default_engines();
-        let names = engines.iter().map(|engine| engine.name()).collect::<Vec<_>>();
+        let names = engines
+            .iter()
+            .map(|engine| engine.name())
+            .collect::<Vec<_>>();
         assert_eq!(
             names,
-            vec![
-                "duckduckgo",
-                "bing",
-                "brave",
-                "baidu",
-                "zapmeta",
-                "yandex",
-            ]
+            vec!["duckduckgo", "bing", "brave", "baidu", "zapmeta", "yandex",]
         );
     }
 
@@ -1931,9 +1874,7 @@ mod tests {
             .build_url(&params)
             .contains("wd=rust+web+scraper&ie=utf-8"));
         assert!(ZapMeta.build_url(&params).contains("q=rust+web+scraper"));
-        assert!(Yandex
-            .build_url(&params)
-            .contains("text=rust+web+scraper"));
+        assert!(Yandex.build_url(&params).contains("text=rust+web+scraper"));
         assert!(Mojeek.build_url(&params).contains("q=rust+web+scraper"));
     }
 
@@ -2118,10 +2059,7 @@ mod tests {
         assert_eq!(hits[0].engine, "good");
         assert_eq!(outcomes.len(), 5);
         assert_eq!(outcome(&outcomes, "good"), Some(&EngineStatus::Ok(1)));
-        assert_eq!(
-            outcome(&outcomes, "timeout"),
-            Some(&EngineStatus::Timeout)
-        );
+        assert_eq!(outcome(&outcomes, "timeout"), Some(&EngineStatus::Timeout));
         assert!(matches!(
             outcome(&outcomes, "error"),
             Some(EngineStatus::Error(message)) if message.contains("synthetic")
@@ -2184,9 +2122,16 @@ mod wiring_tests {
     #[test]
     fn base_item_is_title_description_url_only() {
         let item = base_item(&hit("T", "https://example.com/"));
-        assert_eq!(item.len(), 3, "base item carries exactly title/description/url");
+        assert_eq!(
+            item.len(),
+            3,
+            "base item carries exactly title/description/url"
+        );
         assert_eq!(item.get("title").and_then(|v| v.as_str()), Some("T"));
-        assert_eq!(item.get("description").and_then(|v| v.as_str()), Some("desc"));
+        assert_eq!(
+            item.get("description").and_then(|v| v.as_str()),
+            Some("desc")
+        );
         assert_eq!(
             item.get("url").and_then(|v| v.as_str()),
             Some("https://example.com/")

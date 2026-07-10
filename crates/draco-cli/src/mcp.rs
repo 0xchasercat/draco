@@ -531,10 +531,15 @@ async fn call_search(
         query: query.to_string(),
         limit,
         tbs: args.get("tbs").and_then(Value::as_str).map(String::from),
-        location: args.get("location").and_then(Value::as_str).map(String::from),
+        location: args
+            .get("location")
+            .and_then(Value::as_str)
+            .map(String::from),
     };
     let overall = std::time::Duration::from_millis(
-        args.get("timeout").and_then(Value::as_u64).unwrap_or(60_000),
+        args.get("timeout")
+            .and_then(Value::as_u64)
+            .unwrap_or(60_000),
     );
 
     // SERP session posture from the daemon defaults; browser-like robots.
