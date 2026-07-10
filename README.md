@@ -253,6 +253,43 @@ analytics beacons and static assets sort to the bottom. On `/v1/scrape`,
 `formats: ["endpoints"]` returns the catalog under `data.endpoints` and composes
 with `markdown`/`json`.
 
+### Web search (`draco search` / `POST /v1/search`)
+
+Search the web through Draco's **own stealth HTTP stack** — no external search
+API, and **no rendering** (SERP results are server-rendered HTML; booting the
+isolate for them would be pure waste). Several engines are queried **in
+parallel** and merged by **reciprocal-rank consensus**, so an engine that
+captcha-walls, geo-blocks, or rots is a normal *partial* failure the survivors
+absorb — the request only fails if **every** engine does. (This is the SearXNG
+model — used as a selector/behavior reference, not a dependency or a wholesale
+parser port.)
+
+```sh
+draco search "rust web scraper"                       # → ranked results (JSON)
+draco search "rust web scraper" --limit 10
+draco search "rust web scraper" --format markdown     # also scrape each result
+```
+```sh
+curl -X POST localhost:3002/v1/search -H 'content-type: application/json' \
+  -d '{"query": "rust web scraper", "limit": 5}'
+# → { "success": true,
+#     "data": [ { "title", "description", "url" }, … ],
+#     "draco": { "engines": [ { "engine", "status", "results"? }, … ] } }
+```
+
+- Engine set: DuckDuckGo (HTML endpoint), Bing, Brave, Baidu, ZapMeta, Yandex —
+  behind a swappable `SearchEngine` trait, each parser fixture-tested so parser
+  drift needs no live search. Google/Mojeek-class blocks are expected and
+  tolerated.
+- Request (Firecrawl-shaped; unknown fields accepted-and-ignored): `query`
+  (required), `limit` (default 5, 1–100), `tbs`, `location`, `timeout` (default
+  60000), `scrapeOptions`, plus Draco `proxy`/`ignoreRobots`. Response is a flat
+  `data[]` of `{ title, description, url }`; total engine failure → `502`,
+  partial → consensus of survivors.
+- **`scrapeOptions.formats`** runs each result URL through the scrape ladder and
+  merges the `Document` fields (`markdown`/`html`/`rawHtml`/`links`/`json`/
+  `metadata`) onto the hit — same `FormatSet`, bounded concurrency.
+
 ### MCP server (`draco mcp` / `POST /mcp`)
 
 Draco's scraping is available as **Model Context Protocol tools** for agent
@@ -268,12 +305,15 @@ draco mcp                        # stdio transport (newline-delimited JSON-RPC)
 
 The same server is bound on the daemon at `POST /mcp` (minimal Streamable-HTTP
 subset: single-message POST → single JSON response, `202` for notifications).
-Two tools, both annotated read-only:
+Three tools, all annotated read-only:
 - `draco_scrape` (`url`, `formats: ["markdown"|"json"|"endpoints"]`, `tierMax`,
   `captureWindowMs`, `timeout`, `ignoreRobots`) — scrape to Markdown/JSON.
 - `draco_discover` (`url`, `tierMax`, `captureWindowMs`, `timeout`,
   `ignoreRobots`, `allowUnsafeReplay`) — the ranked API-endpoint catalog + the
   replayed winner, for agents that want a page's data API.
+- `draco_search` (`query`, `limit`, `tbs`, `location`, `timeout`, `formats`) —
+  parallel multi-engine web search merged by reciprocal-rank consensus; with
+  `formats` it also scrapes each result and merges the content onto the hit.
 
 Tool-level failures come back as `isError` results the model can react to;
 protocol misuse is a proper JSON-RPC error.

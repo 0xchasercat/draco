@@ -3,6 +3,40 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.16.0] — 2026-07-10
+
+### Added
+- **Search — Firecrawl-compatible metasearch over Draco's own stealth HTTP
+  stack, no rendering.** New `POST /v1/search`, `draco search <query>`, and MCP
+  `draco_search`. Several engines are queried **in parallel** over plain HTTP
+  (never the browser/isolate — SERP results are server-rendered HTML, so
+  rendering would be pure waste) and merged by **reciprocal-rank consensus**, so
+  an engine that captcha-walls, geo-blocks, or rots (Google/Mojeek-class
+  failures) is a normal *partial* failure that the surviving engines absorb —
+  the request only fails if **every** engine fails. Engine set: DuckDuckGo (HTML
+  endpoint, POST), Bing, Brave, Baidu, ZapMeta, Yandex, behind a swappable
+  `SearchEngine` trait; each parser is fixture-tested so parser changes need no
+  live search. SearXNG is a selector/behavior reference only — not a dependency,
+  not a wholesale parser port. Mojeek's parser ships as the canonical
+  failure-path fixture (its live endpoint returns an automated-query 403).
+  - **Request** (Firecrawl-shaped, unknown fields accepted-and-ignored):
+    `query` (required), `limit` (default 5, 1–100), `tbs`, `location`,
+    `timeout` (default 60000), `scrapeOptions`, plus Draco `proxy`/`ignoreRobots`
+    extensions. **Response**: `{ success, data: [ { title, description, url,
+    …scrape fields } ], draco: { engines: [ per-engine status ] } }` — a flat
+    array; total engine failure → `502`, partial failure → consensus of
+    survivors.
+  - **`scrapeOptions.formats`** runs each result URL through Draco's existing
+    scrape ladder (bounded concurrency + the daemon gate) and merges the
+    `Document` fields (`markdown`/`html`/`rawHtml`/`links`/`json`/`metadata`)
+    onto the hit — one `FormatSet`, no parallel schema.
+  - Consensus canonicalizes URLs (host-case, default ports, tracking params,
+    fragments) to merge duplicates, scores by Σ(1/rank) across engines, and
+    keeps per-engine contributor diagnostics in the `draco` extension.
+  - SERP fetches ride a per-operation session (a per-engine HTTP budget
+    independent of the overall deadline; robots not respected by default, since
+    engines disallow `/search` and a metasearch fetches SERPs like a browser).
+
 ## [0.15.0] — 2026-07-10
 
 ### Added

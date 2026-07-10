@@ -35,12 +35,13 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
-use draco_core::{extract, extract_with_pool, Config, FormatSet, Tier2Pool};
+use draco_core::{extract, extract_with_pool, session_opts, Config, FormatSet, Tier2Pool};
+use draco_types::Status;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Semaphore;
 
-use crate::serve::{parse_formats, to_firecrawl, AppState};
+use crate::serve::{parse_formats, search, to_firecrawl, AppState};
 
 /// Protocol revisions this server knows, newest first. The first entry is the
 /// default offered to clients requesting an unknown revision.
@@ -137,9 +138,13 @@ async fn handle_message(
     let outcome: Result<Value, (i64, String)> = match method {
         "initialize" => Ok(initialize_result(&params)),
         "ping" => Ok(json!({})),
-        "tools/list" => {
-            Ok(json!({ "tools": [scrape_tool_descriptor(), discover_tool_descriptor()] }))
-        }
+        "tools/list" => Ok(json!({
+            "tools": [
+                scrape_tool_descriptor(),
+                discover_tool_descriptor(),
+                search_tool_descriptor(),
+            ]
+        })),
         "tools/call" => call_tool(&params, defaults, gate, pool).await,
         _ => Err((-32601, format!("method not found: {method}"))),
     };
@@ -302,6 +307,39 @@ fn discover_tool_descriptor() -> Value {
     })
 }
 
+/// Descriptor for `draco_search`: metasearch across several engines over plain
+/// HTTP (no browser), merged by reciprocal-rank consensus, tolerant of
+/// individual engine failures. Optionally scrapes each result URL.
+fn search_tool_descriptor() -> Value {
+    json!({
+        "name": "draco_search",
+        "title": "Web search",
+        "description": "Search the web across several engines in parallel over plain HTTP \
+                        (no browser), merged by reciprocal-rank consensus so a captcha-walled \
+                        or geo-blocked engine degrades gracefully instead of failing the query. \
+                        Returns ranked results (title, description, url). If `formats` is given, \
+                        each result URL is also scraped and its content merged onto the hit.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "The search query." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100,
+                           "description": "Max results after consensus (default 5)." },
+                "tbs": { "type": "string", "description": "Time filter (e.g. qdr:d); best-effort per engine." },
+                "location": { "type": "string", "description": "Free-text geo target; best-effort per engine." },
+                "timeout": { "type": "integer", "description": "Overall search deadline in ms (default 60000)." },
+                "formats": {
+                    "type": "array",
+                    "items": { "type": "string", "enum": ["markdown", "html", "rawHtml", "links", "json", "endpoints"] },
+                    "description": "If non-empty, scrape each result URL to these formats and merge the fields onto the result."
+                }
+            },
+            "required": ["query"]
+        },
+        "annotations": { "readOnlyHint": true, "openWorldHint": true }
+    })
+}
+
 /// `tools/call` dispatch. Protocol-level misuse (unknown tool, missing/invalid
 /// params) is a JSON-RPC error; a scrape that *ran and failed* is a tool
 /// result with `isError: true`.
@@ -312,6 +350,11 @@ async fn call_tool(
     pool: Option<&Tier2Pool>,
 ) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+    // `draco_search` is a distinct path (query in, ranked results out) — no URL,
+    // its own fan-out + consensus.
+    if name == "draco_search" {
+        return call_search(params, defaults, gate, pool).await;
+    }
     // Two tools share the same execution path; `draco_discover` just forces
     // endpoint discovery and headlines the catalog in its result.
     let is_discover = name == "draco_discover";
@@ -445,6 +488,138 @@ async fn call_tool(
         }));
     }
     Ok(json!({ "content": content, "isError": false }))
+}
+
+/// `draco_search` execution: fan out across engines, consensus-merge, and
+/// (optionally) scrape each result URL. Total engine failure is a tool-level
+/// error; partial failure still returns the surviving engines' results.
+async fn call_search(
+    params: &Value,
+    defaults: &Config,
+    gate: Option<&Semaphore>,
+    pool: Option<&Tier2Pool>,
+) -> Result<Value, (i64, String)> {
+    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .ok_or((-32602, "\"query\" (string) is required".to_string()))?;
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|n| (n as usize).clamp(1, 100))
+        .unwrap_or(5);
+    let formats: Vec<String> = args
+        .get("formats")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let scrape_formats = if formats.is_empty() {
+        None
+    } else {
+        Some(parse_formats(&formats).map_err(|rej| (-32602, rej.message))?)
+    };
+
+    let params = search::SearchParams {
+        query: query.to_string(),
+        limit,
+        tbs: args.get("tbs").and_then(Value::as_str).map(String::from),
+        location: args
+            .get("location")
+            .and_then(Value::as_str)
+            .map(String::from),
+    };
+    let overall = std::time::Duration::from_millis(
+        args.get("timeout")
+            .and_then(Value::as_u64)
+            .unwrap_or(60_000),
+    );
+
+    // SERP session posture from the daemon defaults; browser-like robots.
+    let serp_config = Config {
+        force_render: false,
+        timeout_ms: 15_000,
+        respect_robots: false,
+        ..defaults.clone()
+    };
+    let session = session_opts(&serp_config);
+
+    // One gate permit spans the whole tool call (SERP fan-out + any scrapes).
+    let permit = match gate {
+        Some(g) => match g.acquire().await {
+            Ok(p) => Some(p),
+            Err(_) => return Ok(tool_error("server is shutting down")),
+        },
+        None => None,
+    };
+
+    let engines = search::default_engines();
+    let fut = search::search_all_with_session(
+        &params,
+        &engines,
+        search::DEFAULT_PER_ENGINE_TIMEOUT,
+        &session,
+    );
+    let (hits, outcomes) = match tokio::time::timeout(overall, fut).await {
+        Ok(pair) => pair,
+        Err(_) => {
+            drop(permit);
+            return Ok(tool_error("search timed out before any engine returned"));
+        }
+    };
+    if !outcomes
+        .iter()
+        .any(|o| matches!(o.status, search::EngineStatus::Ok(_)))
+    {
+        drop(permit);
+        return Ok(tool_error("all search engines failed"));
+    }
+
+    let merged = search::consensus(hits, limit);
+    let mut data = Vec::with_capacity(merged.len());
+    match scrape_formats {
+        Some(formats) => {
+            // Scrape each result (sequential — one tool call, modest limit).
+            // Prefer the warm pool when present (HTTP transport); stdio uses a
+            // one-shot capture.
+            for hit in &merged {
+                let mut item = search::base_item(hit);
+                let config = Config {
+                    formats,
+                    ..defaults.clone()
+                };
+                let result = match pool {
+                    Some(p) => extract_with_pool(&hit.url, &config, p).await,
+                    None => extract(&hit.url, &config).await,
+                };
+                if result.status == Status::Success {
+                    search::merge_scrape_fields(&mut item, &result);
+                }
+                data.push(Value::Object(item));
+            }
+        }
+        None => {
+            for hit in &merged {
+                data.push(Value::Object(search::base_item(hit)));
+            }
+        }
+    }
+    drop(permit);
+
+    let payload = json!({
+        "success": true,
+        "data": data,
+        "draco": { "engines": search::outcomes_json(&outcomes) },
+    });
+    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+    Ok(json!({ "content": [ { "type": "text", "text": text } ], "isError": false }))
 }
 
 /// Tool-level failure result (`isError: true`), distinct from JSON-RPC errors.

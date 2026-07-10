@@ -54,6 +54,9 @@ pub(crate) mod discover;
 pub(crate) mod jobs;
 /// `POST /v1/map` — fast site URL discovery (sitemap + on-page links).
 pub(crate) mod map;
+/// `POST /v1/search` — Firecrawl-compatible metasearch (parallel HTTP engines
+/// + reciprocal-rank consensus; no rendering).
+pub(crate) mod search;
 /// Firecrawl-compatible webhook delivery for crawl + batch jobs.
 pub(crate) mod webhook;
 
@@ -135,6 +138,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/v1/scrape", post(scrape))
         .route("/v1/map", post(map::map_handler))
+        .route("/v1/search", post(search::search_handler))
         .route("/v1/discover", post(discover::discover_handler))
         .route("/v1/crawl", post(crawl::start_handler))
         .route(

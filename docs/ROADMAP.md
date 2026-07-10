@@ -1,6 +1,6 @@
 # Draco Roadmap — current handoff
 
-Status as of **v0.15.0** (2026-07-10). This is the canonical takeover document for the next agent. It supersedes older roadmap notes and matches the repository state on `main` at tag `v0.15.0`.
+Status as of **v0.16.0** (2026-07-10). This is the canonical takeover document for the next agent. It supersedes older roadmap notes and matches the repository state on `main` at tag `v0.16.0`. (Search shipped in v0.16.0; the next net-new feature is **v0.17.0 — interact**, an LLM-driven stateful session over the engine. See the companion interact design doc.)
 
 Draco is a fast, stealth, native-Rust web scraper positioned as a lighter DOM-only alternative to Firecrawl / Browserbase. It is not a browser and must never fake browser-only outputs such as screenshots or actions.
 
@@ -87,9 +87,11 @@ A long run of fixes making the (then jailed, jitless) Tier 2 isolate hydrate rea
 - API discovery: shipped and patched.
 - Webhooks: shipped.
 - Tier 2 render mode: shipped (v0.15.0).
-- Search: **not shipped**. This remains the next major net-new feature (planned below as v0.16.0).
+- Search: **shipped (v0.16.0)** — `POST /v1/search`, `draco search`, MCP `draco_search`; parallel multi-engine metasearch with reciprocal-rank consensus (design section below retained as reference).
 
-## Next major release: v0.16.0 — search / metasearch
+## Shipped in v0.16.0 — search / metasearch (design retained as reference)
+
+> **Shipped 2026-07-10.** The design below was implemented as specified: `POST /v1/search` + `draco search` + MCP `draco_search`, a swappable `SearchEngine` trait with fixture-tested parsers (DuckDuckGo/Bing/Brave/Baidu/ZapMeta/Yandex; Mojeek retained as the failure-path fixture), `JoinSet` fan-out tolerant of per-engine failure, reciprocal-rank consensus, and `scrapeOptions` piping results through the scrape ladder. Retained here as the design of record.
 
 Search is the remaining net-new engine, and it is the recommended next major feature now that the Tier 2 engine is solid. The goal is Firecrawl-compatible search through Draco's own stealth HTTP stack, not an external search API dependency.
 
@@ -236,9 +238,9 @@ Gates before ship: `cargo fmt --all -- --check`, `cargo check --no-default-featu
 
 ## Performance backlog (post-v0.15.0)
 
-The Tier 2 render tier is now correct and its window management is deterministic (every render closes at [last content fetch + quiesce]). The remaining cost is dominated by **CPU-bound hydration** — heavy SPAs peg ~80% of one core running the app's own JS. Candidate work, in rough priority order:
+The Tier 2 render tier is now correct and its window management is deterministic (every render closes at [last content fetch + quiesce]). **Correction (PR #17 phase data):** the render window is **idle-dominated, not CPU-bound** — measured ~60% idle / ~40% V8-CPU (bluff 750 ms cpu / 1558 idle; target 915 / 1334; thrill 1434 / 2120). The cost is network-bound (fetch RTTs + thrill's ~700 ms 2.5 MB snapshot) plus op-completion polling latency plus the ~500 ms quiesce tail — near the physical floor a real browser would also pay. PR #17 already reclaimed op-completion idle (capture poll tick 50 ms → 10 ms). Candidate work, in rough priority order:
 
-1. **Profile the render tier's CPU** — determine whether the time is in happy-dom's DOM implementation, the glue/polyfills, or the page's own hydration; that decides whether a meaningful engine-side win exists or we're at parity with the page's real cost.
+1. **DOM-content-settled quiesce (the real remaining lever)** — the ~500 ms quiesce tail can only be cut *safely* with a DOM-content-settled signal (sample body node-count/text-len per tick; close when it stops growing), not a V8-busy signal (which would pin any SPA with a `setInterval`/animation loop to the hard cap). Moderate build; no regression if gated on "grew then stable".
 2. **Quiesce trim** — the render quiesce tail is 500 ms; ~350 ms would shave ~150 ms/render at a small early-close risk.
 3. **DOM-growth fallback** — generalize `is_tracker()` so an *unlisted* beacon that doesn't grow the DOM also can't hold the window.
 4. **`Deno`/isServer fidelity** — `globalThis.Deno` (deno_core's op bridge) leaks into page scope, so libraries like TanStack Query mis-detect a server environment. Hide it from page scripts without breaking op resolution.
@@ -256,7 +258,7 @@ The Tier 2 render tier is now correct and its window management is deterministic
 
 ## Suggested immediate next step
 
-Two viable tracks; pick per priority:
+Search (v0.16.0) shipped. Two viable tracks; pick per priority:
 
-- **Search (v0.16.0)** — the next net-new feature. Do the short design spike first: read Firecrawl's search reference in `docs/firecrawl-api-reference.md`; save sample SERP HTML for DuckDuckGo/Bing/Brave/Mojeek; confirm which engines are reachable through `draco-net` in the dev environment; decide the exact partial-failure and scrapeOptions-failure response shape; then implement the slices above.
-- **Render-tier performance** — profile the CPU-bound hydration (backlog item 1) before committing to an optimization, so the work is evidence-driven rather than speculative.
+- **Interact (v0.17.0)** — the next net-new feature: an LLM-driven **stateful session** over the Draco engine (a "devtools console" — run JS in page scope, click/type via selectors, navigate, cookies persisted for the job), no browser. Makes the one-shot Tier 2 capture **resumable** (a session actor: a dedicated thread owning the isolate, driven by a command channel). Key decision: safety guardrails (mutation gate, robots, replay toggles) are a **deployment tier** — the production daemon runs full-access — while **containment (no host bindings) is permanent**. Surface `/v1/interact` + `draco interact` + MCP `draco_interact_*`. See the companion interact design doc for the locked design, slices, and risk register (the long-lived isolate is the risk gate — prove it in isolation first).
+- **Render-tier performance** — the DOM-content-settled quiesce lever (backlog item 1); the window is idle-dominated (PR #17), so this is the remaining safe win, not CPU profiling.
