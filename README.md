@@ -64,10 +64,12 @@ tier that yields data:
 
 1. **Static embedded state** — `__NEXT_DATA__`, JSON-LD, `window.__NUXT__`.
 2. **Next.js build-id replay** — fetch `/_next/data/<buildId>/…​.json` directly.
-3. **Runtime interception** — boot a jailed, jitless V8 isolate, let the page's JS
-   hydrate, intercept the `fetch`/`XHR` it fires for its data, rank the intercepts,
-   and replay the winner with the stealth client. The isolate is a *discovery
-   oracle*, not a renderer.
+3. **Runtime interception** — boot an **in-process V8 isolate** (restored from a
+   build-time DOM-engine snapshot in single-digit milliseconds, JIT on), let the
+   page's JS hydrate, intercept the `fetch`/`XHR` it fires for its data, rank the
+   intercepts, and replay the winner with the stealth client. The isolate is a
+   *discovery oracle*, not a renderer — data requests are answered with a
+   synthetic stub, and page JS has no host bindings: it cannot perform I/O.
 
 ```sh
 draco scrape https://app.example.com --format json --pretty       # data[]
@@ -78,22 +80,24 @@ draco scrape https://app.example.com --format both                # markdown + d
 Flags: `--format <markdown|html|raw-html|links|json|endpoints|both>` (repeatable;
 default `markdown`; `both` = `markdown`+`json`), `--json`, `--extract
 <JSONPATH>`, `--no-main-content`, `--wait-for <ms>`, `--tier-max <0|1|2>`, `--proxy`, `--delay <ms>`, `--timeout <ms>`,
-`--capture-window-ms <ms>`, `--ignore-robots`, `--no-jail`, `--strict-sandbox`,
-`--allow-unsafe-replay`, `--runtime-log`, `--pretty`.
+`--capture-window-ms <ms>`, `--ignore-robots`, `--allow-unsafe-replay`,
+`--runtime-log`, `--pretty`. (`--no-jail` / `--strict-sandbox` are still accepted
+for compatibility and are inert — see [Security model](#security-model-only-relevant-to-tier-2).)
 
 Debugging a page that hydrates to nothing? `--runtime-log` (also on `discover`,
 and as `runtimeLog` on the daemon/MCP) surfaces the isolate's page-side
-diagnostics — swallowed exceptions, `console.error` lines, dynamic-chunk
-throws — as `runtime.log` steps in the trace: browser-devtools visibility,
-no browser.
+diagnostics — swallowed exceptions, `console.error` lines, every brokered fetch
+(`[raze.fetch] METHOD URL → STATUS (bytes, live|stub)`), failed chunk/module
+loads, and why/when the capture window closed — all stamped `[+ms]` from capture
+start, so the trace reads as a timeline: browser-devtools visibility, no browser.
 
 ### Client-rendered SPAs → Markdown (render-then-Markdown)
 
 Some pages render their *content* only after JavaScript runs — the fetched HTML is
 a thin shell (an empty `<div id="root">`). Draco handles these automatically: when
 the initial parse finds almost no content and Tier 2 is permitted (the default),
-it hydrates the shell in the same jitless V8 isolate, serializes the **live DOM**,
-splices the shell's real `<head>` (title / Open Graph / canonical) onto the
+it hydrates the shell in the same in-process V8 isolate, serializes the **live
+DOM**, splices the shell's real `<head>` (title / Open Graph / canonical) onto the
 hydrated `<body>`, and re-runs the exact same content engine over it. You get clean
 Markdown from a client-rendered page with no headless browser — the trace shows a
 `runtime.render` step and `source_tier: runtime_interception`.
@@ -109,12 +113,28 @@ of length) and escalated the same way. `Loading…` placeholder lines are always
 stripped from the output, so that noise never reaches you even if the render pass
 is capped (`--tier-max 1`) or can't improve the page.
 
+**Pure-CSR SPAs: live data, safely.** Some SPAs ship no embedded state at all —
+the content exists only behind the JSON APIs the page calls after it hydrates.
+For exactly this escalation (and only it), the isolate's fetch broker switches to
+**Render mode**: the page's *safe* data requests — `GET`/`HEAD`, and read-style
+`POST`/`PUT` (GraphQL / JSON-RPC-shaped) — are fetched **live** through the same
+stealth client and shared cookie jar, and the page sees the real
+status/headers/body, including non-2xx, so a framework router runs its native
+success/error paths. State-changing requests stay stubbed unless
+`--allow-unsafe-replay`; streaming endpoints and analytics beacons are never
+fetched live. `discover` and the JSON tier keep the record-and-stub Observe mode.
+The capture window closes as soon as the page's **content** activity settles —
+analytics/session-replay beacons are recorded but cannot pin the window open —
+with a hard ceiling as backstop.
+
 **External scripts & ES modules** are handled too. The isolate runs a page's
 external `<script src>` and `<script type="module">` (with `import` / dynamic
-`import()`), not just inline scripts. Because the isolate is network-isolated, the
-supervisor pre-fetches the script subresources — seeding from the `<script>` tags
-and crawling the ES-module import graph — and hands them to the isolate; the page
-JS itself still performs zero I/O.
+`import()`), not just inline scripts. Script subresources are fetched **on
+demand and concurrently** — chunk loads fan out on the isolate's event loop like
+a browser's network stack — through the pooled stealth client and a
+process-global immutable chunk cache (512 MiB RAM + 2 GiB disk), so a hashed SPA
+chunk is fetched once across scrapes. Page JS itself still performs zero I/O:
+every byte is brokered by the engine's ops.
 
 A thin shell that can't be improved (hydration adds nothing, or the isolate is
 unavailable) falls back to the static shell — never a crash, never a regression.
@@ -154,15 +174,13 @@ Concurrency is bounded (`--max-concurrency`, default 8); excess requests queue.
 Warm-process SPA hydration answers in ~150 ms end-to-end on the local benchmark
 fixture (fetch → hydrate → serialize → Markdown).
 
-**Warm isolate pool.** Tier 2 scrapes are served by a pool of jailed capture
-workers kept alive between requests (`--isolate-pool-size`, default `0` = auto ≈
-CPU count; also caps concurrent isolates), so a scrape skips the per-request
-fork + sandbox-arming (userns/netns/seccomp/Landlock) + first-snapshot cost.
-Each job still runs in a **fresh isolate** inside a reused worker — no
-cross-scrape state, cookie, or DOM bleed — and workers recycle after
-`--isolate-max-jobs` captures (default 100). A request that overrides the pool's
-sandbox posture falls back to a one-shot spawn. `draco scrape` (one shot) is
-unaffected.
+**Isolate concurrency.** Tier 2 scrapes run in **fresh, in-process V8
+isolates** — one per job, restored from the build-time DOM snapshot in
+single-digit milliseconds, so there is no per-request browser boot to amortize
+and never any cross-scrape state, cookie, or DOM bleed. `--isolate-pool-size`
+bounds how many isolates run concurrently (default `0` = auto ≈ CPU count);
+excess Tier 2 work queues. (`--isolate-max-jobs` is accepted for compatibility
+and inert — there are no long-lived workers to recycle.)
 
 Beyond scraping, the daemon speaks two more Firecrawl endpoints:
 
@@ -229,10 +247,11 @@ curl -X POST localhost:3002/v1/discover -H 'content-type: application/json' \
 ```
 
 Each endpoint carries a `score` (higher = more likely the real data API) and a
-`replayable` flag (clears the viability bar and is replay-safe). Ranked
-best-first; the analytics beacons and static assets sort to the bottom. On
-`/v1/scrape`, `formats: ["endpoints"]` returns the catalog under
-`data.endpoints` and composes with `markdown`/`json`.
+`replayable` flag (clears the viability bar and is replay-safe — one eligibility
+rule feeds both the catalog and the replay engine). Ranked best-first; the
+analytics beacons and static assets sort to the bottom. On `/v1/scrape`,
+`formats: ["endpoints"]` returns the catalog under `data.endpoints` and composes
+with `markdown`/`json`.
 
 ### MCP server (`draco mcp` / `POST /mcp`)
 
@@ -244,7 +263,7 @@ draco mcp                        # stdio transport (newline-delimited JSON-RPC)
 ```
 
 ```json
-{ "mcpServers": { "draco": { "command": "draco", "args": ["mcp", "--no-jail"] } } }
+{ "mcpServers": { "draco": { "command": "draco", "args": ["mcp"] } } }
 ```
 
 The same server is bound on the daemon at `POST /mcp` (minimal Streamable-HTTP
@@ -266,9 +285,8 @@ protocol misuse is a proper JSON-RPC error.
 | `draco-types` | Wire + result contract (no I/O) |
 | `draco-net` | Stealth TLS/JA4 HTTP client (wreq/BoringSSL): cookie jar, proxy, robots, backoff |
 | `draco-static` | **Markdown + metadata extraction** (Firecrawl-parity) · JSON embedded-state · build-id replay |
-| `draco-jail` | Sandbox supervisor + jailed child: userns/netns air-gap, Landlock, seccomp, IPC codec |
-| `draco-runtime` | Tier 2 V8 isolate (jitless): real happy-dom DOM engine baked into a build-time V8 snapshot, `fetch`/`XHR` interception |
-| `draco-core` | Escalation state machine, challenge short-circuit, ranking, replay |
+| `draco-runtime` | Tier 2 **in-process V8 isolate** (JIT): real happy-dom DOM engine baked into a build-time V8 snapshot; `fetch`/`XHR` interception; Observe/Render fetch modes; concurrent async chunk loading |
+| `draco-core` | Escalation state machine, challenge short-circuit, ranking, replay, chunk cache |
 | `draco-cli` | The `draco` CLI + output contract |
 
 ## Feature flags
@@ -278,7 +296,7 @@ protocol misuse is a proper JSON-RPC error.
 - **`serve`** — the persistent HTTP daemon (axum). Independent of `tier2`:
   `--no-default-features --features serve` exposes the same REST API with the
   ladder capped at the static tiers.
-- **`--no-default-features`** — a lean build with **no V8/jail/axum linked**.
+- **`--no-default-features`** — a lean build with **no V8/axum linked**.
   Markdown scraping and static/build-id JSON extraction still work; runtime
   interception reports `unsupported`. Smaller binary, faster build.
 
@@ -286,23 +304,27 @@ protocol misuse is a proper JSON-RPC error.
 cargo build -p draco-cli --no-default-features   # lean, V8-free, axum-free
 ```
 
-## Security model (only relevant to `--format json` Tier 2)
+## Security model (only relevant to Tier 2)
 
-Markdown scraping executes no page JavaScript. The optional Tier 2 does, so
-containment matters. Draco's **primary** containment is the isolate itself: the V8
-context has **no host-capability bindings** — the only ops exposed to page JS
-record the intercepted request, sleep, and resolve URLs. There is no
-network/filesystem/process access, so page JS cannot perform I/O. **This is the
-same class of isolation Puppeteer/Playwright/jsdom rely on**, works identically on
-macOS and Linux, and needs zero configuration (Draco calls it **isolate mode**).
+Markdown scraping of a static page executes no page JavaScript. Tier 2 (runtime
+interception / render-then-Markdown) does, so containment matters. Draco's
+containment is the **V8 isolate itself**: the context has **no host-capability
+bindings** — the only ops exposed to page JS record an intercepted request, load
+a script chunk, log a diagnostic, sleep, and resolve URLs. There is no network,
+filesystem, or process access; the only I/O page JS can *cause* is the fetches
+the engine explicitly brokers (script subresources always; data requests only in
+Render mode, under the mutation-safety policy). **This is the same class of
+isolation Puppeteer/Playwright/jsdom rely on**, works identically on macOS and
+Linux, and needs zero configuration. JIT is on (`--single-threaded`, so V8
+spawns no background threads); the achieved posture shows in the `trace` as a
+`runtime.sandbox` step (`isolate: in-process v8 (no host bindings)`).
 
-On **Linux**, Draco adds OS-level defense-in-depth automatically: a **seccomp-bpf
-denylist** (kills breakout syscalls — `execve`, `socket`/`connect`, `ptrace`,
-`mount`, `bpf`, executable `mprotect`; no per-host tuning), plus a
-**network-namespace** air-gap and **Landlock** FS lockdown when the kernel
-supports them. V8 runs `--jitless`. The achieved level shows in the `trace` as a
-`runtime.sandbox` step (`hardened: …` / `isolate: …`). `--strict-sandbox` opts
-into a maximal allowlist; `--no-jail` skips the OS layer.
+The OS process jail of earlier releases (fork + userns/netns air-gap + seccomp +
+Landlock) was **retired in v0.14**: its per-chunk blocking IPC was the engine's
+throughput ceiling, and for hosted deployments the security perimeter belongs to
+the infrastructure layer (stateless, ephemeral, unidirectional workers).
+`--no-jail` and `--strict-sandbox` are accepted for CLI compatibility and are
+inert.
 
 Draco does **not** defeat JS challenge walls (Cloudflare/DataDome/…); a genuine
 interstitial (blocking status + real challenge page) short-circuits to
@@ -310,14 +332,13 @@ interstitial (blocking status + real challenge page) short-circuits to
 
 ## Platforms
 
-| Platform | Markdown scrape | JSON Tier 0/1 | Tier 2 isolate | Tier 2 OS hardening |
-|----------|:---:|:---:|:---:|---|
-| **Linux** `x86_64-gnu` | ✅ | ✅ | ✅ | ✅ auto (seccomp always; netns + Landlock when supported) |
-| **macOS** `aarch64-darwin` | ✅ | ✅ | ✅ | isolate mode (Seatbelt hardening on the roadmap) |
+| Platform | Markdown scrape | JSON Tier 0/1 | Tier 2 isolate |
+|----------|:---:|:---:|:---:|
+| **Linux** `x86_64-gnu` | ✅ | ✅ | ✅ |
+| **macOS** `aarch64-darwin` | ✅ | ✅ | ✅ |
 
-Both are **first-class**. The optional Linux hardening can be verified on a real
-kernel per **[docs/BARE_METAL_VALIDATION.md](docs/BARE_METAL_VALIDATION.md)** —
-that confirms the extra hardening; it is not required to run Draco.
+Both are **first-class** — Tier 2 is the same in-process isolate on both, with
+identical behavior and zero platform-specific configuration.
 
 ## Development
 

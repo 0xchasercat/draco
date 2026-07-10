@@ -3,6 +3,119 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.15.0] — 2026-07-10
+
+### Added
+- **Tier 2 Render mode — pure-CSR SPAs now render their content.** A pure-CSR
+  page (e.g. thrill.com) ships an empty shell and paints only after client-side
+  data fetches resolve; Tier 2 stubbed those fetches (right for `discover`,
+  fast for SSR/hybrid), so `scrape` extracted an empty DOM. The isolate now has
+  two fetch modes: **Observe** (unchanged — record + synthetic stub) and
+  **Render** — the page's *safe* data requests are fetched live through a new
+  `ApiFetcher` seam over the existing `draco_net::replay` path (pooled client +
+  shared cookie jar) and the page sees the REAL status/headers/body, including
+  non-2xx, so framework routers run their native success/error paths.
+  Mutation-safety is reused verbatim from ranking: safe methods and read-style
+  POST/PUT go live; streaming endpoints and analytics beacons stay stubbed;
+  `--allow-unsafe-replay` is honored. The existing thin/skeleton-shell
+  escalation triggers Render automatically (hidden `--force-render` to force
+  it). Measured: thrill.com went from a 478-char footer to the full 42,823-char
+  lobby (every category, game tile, and provider).
+- **Render observability — the isolate is no longer a black box.** Under
+  `--runtime-log`, every brokered request logs `[raze.fetch] METHOD URL →
+  STATUS (bytes, live|stub(...))`, failed chunk/module loads log
+  `[raze.chunk]/[raze.module] MISS`, and the capture window logs why and when
+  it closed (`drained|quiesce|hard-cap`, requests captured, loads in flight) —
+  all stamped `[+ms]` relative to capture start, so a trace reads as a
+  timeline. Log budget 32 → 96 lines (exact repeats deduped). This is what
+  turned the remaining thrill/target diagnosis from guesswork into one run.
+
+### Fixed
+- **`document.currentScript` points at the real parsed `<script>` node.** The
+  shim grafted a synthetic node onto `<head>`, so SvelteKit's
+  `currentScript.parentElement` mount target resolved to `<head>` — a non-null
+  but *wrong* parent (silent misrender into the document head). The runtime now
+  matches the executing block to its real node in the tree (inline source /
+  external src identity, WeakSet-claimed); fallback parents to `<body>`, never
+  `<head>`. (#14)
+- **Web Animations shim — Svelte 5 transitions no longer abort the mount.**
+  happy-dom ships no `Element.animate`/`getAnimations`; the TypeError aborted
+  the component tree mid-mount (footer rendered, content didn't). Inert,
+  completion-biased shim: animations auto-finish, `onfinish` fires even when
+  assigned late, `finished` resolves, `cancel()` settles. Real implementations
+  win if present.
+- **Dynamically injected `<script type="module">` evaluates via `import()`.**
+  It previously fell through to happy-dom's disabled loader (`game-loader.js`
+  class of failures); module scripts now resolve through the same
+  `MapModuleLoader`/`ScriptFetcher` path as the page's own imports, with
+  correct ES semantics and concurrency.
+- **Completion-biased IntersectionObserver + ResizeObserver.** The snapshot
+  stubs were inert no-ops, so sections that lazy-load on scroll-into-view never
+  learned they were visible and stayed skeletons. Observed elements now report
+  fully-intersecting/measured once on the next tick — the correct bias for a
+  renderless extractor; window + `max_intercepts` still bound infinite scroll.
+- **The document lifecycle fires.** happy-dom never runs
+  `readystatechange`/`DOMContentLoaded`/`load` for the `document.write` +
+  manual-eval path, and SvelteKit's boot gates its data phase on them. The
+  capture loop now fires the full sequence at the parsing-finished moment
+  (browser-faithful: before dynamic `import()`s settle), with
+  `document.readyState` shadowed `"loading"` → `"complete"`.
+- **`discover`'s `replayable` flag matches what replay actually does.** The
+  catalog screened on safe methods only, while `best_replayable` also admits
+  read-style POST/PUT (GraphQL/JSON-RPC) — thrill's `POST /tickets` was listed
+  `replayable: false` yet was replayed. One eligibility rule now feeds both.
+- **`--json` stdout is clean.** The vendored timer/MessagePort error handlers
+  printed page-side errors (e.g. a `performance.timing` probe) to **stdout**,
+  corrupting the JSON envelope (`jq` parse errors). They now land in the
+  bounded `runtime.log` channel via `op_raze_log` (stderr as fallback where
+  ops aren't registered). Errors never touch stdout.
+
+### Changed
+- **Mode-aware capture window.** One 2.5 s clamp served both modes — and sat
+  *below* the 2.5 s subresource-fetch timeout, so a route chunk requested late
+  in a cold-isolate hydration was abandoned before it could finish; thrill's
+  game grid (a TanStack Query inside a lazily-imported route component) never
+  mounted. Observe keeps the tight cap (discovery's ranked calls fire early);
+  Render gets an 8 s floor / 15 s ceiling — a *ceiling*, not a wait: quiesce
+  still ends the window as soon as the page goes idle.
+- **Content-activity quiesce — trackers can't pin the window open.** Timeline
+  traces showed target.com's content done at +1.8 s while FullStory (257 KB),
+  DoubleVerify, googlesyndication, Attentive and Medallia kept the window open
+  to +4.0 s. A curated `is_tracker()` denylist (analytics / session-replay /
+  ads / bot-detection vendors) now classifies requests: trackers are still
+  recorded (discover unaffected) and still fetched live (the page behaves
+  normally) but no longer count as progress or hold the window. Every render
+  now closes deterministically at [last content fetch + quiesce]. Measured:
+  target.com render tier 3999 ms → 2348 ms (−41%) with identical content;
+  thrill (a real data dependency chain) unaffected.
+
+## [0.14.0] — 2026-07-09
+
+### Changed
+- **In-process async engine — the OS process jail is deleted.** Amputate,
+  don't band-aid: the fork/exec jail with its per-chunk blocking IPC was the
+  root cause of Tier 2's serialized, budget-strangled chunk loading, and no
+  amount of prewarming could disguise it. V8 now runs **in-process** on a
+  current-thread tokio runtime behind an async `ScriptFetcher` seam:
+  `op_raze_load_script` is a real async op and the module loader awaits the
+  fetcher, so `import()`/chunk loads fan out **concurrently** on the event
+  loop exactly like a browser's network stack. Initial external `<script src>`
+  are fetched concurrently and executed in document order; an in-flight-load
+  counter keeps the capture window from quiescing mid-load. Containment is the
+  isolate itself — page JS has **no host-capability bindings** (no network, no
+  filesystem, no processes; the only I/O it can cause is the fetches the
+  engine explicitly brokers) — plus the hosted-cloud infrastructure perimeter.
+  Deleted: the `draco-jail` crate (9 files), `prewarm.rs`, and the
+  prefetch/import-graph machinery; `--no-jail`/`--strict-sandbox` remain as
+  inert CLI no-ops. `Tier2Pool` is now a semaphore bounding concurrent
+  isolates.
+
+### Added
+- **Process-global immutable chunk cache.** 512 MiB RAM LRU + 2 GiB disk
+  (`~/.cache/draco/chunks`), collision-safe and never worse than a miss —
+  hashed/immutable SPA chunks are fetched once across scrapes; data responses
+  are deliberately never cached.
+
 ## [0.13.15] — 2026-07-08
 
 ### Changed
