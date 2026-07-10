@@ -750,6 +750,8 @@ mod tests {
             tier2_pool: draco_core::Tier2Pool::new(1, 100, true, false),
             crawl: Default::default(),
             batch: Default::default(),
+            #[cfg(feature = "tier2")]
+            sessions: crate::serve::interact::SessionStore::new(1),
         });
         Router::new()
             .route("/mcp", post(http_handler))

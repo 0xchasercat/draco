@@ -10,12 +10,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 
-use draco_types::{DracoError, JailKind};
+use draco_types::{DracoError, ExtractionResult, JailKind, SourceTier, Status, Timing};
 
 use crate::chunk_cache::ChunkCache;
 use crate::tier2::prod::{capture_config, NetApiFetcher, NetScriptFetcher};
 use crate::tier2::{jail_error, subresource_opts, CaptureMode};
-use crate::Config;
+use crate::{Config, FormatSet};
 
 /// Cookie-aware top-level document fetcher used by explicit session navigation.
 struct NetPageFetcher {
@@ -87,4 +87,44 @@ pub async fn open_interact_session(
     )
     .await
     .map_err(|e| jail_error(JailKind::Spawn, e.to_string()))
+}
+
+/// Project a live session's serialized DOM through Draco's existing content
+/// engine and return the standard extraction envelope.
+///
+/// Interact serialization is already the current full document, so no shell
+/// merge is needed. Only DOM-derived formats are meaningful here; callers reject
+/// `json` and `endpoints` before invoking this helper.
+pub fn scrape_interact_html(
+    url: &str,
+    html: &str,
+    formats: FormatSet,
+    only_main_content: bool,
+) -> ExtractionResult {
+    let scraped = draco_static::content::scrape(
+        html,
+        url,
+        200,
+        "text/html; charset=utf-8",
+        only_main_content,
+    );
+    ExtractionResult {
+        url: url.to_string(),
+        status: Status::Success,
+        source_tier: Some(SourceTier::RuntimeInterception),
+        data: None,
+        markdown: formats.markdown.then_some(scraped.markdown),
+        metadata: Some(scraped.metadata),
+        html: formats
+            .html
+            .then(|| draco_static::content::clean_html(html, url, only_main_content)),
+        raw_html: formats.raw_html.then(|| html.to_string()),
+        links: formats
+            .links
+            .then(|| draco_static::content::extract_links(html, url)),
+        endpoints: None,
+        timing: Timing::default(),
+        trace: Vec::new(),
+        error: None,
+    }
 }

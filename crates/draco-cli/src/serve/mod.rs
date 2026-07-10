@@ -52,6 +52,9 @@ pub(crate) mod crawl;
 pub(crate) mod discover;
 /// Shared async-job registry (`JobStore`) for crawl + batch scrape.
 pub(crate) mod jobs;
+/// Resumable V8 sessions + `POST /v1/interact` REST surface.
+#[cfg(feature = "tier2")]
+pub(crate) mod interact;
 /// `POST /v1/map` — fast site URL discovery (sitemap + on-page links).
 pub(crate) mod map;
 /// `POST /v1/search` — Firecrawl-compatible metasearch (parallel HTTP engines
@@ -89,6 +92,9 @@ pub(crate) struct AppState {
     pub(crate) crawl: jobs::JobStore,
     /// In-memory registry of async batch-scrape jobs (`/v1/batch/scrape`).
     pub(crate) batch: jobs::JobStore,
+    /// Live interact sessions. Absent from lean serve builds with no V8.
+    #[cfg(feature = "tier2")]
+    pub(crate) sessions: interact::SessionStore,
 }
 
 // ===================================================================
@@ -112,6 +118,8 @@ pub async fn serve(opts: ServeOptions) -> Result<(), String> {
         tier2_pool,
         crawl: jobs::JobStore::default(),
         batch: jobs::JobStore::default(),
+        #[cfg(feature = "tier2")]
+        sessions: interact::SessionStore::new(opts.isolate_pool_size),
     });
     let addr = format!("{}:{}", opts.host, opts.port);
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -127,14 +135,15 @@ pub async fn serve(opts: ServeOptions) -> Result<(), String> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| format!("server error: {e}"));
-    // Retire pooled workers promptly on shutdown instead of leaving children to
-    // exit on socket EOF.
+    // Close live session actors before retiring the shared capture pool.
+    #[cfg(feature = "tier2")]
+    state.sessions.close_all().await;
     state.tier2_pool.shutdown();
     result
 }
 
 fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/v1/scrape", post(scrape))
         .route("/v1/map", post(map::map_handler))
@@ -152,8 +161,21 @@ fn router(state: Arc<AppState>) -> Router {
             get(batch::status_handler).delete(batch::cancel_handler),
         )
         .route("/v1/batch/scrape/{id}/errors", get(batch::errors_handler))
-        .route("/mcp", post(crate::mcp::http_handler))
-        .with_state(state)
+        .route("/mcp", post(crate::mcp::http_handler));
+    #[cfg(feature = "tier2")]
+    let router = router
+        .route("/v1/interact", post(interact::open_handler))
+        .route("/v1/interact/{id}/exec", post(interact::exec_handler))
+        .route(
+            "/v1/interact/{id}/navigate",
+            post(interact::navigate_handler),
+        )
+        .route(
+            "/v1/interact/{id}/scrape",
+            post(interact::scrape_handler),
+        )
+        .route("/v1/interact/{id}", axum::routing::delete(interact::close_handler));
+    router.with_state(state)
 }
 
 async fn shutdown_signal() {
@@ -524,6 +546,8 @@ mod tests {
             tier2_pool: Tier2Pool::new(1, 100, true, false),
             crawl: jobs::JobStore::default(),
             batch: jobs::JobStore::default(),
+            #[cfg(feature = "tier2")]
+            sessions: interact::SessionStore::new(1),
         })
     }
 

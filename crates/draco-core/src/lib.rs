@@ -54,7 +54,7 @@ pub use challenge::{detect_challenge, ChallengeKind};
 pub use fetcher::{NetFetcher, PageFetcher};
 pub use machine::{clamp_tier_max, session_opts, ProdStatic, StaticEngine, TIER_CEILING};
 #[cfg(feature = "tier2")]
-pub use interact::open_interact_session;
+pub use interact::{open_interact_session, scrape_interact_html};
 #[cfg(feature = "tier2")]
 pub use draco_runtime::session::{ExecOptions, ExecReport, NavReport, Session};
 /// The warm Tier 2 worker pool for the daemon (real under `tier2`, a
