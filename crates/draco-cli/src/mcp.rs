@@ -11,10 +11,10 @@
 //!   are simpler to reason about than interleaving.
 //! - **HTTP** (`POST /mcp` on the daemon): the minimal Streamable-HTTP subset —
 //!   a single JSON-RPC message per POST, answered with a single
-//!   `application/json` response (`202 Accepted` for notifications). No SSE
-//!   stream, no session management; stateless request/response is all the
-//!   tools need today, and the subset is forward-compatible with clients that
-//!   fall back from SSE.
+//!   `application/json` response (`202 Accepted` for notifications). There is no
+//!   SSE stream or MCP transport session; daemon-scoped interact ids provide the
+//!   only cross-call state. The subset remains forward-compatible with clients
+//!   that fall back from SSE.
 //!
 //! Protocol notes:
 //! - Version negotiation: the client's requested `protocolVersion` is echoed
@@ -41,11 +41,18 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Semaphore;
 
+#[cfg(feature = "tier2")]
+use crate::serve::interact::{SessionStore, SessionStoreError};
 use crate::serve::{parse_formats, search, to_firecrawl, AppState};
 
 /// Protocol revisions this server knows, newest first. The first entry is the
 /// default offered to clients requesting an unknown revision.
 const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+
+#[cfg(feature = "tier2")]
+type InteractStoreRef<'a> = Option<&'a SessionStore>;
+#[cfg(not(feature = "tier2"))]
+type InteractStoreRef<'a> = ();
 
 // ===================================================================
 // Transports
@@ -65,10 +72,14 @@ pub(crate) async fn run_stdio(defaults: Config) -> Result<(), String> {
         if line.trim().is_empty() {
             continue;
         }
+        #[cfg(feature = "tier2")]
+        let sessions: InteractStoreRef<'_> = None;
+        #[cfg(not(feature = "tier2"))]
+        let sessions: InteractStoreRef<'_> = ();
         let response = match serde_json::from_str::<Value>(&line) {
-            // stdio is a single-client session: no daemon gate, and no warm pool
-            // (one-shot `extract` per call is fine for interactive use).
-            Ok(msg) => handle_message(&msg, &defaults, None, None).await,
+            // stdio is a single-client session: no daemon gate, warm pool, or
+            // persistent interact registry.
+            Ok(msg) => handle_message(&msg, &defaults, None, None, sessions).await,
             Err(e) => Some(parse_error(&e)),
         };
         if let Some(resp) = response {
@@ -97,11 +108,16 @@ pub(crate) async fn http_handler(
         Ok(m) => m,
         Err(e) => return (StatusCode::OK, Json(parse_error(&e))),
     };
+    #[cfg(feature = "tier2")]
+    let sessions: InteractStoreRef<'_> = Some(&state.sessions);
+    #[cfg(not(feature = "tier2"))]
+    let sessions: InteractStoreRef<'_> = ();
     match handle_message(
         &msg,
         &state.defaults,
         Some(&state.gate),
         Some(&state.tier2_pool),
+        sessions,
     )
     .await
     {
@@ -124,6 +140,7 @@ async fn handle_message(
     defaults: &Config,
     gate: Option<&Semaphore>,
     pool: Option<&Tier2Pool>,
+    sessions: InteractStoreRef<'_>,
 ) -> Option<Value> {
     let id = msg.get("id").filter(|v| !v.is_null()).cloned();
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
@@ -139,13 +156,9 @@ async fn handle_message(
         "initialize" => Ok(initialize_result(&params)),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({
-            "tools": [
-                scrape_tool_descriptor(),
-                discover_tool_descriptor(),
-                search_tool_descriptor(),
-            ]
+            "tools": tool_descriptors(interact_available(sessions))
         })),
-        "tools/call" => call_tool(&params, defaults, gate, pool).await,
+        "tools/call" => call_tool(&params, defaults, gate, pool, sessions).await,
         _ => Err((-32601, format!("method not found: {method}"))),
     };
 
@@ -192,6 +205,37 @@ fn initialize_result(params: &Value) -> Value {
         "instructions": "Scrape web pages to clean Markdown (and structured JSON-API data) \
                          without a browser via the draco_scrape tool.",
     })
+}
+
+#[cfg(feature = "tier2")]
+fn interact_available(store: InteractStoreRef<'_>) -> bool {
+    store.is_some()
+}
+
+#[cfg(not(feature = "tier2"))]
+fn interact_available(_store: InteractStoreRef<'_>) -> bool {
+    false
+}
+
+fn tool_descriptors(interact: bool) -> Vec<Value> {
+    let tools = vec![
+        scrape_tool_descriptor(),
+        discover_tool_descriptor(),
+        search_tool_descriptor(),
+    ];
+    #[cfg(feature = "tier2")]
+    {
+        let mut tools = tools;
+        if interact {
+            tools.extend(interact_tool_descriptors());
+        }
+        tools
+    }
+    #[cfg(not(feature = "tier2"))]
+    {
+        let _ = interact;
+        tools
+    }
 }
 
 // ===================================================================
@@ -340,6 +384,92 @@ fn search_tool_descriptor() -> Value {
     })
 }
 
+#[cfg(feature = "tier2")]
+fn interact_tool_descriptors() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "draco_interact_open",
+            "title": "Open interact session",
+            "description": "Open a resumable DOM session for a URL and return its id plus \
+                            initial snapshot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "The http(s) URL to open." }
+                },
+                "required": ["url"]
+            },
+            "annotations": { "readOnlyHint": false, "openWorldHint": true }
+        }),
+        json!({
+            "name": "draco_interact_exec",
+            "title": "Execute JavaScript in session",
+            "description": "Run one async JavaScript body in the live page scope and return \
+                            its value and console output.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sessionId": { "type": "string" },
+                    "js": { "type": "string" },
+                    "full": {
+                        "type": "boolean",
+                        "description": "Return the full value regardless of maxBytes."
+                    },
+                    "maxBytes": { "type": "integer", "minimum": 1,
+                                  "description": "Approximate serialized result budget." }
+                },
+                "required": ["sessionId", "js"]
+            },
+            "annotations": { "readOnlyHint": false, "openWorldHint": true }
+        }),
+        json!({
+            "name": "draco_interact_navigate",
+            "title": "Navigate interact session",
+            "description": "Fetch and hydrate another URL in the same cookie-persisting session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sessionId": { "type": "string" },
+                    "url": { "type": "string" }
+                },
+                "required": ["sessionId", "url"]
+            },
+            "annotations": { "readOnlyHint": false, "openWorldHint": true }
+        }),
+        json!({
+            "name": "draco_interact_scrape",
+            "title": "Scrape interact session",
+            "description": "Serialize the current DOM and run Draco's content engine over it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sessionId": { "type": "string" },
+                    "formats": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["markdown", "html", "rawHtml", "links"]
+                        }
+                    }
+                },
+                "required": ["sessionId"]
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false }
+        }),
+        json!({
+            "name": "draco_interact_close",
+            "title": "Close interact session",
+            "description": "Close a live interact session and release its isolate slot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "sessionId": { "type": "string" } },
+                "required": ["sessionId"]
+            },
+            "annotations": { "readOnlyHint": false, "openWorldHint": false }
+        }),
+    ]
+}
+
 /// `tools/call` dispatch. Protocol-level misuse (unknown tool, missing/invalid
 /// params) is a JSON-RPC error; a scrape that *ran and failed* is a tool
 /// result with `isError: true`.
@@ -348,8 +478,15 @@ async fn call_tool(
     defaults: &Config,
     gate: Option<&Semaphore>,
     pool: Option<&Tier2Pool>,
+    sessions: InteractStoreRef<'_>,
 ) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+    #[cfg(feature = "tier2")]
+    if name.starts_with("draco_interact_") {
+        return call_interact(name, params, defaults, sessions).await;
+    }
+    #[cfg(not(feature = "tier2"))]
+    let _ = sessions;
     // `draco_search` is a distinct path (query in, ranked results out) — no URL,
     // its own fan-out + consensus.
     if name == "draco_search" {
@@ -488,6 +625,163 @@ async fn call_tool(
         }));
     }
     Ok(json!({ "content": content, "isError": false }))
+}
+
+#[cfg(feature = "tier2")]
+fn required_interact_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, (i64, String)> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or((-32602, format!("\"{key}\" (string) is required")))
+}
+
+#[cfg(feature = "tier2")]
+async fn call_interact(
+    name: &str,
+    params: &Value,
+    defaults: &Config,
+    sessions: InteractStoreRef<'_>,
+) -> Result<Value, (i64, String)> {
+    let Some(store) = sessions else {
+        return Ok(tool_error("interact requires the daemon HTTP transport"));
+    };
+    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+
+    let payload = match name {
+        "draco_interact_open" => {
+            let url = required_interact_arg(&args, "url")?;
+            let config = Config {
+                formats: FormatSet::markdown_only(),
+                force_render: false,
+                ..defaults.clone()
+            };
+            let opened = match store.open(url, &config).await {
+                Ok(opened) => opened,
+                Err(error) => return Ok(interact_store_error(error)),
+            };
+            let snapshot = opened.snapshot_html.as_deref().map(|html| {
+                let result = draco_core::scrape_interact_html(
+                    url,
+                    html,
+                    FormatSet::markdown_only(),
+                    true,
+                );
+                json!({
+                    "markdown": result.markdown,
+                    "html": html,
+                    "metadata": result.metadata,
+                })
+            });
+            json!({
+                "success": true,
+                "sessionId": opened.id,
+                "snapshot": snapshot,
+            })
+        }
+        "draco_interact_exec" => {
+            let id = required_interact_arg(&args, "sessionId")?;
+            let js = required_interact_arg(&args, "js")?;
+            let defaults = draco_core::ExecOptions::default();
+            let max_bytes = match args.get("maxBytes").and_then(Value::as_u64) {
+                Some(value) => usize::try_from(value)
+                    .map_err(|_| (-32602, "\"maxBytes\" is too large".to_string()))?
+                    .max(1),
+                None => defaults.max_bytes,
+            };
+            let opts = draco_core::ExecOptions {
+                settle: true,
+                full: args
+                    .get("full")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(defaults.full),
+                max_bytes,
+            };
+            let report = match store.exec(id, js.to_string(), opts).await {
+                Ok(report) => report,
+                Err(error) => return Ok(interact_store_error(error)),
+            };
+            json!({
+                "success": report.ok,
+                "result": report.result,
+                "logs": report.logs,
+                "error": report.error,
+            })
+        }
+        "draco_interact_navigate" => {
+            let id = required_interact_arg(&args, "sessionId")?;
+            let url = required_interact_arg(&args, "url")?;
+            let report = match store.navigate(id, url.to_string()).await {
+                Ok(report) => report,
+                Err(error) => return Ok(interact_store_error(error)),
+            };
+            json!({
+                "success": report.ok,
+                "url": report.url,
+                "error": report.error,
+            })
+        }
+        "draco_interact_scrape" => {
+            let id = required_interact_arg(&args, "sessionId")?;
+            let formats: Vec<String> = args
+                .get("formats")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let formats = parse_formats(&formats).map_err(|reject| (-32602, reject.message))?;
+            if formats.json || formats.endpoints {
+                return Err((
+                    -32602,
+                    "interact scrape supports markdown, html, rawHtml, and links".to_string(),
+                ));
+            }
+            let result = match store.scrape(id, formats, true).await {
+                Ok(result) => result,
+                Err(error) => return Ok(interact_store_error(error)),
+            };
+            let (status, body) = to_firecrawl(&result);
+            if status != StatusCode::OK {
+                return Ok(tool_error(
+                    body["error"]
+                        .as_str()
+                        .unwrap_or("interact scrape failed"),
+                ));
+            }
+            body
+        }
+        "draco_interact_close" => {
+            let id = required_interact_arg(&args, "sessionId")?;
+            if let Err(error) = store.close(id).await {
+                return Ok(interact_store_error(error));
+            }
+            json!({ "success": true })
+        }
+        _ => return Err((-32602, format!("unknown tool: {name:?}"))),
+    };
+
+    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+    Ok(json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": false,
+    }))
+}
+
+#[cfg(feature = "tier2")]
+fn interact_store_error(error: SessionStoreError) -> Value {
+    match error {
+        SessionStoreError::NotFound => tool_error("interact session not found"),
+        SessionStoreError::Capacity => tool_error("interact session capacity reached"),
+        SessionStoreError::Closed => tool_error("interact session is closed"),
+        SessionStoreError::Runtime(message) => {
+            tool_error(&format!("interact session error: {message}"))
+        }
+    }
 }
 
 /// `draco_search` execution: fan out across engines, consensus-merge, and
@@ -653,8 +947,12 @@ mod tests {
     }
 
     async fn dispatch(msg: Value) -> Option<Value> {
-        // No gate, no pool: exercises the one-shot `extract` path.
-        handle_message(&msg, &defaults(), None, None).await
+        // No gate, pool, or daemon interact registry.
+        #[cfg(feature = "tier2")]
+        let sessions: InteractStoreRef<'_> = None;
+        #[cfg(not(feature = "tier2"))]
+        let sessions: InteractStoreRef<'_> = ();
+        handle_message(&msg, &defaults(), None, None, sessions).await
     }
 
     // ---- initialize ---------------------------------------------------------
@@ -684,7 +982,7 @@ mod tests {
     // ---- tools/list ---------------------------------------------------------
 
     #[tokio::test]
-    async fn tools_list_advertises_scrape_and_discover() {
+    async fn tools_list_matches_stdio_transport_capabilities() {
         let resp = dispatch(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
             .unwrap();
@@ -692,10 +990,31 @@ mod tests {
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"draco_scrape"), "tools: {names:?}");
         assert!(names.contains(&"draco_discover"), "tools: {names:?}");
-        // Both require a url and are read-only.
-        for t in tools {
-            assert_eq!(t["inputSchema"]["required"], json!(["url"]), "{t}");
-            assert_eq!(t["annotations"]["readOnlyHint"], true, "{t}");
+        assert!(names.contains(&"draco_search"), "tools: {names:?}");
+        assert!(
+            !names.iter().any(|name| name.starts_with("draco_interact_")),
+            "stdio must not advertise daemon-only interact tools: {names:?}"
+        );
+        for name in ["draco_scrape", "draco_discover"] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            assert_eq!(tool["inputSchema"]["required"], json!(["url"]));
+            assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        }
+    }
+
+    #[cfg(feature = "tier2")]
+    #[test]
+    fn daemon_descriptors_include_all_interact_tools() {
+        let tools = tool_descriptors(true);
+        let names: Vec<&str> = tools.iter().filter_map(|tool| tool["name"].as_str()).collect();
+        for name in [
+            "draco_interact_open",
+            "draco_interact_exec",
+            "draco_interact_navigate",
+            "draco_interact_scrape",
+            "draco_interact_close",
+        ] {
+            assert!(names.contains(&name), "missing {name}: {names:?}");
         }
     }
 
@@ -724,6 +1043,25 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp["error"]["code"], -32602);
+    }
+
+    #[cfg(feature = "tier2")]
+    #[tokio::test]
+    async fn stdio_interact_call_returns_transport_error() {
+        let resp = dispatch(json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {
+                "name": "draco_interact_open",
+                "arguments": { "url": "https://example.com" }
+            }
+        }))
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("daemon HTTP transport"));
     }
 
     #[tokio::test]
