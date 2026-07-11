@@ -13,7 +13,8 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use draco_core::{
-    Config, ExecOptions, ExecReport, ExtractionResult, FormatSet, NavReport, Session,
+    ActReport, Action, Config, ExecOptions, ExecReport, ExtractionResult, FormatSet, NavReport,
+    Session,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -222,6 +223,24 @@ impl SessionStore {
         Ok(report)
     }
 
+    pub(crate) async fn act(
+        &self,
+        id: &str,
+        actions: Vec<Action>,
+    ) -> Result<ActReport, SessionStoreError> {
+        let (handle, _) = self.acquire(id)?;
+        let guard = handle.lock().await;
+        let report = guard
+            .as_ref()
+            .ok_or(SessionStoreError::Closed)?
+            .act(actions)
+            .await
+            .map_err(|e| SessionStoreError::Runtime(e.to_string()))?;
+        drop(guard);
+        self.touch(id);
+        Ok(report)
+    }
+
     pub(crate) async fn scrape(
         &self,
         id: &str,
@@ -320,6 +339,17 @@ pub(crate) struct NavigateRequest {
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ScrapeRequest {
+    #[serde(default)]
+    formats: Vec<String>,
+    #[serde(default)]
+    only_main_content: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ActRequest {
+    #[serde(default)]
+    actions: Value,
     #[serde(default)]
     formats: Vec<String>,
     #[serde(default)]
@@ -437,6 +467,77 @@ pub(crate) async fn navigate_handler(
         ),
         Err(error) => store_error_response(error),
     }
+}
+
+pub(crate) async fn act_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ActRequest>,
+) -> (StatusCode, Json<Value>) {
+    let actions: Vec<Action> = match serde_json::from_value(req.actions) {
+        Ok(actions) => actions,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(error_body(&format!("invalid \"actions\": {error}"))),
+            );
+        }
+    };
+    let formats = match parse_formats(&req.formats) {
+        Ok(formats) => formats,
+        Err(reject) => {
+            let status = if reject.unsupported {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return (status, Json(error_body(&reject.message)));
+        }
+    };
+    if formats.json || formats.endpoints {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(error_body(
+                "interact act supports DOM-derived formats only: markdown, html, rawHtml, links",
+            )),
+        );
+    }
+    let report = match state.sessions.act(&id, actions).await {
+        Ok(report) => report,
+        Err(error) => return store_error_response(error),
+    };
+    let only_main = req
+        .only_main_content
+        .unwrap_or(state.defaults.only_main_content);
+    let result = match state.sessions.scrape(&id, formats, only_main).await {
+        Ok(result) => result,
+        Err(error) => return store_error_response(error),
+    };
+    let (status, mut body) = to_firecrawl(&result);
+    if status != StatusCode::OK {
+        return (status, Json(body));
+    }
+    if let Some(data) = body.get_mut("data").and_then(Value::as_object_mut) {
+        data.insert("ok".into(), Value::Bool(report.ok));
+        data.insert(
+            "steps".into(),
+            Value::Array(
+                report
+                    .steps
+                    .into_iter()
+                    .map(|step| {
+                        json!({
+                            "action": step.action,
+                            "ok": step.ok,
+                            "error": step.error,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+        data.insert("logs".into(), json!(report.logs));
+    }
+    (status, Json(body))
 }
 
 pub(crate) async fn scrape_handler(
