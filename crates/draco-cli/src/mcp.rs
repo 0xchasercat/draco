@@ -61,6 +61,21 @@ type InteractStoreRef<'a> = ();
 /// Run the MCP server over stdio until stdin closes. `defaults` seeds each
 /// tool call's [`Config`]; per-call arguments override individual fields.
 pub(crate) async fn run_stdio(defaults: Config) -> Result<(), String> {
+    // A persistent interact registry for the stdio session so the
+    // `draco_interact_*` tools are advertised AND usable over stdio — the
+    // transport MCP clients (Claude Desktop/Code, editors) actually use. A stdio
+    // process is one long-lived single client, so one store held for the life of
+    // the loop is exactly right: `open` on one message, `exec`/`navigate` on the
+    // next, `close` later, all against the same sessions (idle-reaped meanwhile).
+    // Sized like the daemon's auto isolate pool (≈ CPU count); each live session
+    // is a V8 isolate. tier2-only — a lean build has no interact surface.
+    #[cfg(feature = "tier2")]
+    let session_store = SessionStore::new(
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4),
+    );
+
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut lines = BufReader::new(stdin).lines();
@@ -73,12 +88,13 @@ pub(crate) async fn run_stdio(defaults: Config) -> Result<(), String> {
             continue;
         }
         #[cfg(feature = "tier2")]
-        let sessions: InteractStoreRef<'_> = None;
+        let sessions: InteractStoreRef<'_> = Some(&session_store);
         #[cfg(not(feature = "tier2"))]
         let sessions: InteractStoreRef<'_> = ();
         let response = match serde_json::from_str::<Value>(&line) {
-            // stdio is a single-client session: no daemon gate, warm pool, or
-            // persistent interact registry.
+            // stdio is a single-client session: no daemon gate or warm pool. It
+            // does keep a persistent interact registry (above) so the session
+            // tools work across messages.
             Ok(msg) => handle_message(&msg, &defaults, None, None, sessions).await,
             Err(e) => Some(parse_error(&e)),
         };
