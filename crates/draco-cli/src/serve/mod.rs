@@ -50,11 +50,11 @@ pub(crate) mod batch;
 pub(crate) mod crawl;
 /// `POST /v1/discover` — JSON/XHR API endpoint discovery + winner replay.
 pub(crate) mod discover;
-/// Shared async-job registry (`JobStore`) for crawl + batch scrape.
-pub(crate) mod jobs;
 /// Resumable V8 sessions + `POST /v1/interact` REST surface.
 #[cfg(feature = "tier2")]
 pub(crate) mod interact;
+/// Shared async-job registry (`JobStore`) for crawl + batch scrape.
+pub(crate) mod jobs;
 /// `POST /v1/map` — fast site URL discovery (sitemap + on-page links).
 pub(crate) mod map;
 /// `POST /v1/search` — Firecrawl-compatible metasearch (parallel HTTP engines
@@ -170,11 +170,11 @@ fn router(state: Arc<AppState>) -> Router {
             "/v1/interact/{id}/navigate",
             post(interact::navigate_handler),
         )
+        .route("/v1/interact/{id}/scrape", post(interact::scrape_handler))
         .route(
-            "/v1/interact/{id}/scrape",
-            post(interact::scrape_handler),
-        )
-        .route("/v1/interact/{id}", axum::routing::delete(interact::close_handler));
+            "/v1/interact/{id}",
+            axum::routing::delete(interact::close_handler),
+        );
     router.with_state(state)
 }
 

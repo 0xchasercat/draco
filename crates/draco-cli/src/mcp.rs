@@ -661,12 +661,8 @@ async fn call_interact(
                 Err(error) => return Ok(interact_store_error(error)),
             };
             let snapshot = opened.snapshot_html.as_deref().map(|html| {
-                let result = draco_core::scrape_interact_html(
-                    url,
-                    html,
-                    FormatSet::markdown_only(),
-                    true,
-                );
+                let result =
+                    draco_core::scrape_interact_html(url, html, FormatSet::markdown_only(), true);
                 json!({
                     "markdown": result.markdown,
                     "html": html,
@@ -748,9 +744,7 @@ async fn call_interact(
             let (status, body) = to_firecrawl(&result);
             if status != StatusCode::OK {
                 return Ok(tool_error(
-                    body["error"]
-                        .as_str()
-                        .unwrap_or("interact scrape failed"),
+                    body["error"].as_str().unwrap_or("interact scrape failed"),
                 ));
             }
             body
@@ -1006,7 +1000,10 @@ mod tests {
     #[test]
     fn daemon_descriptors_include_all_interact_tools() {
         let tools = tool_descriptors(true);
-        let names: Vec<&str> = tools.iter().filter_map(|tool| tool["name"].as_str()).collect();
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
         for name in [
             "draco_interact_open",
             "draco_interact_exec",

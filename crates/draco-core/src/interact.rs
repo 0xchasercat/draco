@@ -62,8 +62,8 @@ pub async fn open_interact_session(
     let page_opts = opts.clone();
     let cache = ChunkCache::shared();
     let allow_unsafe = config.allow_unsafe_replay;
-    let factory: draco_runtime::session::FetcherFactory = Box::new(move || {
-        draco_runtime::session::SessionFetchers {
+    let factory: draco_runtime::session::FetcherFactory =
+        Box::new(move || draco_runtime::session::SessionFetchers {
             scripts: Rc::new(NetScriptFetcher {
                 opts: network_opts.clone(),
                 cache,
@@ -73,8 +73,7 @@ pub async fn open_interact_session(
                 allow_unsafe,
             })),
             page: Some(Rc::new(NetPageFetcher { opts: page_opts })),
-        }
-    });
+        });
 
     let capture = capture_config(config, CaptureMode::Render);
     draco_runtime::session::Session::open(

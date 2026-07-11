@@ -56,12 +56,12 @@ mod interact;
 // ---- Public API -----------------------------------------------------------
 
 pub use challenge::{detect_challenge, ChallengeKind};
-pub use fetcher::{NetFetcher, PageFetcher};
-pub use machine::{clamp_tier_max, session_opts, ProdStatic, StaticEngine, TIER_CEILING};
-#[cfg(feature = "tier2")]
-pub use interact::{open_interact_session, scrape_interact_html};
 #[cfg(feature = "tier2")]
 pub use draco_runtime::session::{ExecOptions, ExecReport, NavReport, Session};
+pub use fetcher::{NetFetcher, PageFetcher};
+#[cfg(feature = "tier2")]
+pub use interact::{open_interact_session, scrape_interact_html};
+pub use machine::{clamp_tier_max, session_opts, ProdStatic, StaticEngine, TIER_CEILING};
 /// The warm Tier 2 worker pool for the daemon (real under `tier2`, a
 /// finalizes-`Unsupported` stub in the lean build). Paired with
 /// [`extract_with_pool`].

@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use draco_core::{Config, ExecOptions, ExecReport, ExtractionResult, FormatSet, NavReport, Session};
+use draco_core::{
+    Config, ExecOptions, ExecReport, ExtractionResult, FormatSet, NavReport, Session,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
@@ -122,10 +124,7 @@ impl SessionStore {
             .collect()
     }
 
-    fn acquire(
-        &self,
-        id: &str,
-    ) -> Result<SessionHandle, SessionStoreError> {
+    fn acquire(&self, id: &str) -> Result<SessionHandle, SessionStoreError> {
         let mut sessions = self.lock_sessions();
         let entry = sessions.get_mut(id).ok_or(SessionStoreError::NotFound)?;
         entry.last_activity = Instant::now();
