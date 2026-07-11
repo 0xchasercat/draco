@@ -415,7 +415,7 @@ fn base64_encode(input: &[u8]) -> String {
 // ===========================================================================
 
 #[cfg(feature = "tier2")]
-mod prod {
+pub(crate) mod prod {
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -437,9 +437,9 @@ mod prod {
     /// own event loop — many chunk/module loads kicked off in a burst fan out
     /// concurrently over Tokio instead of serializing one blocking round-trip at a
     /// time (the whole point of retiring the jail's per-chunk IPC).
-    struct NetScriptFetcher {
-        opts: draco_net::SessionOpts,
-        cache: Arc<ChunkCache>,
+    pub(crate) struct NetScriptFetcher {
+        pub(crate) opts: draco_net::SessionOpts,
+        pub(crate) cache: Arc<ChunkCache>,
     }
 
     impl draco_runtime::ScriptFetcher for NetScriptFetcher {
@@ -485,9 +485,9 @@ mod prod {
     /// read-style POST/PUT (GraphQL/JSON-RPC), which is how a CSR SPA fetches its
     /// layout data. `allow_unsafe` (from `--allow-unsafe-replay`) opens the gate to
     /// any method.
-    struct NetApiFetcher {
-        opts: draco_net::SessionOpts,
-        allow_unsafe: bool,
+    pub(crate) struct NetApiFetcher {
+        pub(crate) opts: draco_net::SessionOpts,
+        pub(crate) allow_unsafe: bool,
     }
 
     impl NetApiFetcher {
@@ -546,7 +546,10 @@ mod prod {
     /// requested capture window is clamped ([`effective_capture_window_ms`]); the
     /// stub body is `"[]"` (an empty JSON array — the shape most page code
     /// `.flatMap`/`.map`s over without throwing, so hydration proceeds).
-    fn capture_config(config: &Config, mode: CaptureMode) -> draco_runtime::CaptureConfig {
+    pub(crate) fn capture_config(
+        config: &Config,
+        mode: CaptureMode,
+    ) -> draco_runtime::CaptureConfig {
         let capture_window_ms = effective_capture_window_ms(config.capture_window_ms, mode);
         draco_runtime::CaptureConfig {
             capture_window_ms,

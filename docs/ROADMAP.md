@@ -1,6 +1,6 @@
 # Draco Roadmap — current handoff
 
-Status as of **v0.16.0** (2026-07-10). This is the canonical takeover document for the next agent. It supersedes older roadmap notes and matches the repository state on `main` at tag `v0.16.0`. (Search shipped in v0.16.0; the next net-new feature is **v0.17.0 — interact**, an LLM-driven stateful session over the engine. See the companion interact design doc.)
+Status as of **v0.17.0** (2026-07-11). This is the canonical takeover document for the next agent. It supersedes older roadmap notes and matches the repository state on `main` at tag `v0.17.0`. (Search shipped in v0.16.0; interact — the LLM-driven stateful session over the engine — shipped in v0.17.0. Both are in the capability matrix below.)
 
 Draco is a fast, stealth, native-Rust web scraper positioned as a lighter DOM-only alternative to Firecrawl / Browserbase. It is not a browser and must never fake browser-only outputs such as screenshots or actions.
 
@@ -88,6 +88,7 @@ A long run of fixes making the (then jailed, jitless) Tier 2 isolate hydrate rea
 - Webhooks: shipped.
 - Tier 2 render mode: shipped (v0.15.0).
 - Search: **shipped (v0.16.0)** — `POST /v1/search`, `draco search`, MCP `draco_search`; parallel multi-engine metasearch with reciprocal-rank consensus (design section below retained as reference).
+- Interact: **shipped (v0.17.0)** — resumable Tier 2 sessions: `POST /v1/interact` (open/exec/navigate/scrape/delete), `draco interact`, MCP `draco_interact_*`. LLM-driven devtools-console over the engine (run JS, click/navigate by selector), cookies persisted per session. Tier2-gated surface.
 
 ## Shipped in v0.16.0 — search / metasearch (design retained as reference)
 
@@ -258,7 +259,9 @@ The Tier 2 render tier is now correct and its window management is deterministic
 
 ## Suggested immediate next step
 
-Search (v0.16.0) shipped. Two viable tracks; pick per priority:
+Search (v0.16.0) and interact (v0.17.0) shipped. Viable tracks; pick per priority:
 
-- **Interact (v0.17.0)** — the next net-new feature: an LLM-driven **stateful session** over the Draco engine (a "devtools console" — run JS in page scope, click/type via selectors, navigate, cookies persisted for the job), no browser. Makes the one-shot Tier 2 capture **resumable** (a session actor: a dedicated thread owning the isolate, driven by a command channel). Key decision: safety guardrails (mutation gate, robots, replay toggles) are a **deployment tier** — the production daemon runs full-access — while **containment (no host bindings) is permanent**. Surface `/v1/interact` + `draco interact` + MCP `draco_interact_*`. See the companion interact design doc for the locked design, slices, and risk register (the long-lived isolate is the risk gate — prove it in isolation first).
+- **Interact 4b — auto-navigation** — v0.17.0 navigation is *explicit* (`navigate(url)`); the ergonomic next step is intercepting `<a>`-click / `location` setters in the glue so a page-driven navigation refetches automatically. Deferred because it depends on happy-dom event semantics and wants gate iteration; the explicit path is the safe v1.
+- **Interact hardening** — a live login-flow cookie-persistence e2e (added in v0.17.0 as `crates/draco-cli/tests/interact_cookie_e2e.rs`); extend with concurrency/TTL-reaper coverage and a `scrapeOptions`-style render-then-Markdown for `…/scrape`.
+- **Shared hydrate helper** — `run_capture_inner` and `session::hydrate` still duplicate the linear open sequence (inputs → glue → document-order eval → lifecycle); extract one helper now that both are green on the gate.
 - **Render-tier performance** — the DOM-content-settled quiesce lever (backlog item 1); the window is idle-dominated (PR #17), so this is the remaining safe win, not CPU profiling.

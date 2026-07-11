@@ -28,7 +28,12 @@
 //! the CLI runs end-to-end even though live Tier 0/1 needs the sibling crates.
 #![allow(dead_code, unused_variables)]
 
-use draco_types::ExtractionResult;
+// Re-exported (not just `use`d): `ExtractionResult` is the return type of the
+// public `extract` / `extract_with_pool` / `scrape_interact_html`, so callers
+// (the daemon's `serve::interact`) can name it as `draco_core::ExtractionResult`
+// — matching how the crate already re-exports the other types its public API
+// surfaces (`Session`, `ExecReport`, `NavReport`).
+pub use draco_types::ExtractionResult;
 
 mod challenge;
 mod fetcher;
@@ -45,11 +50,17 @@ mod tier2;
 
 #[cfg(feature = "tier2")]
 mod chunk_cache;
+#[cfg(feature = "tier2")]
+mod interact;
 
 // ---- Public API -----------------------------------------------------------
 
 pub use challenge::{detect_challenge, ChallengeKind};
+#[cfg(feature = "tier2")]
+pub use draco_runtime::session::{ExecOptions, ExecReport, NavReport, Session};
 pub use fetcher::{NetFetcher, PageFetcher};
+#[cfg(feature = "tier2")]
+pub use interact::{open_interact_session, scrape_interact_html};
 pub use machine::{clamp_tier_max, session_opts, ProdStatic, StaticEngine, TIER_CEILING};
 /// The warm Tier 2 worker pool for the daemon (real under `tier2`, a
 /// finalizes-`Unsupported` stub in the lean build). Paired with

@@ -3,6 +3,47 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.17.0] — 2026-07-11
+
+### Added
+- **Interact — LLM-driven stateful sessions over the Draco engine, no browser.**
+  A resumable Tier 2 isolate an agent drives turn-by-turn: run JS in page scope,
+  read the returned value + console, click/type via selectors, and navigate —
+  with the network session (cookies) persisted for the whole job. New
+  `POST /v1/interact` (open) / `…/{id}/exec` / `…/{id}/navigate` / `…/{id}/scrape`
+  / `DELETE …/{id}`, a `draco interact` CLI (one-shot `--exec` + REPL), and MCP
+  `draco_interact_open`/`exec`/`navigate`/`scrape`/`close` tools. It's the
+  DOM-only analog of a devtools console: querying content, clicking a link, and
+  reading the result needs a DOM + JS runtime + a cookie-carrying network stack,
+  all of which the engine already has — not a renderer.
+  - **Session actor.** A `JsRuntime` is `!Send`, so each session owns a dedicated
+    OS thread running the isolate on a current-thread tokio runtime; the `Send`
+    `Session` handle drives it over an `mpsc` command channel with per-command
+    `oneshot` replies. Between commands the loop keeps pumping the event loop, so
+    timers / in-flight fetches armed in one turn resolve before the next. Made
+    the one-shot capture path resumable (open → hold → exec/navigate/scrape →
+    close) without forking the shipped `run_capture` machinery.
+  - **exec value capture.** A turn runs as an async function body (may `await`;
+    `return`s a value) and the completion value is serialized page-side under a
+    size budget — primitives/arrays/objects pass through, DOM nodes/functions/
+    cycles are *described* rather than dropped, an over-budget value becomes a
+    `{ "__truncated": true, … }` descriptor unless `full` (with `maxBytes`).
+  - **Navigation with cookie persistence.** `navigate(url)` fetches the next
+    document through a cookie-aware page fetcher and re-hydrates in the same
+    session, so a `Set-Cookie` (login / CSRF / session id) from one page rides to
+    the next — one operation-scoped cookie jar shared by the initial fetch,
+    script/module loads, page API requests, and every navigation. This is the
+    browser-tab behaviour that makes multi-page / login interact flows work.
+  - **Daemon session lifecycle.** An in-memory `SessionStore` (idle-TTL + hard
+    lifetime cap reaper, concurrency-capped to the isolate pool) holds live
+    sessions across requests and closes them all on graceful shutdown. The whole
+    interact surface (REST + CLI + MCP) is tier2-gated: a lean
+    `--no-default-features` / serve-only build compiles it out cleanly.
+  - **Containment unchanged.** The isolate still has no host-capability bindings;
+    `exec` runs arbitrary page JS but its only I/O is the fetches the engine
+    brokers — resumability does not widen the boundary. Network guardrails
+    (mutation-safety, robots) remain a deployment-tier concern.
+
 ## [0.16.0] — 2026-07-10
 
 ### Added
