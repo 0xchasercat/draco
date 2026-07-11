@@ -57,7 +57,9 @@ mod interact;
 
 pub use challenge::{detect_challenge, ChallengeKind};
 #[cfg(feature = "tier2")]
-pub use draco_runtime::session::{ExecOptions, ExecReport, NavReport, Session};
+pub use draco_runtime::session::{
+    ActReport, ActStep, Action, ExecOptions, ExecReport, NavReport, Session,
+};
 pub use fetcher::{NetFetcher, PageFetcher};
 #[cfg(feature = "tier2")]
 pub use interact::{open_interact_session, scrape_interact_html};
