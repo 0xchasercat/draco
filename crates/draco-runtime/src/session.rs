@@ -343,7 +343,7 @@ async fn actor_main(
     let fetchers = fetchers_factory();
 
     let (mut runtime, mut cap) = match hydrate(&config, &fetchers).await {
-        Ok(parts) => parts,
+        Ok(parts) => (Some(parts.0), Some(parts.1)),
         Err(e) => {
             let _ = ready_tx.send(Err(e));
             return;
@@ -352,7 +352,12 @@ async fn actor_main(
 
     // Initial settle: let the freshly-hydrated page's scheduled work land, exactly
     // as the one-shot path's capture window does, before we report ready.
-    pump_to_quiesce(&mut runtime, &cap, &config.capture).await;
+    pump_to_quiesce(
+        runtime.as_mut().unwrap(),
+        cap.as_ref().unwrap(),
+        &config.capture,
+    )
+    .await;
     if ready_tx.send(Ok(())).is_err() {
         // Opener gave up; nothing to serve.
         return;
@@ -369,15 +374,16 @@ async fn actor_main(
                 match maybe_cmd {
                     None => break, // all handles dropped -> tear down
                     Some(Command::Exec { js, opts, reply }) => {
-                        let report = do_exec(&mut runtime, &cap, &config.capture, &js, &opts).await;
+                        let report = do_exec(runtime.as_mut().unwrap(), cap.as_ref().unwrap(), &config.capture, &js, &opts).await;
                         let _ = reply.send(report);
                     }
                     Some(Command::Serialize { reply }) => {
-                        serialize_dom(&mut runtime);
-                        let html = cap.borrow().rendered_html.clone();
+                        serialize_dom(runtime.as_mut().unwrap());
+                        let html = cap.as_ref().unwrap().borrow().rendered_html.clone();
                         let _ = reply.send(html);
                     }
                     Some(Command::Navigate { url, reply }) => {
+                        let mut old_dropped = false;
                         let report = match &fetchers.page {
                             None => NavReport {
                                 ok: false,
@@ -393,10 +399,15 @@ async fn actor_main(
                                     error: Some(format!("failed to fetch {url}")),
                                 },
                                 Some((final_url, html)) => {
-                                    // Re-hydrate a fresh isolate with the new document,
-                                    // reusing the same fetchers (cookies persist). On
-                                    // success the old isolate is dropped (replaced); on
-                                    // failure the current page stays loaded.
+                                    // Drop the old V8 isolate *before* creating the
+                                    // new one.  Two isolates on the same thread cause
+                                    // a V8 HandleScope CHECK failure during the old
+                                    // isolate's realm teardown (SetAlignedPointerIn-
+                                    // EmbedderData creates a handle without a scope).
+                                    drop(runtime.take());
+                                    drop(cap.take());
+                                    old_dropped = true;
+
                                     let nav_cfg = SessionConfig {
                                         url: final_url.clone(),
                                         html,
@@ -404,9 +415,9 @@ async fn actor_main(
                                     };
                                     match hydrate(&nav_cfg, &fetchers).await {
                                         Ok((new_rt, new_cap)) => {
-                                            runtime = new_rt;
-                                            cap = new_cap;
-                                            pump_to_quiesce(&mut runtime, &cap, &config.capture)
+                                            runtime = Some(new_rt);
+                                            cap = Some(new_cap);
+                                            pump_to_quiesce(runtime.as_mut().unwrap(), cap.as_ref().unwrap(), &config.capture)
                                                 .await;
                                             NavReport {
                                                 ok: true,
@@ -423,7 +434,11 @@ async fn actor_main(
                                 }
                             },
                         };
+                        let ok = report.ok;
                         let _ = reply.send(report);
+                        if old_dropped && !ok {
+                            break;
+                        }
                     }
                     Some(Command::Close { reply }) => {
                         let _ = reply.send(());
@@ -435,7 +450,9 @@ async fn actor_main(
                 // Keep background work (timers, in-flight fetches) progressing while
                 // idle-waiting for the next command. A drained loop returns fast, so
                 // this is not a busy-spin.
-                let _ = poll_once(&mut runtime);
+                if let Some(rt) = runtime.as_mut() {
+                    let _ = poll_once(rt);
+                }
             }
         }
     }
