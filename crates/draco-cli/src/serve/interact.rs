@@ -53,12 +53,20 @@ pub(crate) struct OpenedSession {
     pub(crate) snapshot_html: Option<String>,
 }
 
+type SessionHandle = (Arc<AsyncMutex<Option<Session>>>, String);
+
 #[derive(Debug)]
 pub(crate) enum SessionStoreError {
     NotFound,
     Capacity,
     Closed,
     Runtime(String),
+}
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::new(0)
+    }
 }
 
 impl SessionStore {
@@ -117,7 +125,7 @@ impl SessionStore {
     fn acquire(
         &self,
         id: &str,
-    ) -> Result<(Arc<AsyncMutex<Option<Session>>>, String), SessionStoreError> {
+    ) -> Result<SessionHandle, SessionStoreError> {
         let mut sessions = self.lock_sessions();
         let entry = sessions.get_mut(id).ok_or(SessionStoreError::NotFound)?;
         entry.last_activity = Instant::now();

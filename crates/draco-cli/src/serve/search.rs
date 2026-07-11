@@ -1281,7 +1281,6 @@ fn clean_text(fragment: &str) -> String {
             match find_tag_end(bytes, at + 1) {
                 Some(end) => {
                     at = end + 1;
-                    plain.push(' ');
                     continue;
                 }
                 None => break,
