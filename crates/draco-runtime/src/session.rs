@@ -674,19 +674,36 @@ async fn do_exec(
 /// reported through the same channel as an `{ "__error": ... }` value while the
 /// turn's `error`/logs still carry the raw throw.
 fn build_exec_wrapper(js: &str, budget: f64) -> String {
-    // `MAXB` and the user body are the only interpolated parts; everything else is
-    // a fixed, self-contained serializer (no dependency on glue additions).
+    // The user source is embedded as a STRING and evaluated for its completion
+    // value (devtools-console / REPL semantics) rather than spliced as a function
+    // body — so a bare last expression (`document.title`, `els.length`) is
+    // captured WITHOUT an explicit `return`. `MAXB` and that string literal are the
+    // only interpolated parts; the serializer below is fixed.
+    let src_lit = json_string_literal(js);
     format!(
         r#"(async () => {{
   const MAXB = {budget};
+  const __src = {src_lit};
   let __v;
   try {{
-    __v = await (async () => {{
-{js}
-}})();
+    // Indirect eval runs in global scope (sees `document`/`window`, not our
+    // wrapper locals); its completion value is the last expression's value.
+    // `await` resolves a trailing promise (e.g. a bare `fetch(...)`).
+    __v = await (0, eval)(__src);
   }} catch (e) {{
-    try {{ Deno.core.ops.op_raze_exec_result(JSON.stringify({{ __error: (e && e.stack) ? String(e.stack) : String(e) }})); }} catch (_e) {{}}
-    return;
+    if (e instanceof SyntaxError) {{
+      // Not a bare expression (top-level `await`/`return`/`import`): run it as an
+      // async body — a value still comes back via an explicit `return`.
+      try {{
+        __v = await (0, eval)("(async () => {{" + __src + "\n}})()");
+      }} catch (e2) {{
+        try {{ Deno.core.ops.op_raze_exec_result(JSON.stringify({{ __error: (e2 && e2.stack) ? String(e2.stack) : String(e2) }})); }} catch (_e) {{}}
+        return;
+      }}
+    }} else {{
+      try {{ Deno.core.ops.op_raze_exec_result(JSON.stringify({{ __error: (e && e.stack) ? String(e.stack) : String(e) }})); }} catch (_e) {{}}
+      return;
+    }}
   }}
   if (__v === undefined) return;
   const seen = new WeakSet();
