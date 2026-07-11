@@ -290,6 +290,41 @@ curl -X POST localhost:3002/v1/search -H 'content-type: application/json' \
   merges the `Document` fields (`markdown`/`html`/`rawHtml`/`links`/`json`/
   `metadata`) onto the hit — same `FormatSet`, bounded concurrency.
 
+### Interact (`draco interact` / `POST /v1/interact`)
+
+Drive a page like a **devtools console**, no browser: open a stateful session,
+then run JS in page scope, read the returned value + console, click/type via
+selectors, and navigate — with **cookies persisted for the whole session** (a
+`Set-Cookie` on one page rides to the next, so multi-page and login flows work).
+It's the DOM-only analog of Firecrawl's browser actions: querying content and
+clicking a link needs a DOM + JS runtime + a cookie-carrying network stack, all
+of which Draco already has — not a renderer. The isolate keeps its no-host-
+bindings containment; `exec` runs arbitrary page JS but its only I/O is the
+fetches the engine brokers.
+
+```sh
+draco interact https://app.example.com --exec "return document.title"   # one-shot
+draco interact https://app.example.com                                   # REPL
+```
+```sh
+# Open a session, act, read back, close (the daemon keeps it warm between calls).
+curl -X POST localhost:3002/v1/interact -H 'content-type: application/json' \
+  -d '{"url": "https://app.example.com"}'
+# → { "success": true, "sessionId": "…", "snapshot": { "markdown": … } }
+curl -X POST localhost:3002/v1/interact/<id>/exec -H 'content-type: application/json' \
+  -d '{"js": "return [...document.querySelectorAll(\"a\")].map(a => a.href)"}'
+# → { "success": true, "result": [ … ], "logs": [ … ] }
+```
+
+- **`exec`** — the turn is an async function body (may `await`, `return`s a
+  value); the value is serialized under a budget (DOM nodes/functions described,
+  over-budget → a truncation descriptor unless `full`/`maxBytes`). **`navigate`**
+  — fetch the next document (cookie-aware) and re-hydrate in place; "click a link
+  by selector" is `exec("return el.href")` → `navigate(href)`. **`scrape`** —
+  Markdown/HTML/links of the live DOM. `DELETE` closes; idle sessions are reaped.
+- Sessions are held in-memory on the daemon, concurrency-capped and idle-reaped.
+  The interact surface needs Tier 2 (V8); a lean serve build omits it.
+
 ### MCP server (`draco mcp` / `POST /mcp`)
 
 Draco's scraping is available as **Model Context Protocol tools** for agent
@@ -314,6 +349,10 @@ Three tools, all annotated read-only:
 - `draco_search` (`query`, `limit`, `tbs`, `location`, `timeout`, `formats`) —
   parallel multi-engine web search merged by reciprocal-rank consensus; with
   `formats` it also scrapes each result and merges the content onto the hit.
+- `draco_interact_open`/`exec`/`navigate`/`scrape`/`close` — a stateful page
+  session an agent drives across calls (open → run JS / click / navigate → read
+  → close), cookies persisted for the session. Advertised only on the daemon
+  (`POST /mcp`), where sessions are held; requires Tier 2.
 
 Tool-level failures come back as `isError` results the model can react to;
 protocol misuse is a proper JSON-RPC error.
