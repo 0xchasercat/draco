@@ -28,7 +28,12 @@
 //! the CLI runs end-to-end even though live Tier 0/1 needs the sibling crates.
 #![allow(dead_code, unused_variables)]
 
-use draco_types::ExtractionResult;
+// Re-exported (not just `use`d): `ExtractionResult` is the return type of the
+// public `extract` / `extract_with_pool` / `scrape_interact_html`, so callers
+// (the daemon's `serve::interact`) can name it as `draco_core::ExtractionResult`
+// — matching how the crate already re-exports the other types its public API
+// surfaces (`Session`, `ExecReport`, `NavReport`).
+pub use draco_types::ExtractionResult;
 
 mod challenge;
 mod fetcher;
