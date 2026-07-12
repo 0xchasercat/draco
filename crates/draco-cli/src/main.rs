@@ -152,6 +152,14 @@ enum Command {
         /// JSONPath filter applied to `.data` before printing.
         #[arg(long)]
         extract: Option<String>,
+        /// Selector-schema structured extraction: a JSON object mapping output
+        /// field names to CSS-selector specs (string shorthand, or
+        /// `{selector, all, attr, fields}`), evaluated against the fetched or
+        /// rendered HTML. The result rides the envelope as `extract`. Distinct
+        /// from `--extract`, which JSONPath-filters the tiered `data` payload.
+        /// Implies the JSON envelope output.
+        #[arg(long, value_name = "JSON")]
+        extract_schema: Option<String>,
         /// http/https/socks5 proxy URL.
         #[arg(long)]
         proxy: Option<String>,
@@ -647,6 +655,7 @@ async fn async_main() {
             format,
             json,
             extract: extract_expr,
+            extract_schema,
             proxy,
             delay,
             timeout,
@@ -666,9 +675,24 @@ async fn async_main() {
             pretty,
         } => {
             let formats = formats_from_args(&format);
+            let extract_schema = match extract_schema.as_deref() {
+                None => None,
+                Some(raw) => match serde_json::from_str::<serde_json::Value>(raw) {
+                    Ok(v) if v.is_object() => Some(v),
+                    Ok(_) => {
+                        eprintln!("draco: --extract-schema must be a JSON object");
+                        std::process::exit(2);
+                    }
+                    Err(e) => {
+                        eprintln!("draco: invalid --extract-schema JSON: {e}");
+                        std::process::exit(2);
+                    }
+                },
+            };
+            let has_extract_schema = extract_schema.is_some();
             let config = Config {
                 formats,
-                extract_schema: None,
+                extract_schema,
                 only_main_content: !no_main_content,
                 include_tags: include_tag,
                 exclude_tags: exclude_tag,
@@ -691,8 +715,9 @@ async fn async_main() {
             if let Some(expr) = extract_expr.as_deref() {
                 result = filter_result(result, expr);
             }
-            // `--runtime-log` implies the envelope: the trace carries the logs.
-            let json = json || runtime_log;
+            // `--runtime-log` implies the envelope (the trace carries the logs);
+            // `--extract-schema` does too (the extraction rides the envelope).
+            let json = json || runtime_log || has_extract_schema;
             print!("{}", render_output(&result, formats, json, pretty));
             std::process::exit(status_to_exit_code(result.status));
         }
