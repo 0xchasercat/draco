@@ -256,12 +256,14 @@ pub enum Action {
     Select { selector: String, value: String },
     /// Hover: pointerover/mouseover/mouseenter/mousemove.
     Hover { selector: String },
-    /// Wait until `selector` appears (up to `timeout_ms`), or a fixed
-    /// `milliseconds` pause. Defaults: 5000 ms selector timeout.
+    /// Wait until `selector` appears, or a fixed `milliseconds` pause (both
+    /// ceilinged by the capture window). `ms` is accepted as an alias for
+    /// `milliseconds` (Firecrawl uses the long name; agents habitually send
+    /// the short one).
     Wait {
         #[serde(default)]
         selector: Option<String>,
-        #[serde(default)]
+        #[serde(default, alias = "ms")]
         milliseconds: Option<u64>,
     },
 }
@@ -1020,7 +1022,9 @@ async fn wait_action(
     }
     let sel = match selector {
         Some(s) => s,
-        None => return Err("wait requires `selector` or `milliseconds`".to_string()),
+        None => {
+            return Err("wait requires `selector` or `milliseconds` (alias: `ms`)".to_string())
+        }
     };
     let check_js = SEL_PRESENT_JS.replace("__SEL__", &json_string_literal(sel));
     let ceiling = Duration::from_millis(cfg.capture_window_ms);
