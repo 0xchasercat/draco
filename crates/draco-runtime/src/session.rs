@@ -1022,7 +1022,9 @@ async fn wait_action(
     }
     let sel = match selector {
         Some(s) => s,
-        None => return Err("wait requires `selector` or `milliseconds` (alias: `ms`)".to_string()),
+        None => {
+            return Err("wait requires `selector` or `milliseconds` (alias: `ms`)".to_string())
+        }
     };
     let check_js = SEL_PRESENT_JS.replace("__SEL__", &json_string_literal(sel));
     let ceiling = Duration::from_millis(cfg.capture_window_ms);
