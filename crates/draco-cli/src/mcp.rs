@@ -446,7 +446,7 @@ fn interact_tool_descriptors() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string" },
+                    "sessionId": { "type": "string" },
                     "actions": {
                         "type": "array",
                         "items": {
@@ -462,7 +462,7 @@ fn interact_tool_descriptors() -> Vec<Value> {
                         }
                     }
                 },
-                "required": ["id", "actions"]
+                "required": ["sessionId", "actions"]
             },
             "annotations": { "readOnlyHint": false, "openWorldHint": true }
         }),
@@ -749,7 +749,7 @@ async fn call_interact(
             })
         }
         "draco_interact_act" => {
-            let id = required_interact_arg(&args, "id")?;
+            let id = required_interact_arg(&args, "sessionId")?;
             let actions = args
                 .get("actions")
                 .cloned()
