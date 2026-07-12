@@ -417,12 +417,12 @@ mod tests {
 
     #[test]
     fn depth_cap_warns() {
-        // Build a schema nested one past MAX_DEPTH.
-        let mut spec = json!({ "selector": ".card", "fields": { "name": ".name" } });
+        let deep_html = "<div><div><div><div><div><div>text</div></div></div></div></div></div>";
+        let mut spec = json!({ "selector": "div", "fields": { "name": "div" } });
         for _ in 0..MAX_DEPTH {
-            spec = json!({ "selector": ".card", "fields": { "inner": spec } });
+            spec = json!({ "selector": "div", "fields": { "inner": spec } });
         }
-        let (_, w) = extract_with_schema(PAGE, URL, &json!({ "deep": spec }));
+        let (_, w) = extract_with_schema(deep_html, URL, &json!({ "deep": spec }));
         assert!(w.iter().any(|m| m.contains("depth cap")));
     }
 }
