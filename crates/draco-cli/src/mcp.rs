@@ -771,6 +771,16 @@ async fn call_tool(
     // a second pretty-printed item. For discovery, the endpoint catalog leads.
     let data = &body["data"];
     let mut content = Vec::new();
+    // Selector-schema extraction leads when it was requested: the structured
+    // payload is the answer the agent asked for; prose follows.
+    if config.extract_schema.is_some() {
+        let mut payload = json!({ "extract": data.get("extract").cloned().unwrap_or(Value::Null) });
+        if let Some(w) = data.get("extractWarnings") {
+            payload["extractWarnings"] = w.clone();
+        }
+        let pretty = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+        content.push(json!({ "type": "text", "text": pretty }));
+    }
     if is_discover {
         let endpoints = data.get("endpoints").cloned().unwrap_or(json!([]));
         let pretty =
@@ -855,11 +865,21 @@ async fn call_map(params: &Value, defaults: &Config) -> Result<Value, (i64, Stri
         sitemap_only: false,
     };
     match crate::serve::map::map_site(&opts).await {
-        Ok(out) => Ok(json!({
-            "success": true,
-            "count": out.links.len(),
-            "links": out.links,
-        })),
+        Ok(out) => {
+            // Tool results MUST ride the MCP content envelope — a bare JSON
+            // payload renders as an empty result in MCP clients.
+            let payload = json!({
+                "success": true,
+                "count": out.links.len(),
+                "links": out.links,
+            });
+            let text =
+                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+            Ok(json!({
+                "content": [{ "type": "text", "text": text }],
+                "isError": false,
+            }))
+        }
         Err(crate::serve::map::MapError::BadRequest(m))
         | Err(crate::serve::map::MapError::Upstream(m)) => Ok(tool_error(&m)),
     }
@@ -1008,11 +1028,17 @@ async fn call_multi_scrape(
             }));
         }
     }
-    Ok(json!({
+    // Tool results MUST ride the MCP content envelope (see call_map).
+    let payload = json!({
         "success": true,
         "total": urls.len(),
         "completed": completed,
         "data": docs,
+    });
+    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+    Ok(json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": false,
     }))
 }
 
