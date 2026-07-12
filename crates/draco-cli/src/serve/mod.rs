@@ -29,7 +29,9 @@
 //!
 //! Concurrency is bounded by a semaphore (`--max-concurrency`): each in-flight
 //! scrape may spawn a jailed V8 child, so an unbounded intake could exhaust the
-//! host. Excess requests queue rather than fail.
+//! host. At saturation the daemon FAILS FAST with `503` (rather than queuing) so
+//! a fleet gateway fronting many nodes can fail the request over to another
+//! node; `GET /health` reports `availableSlots` for proactive avoidance.
 
 use std::sync::Arc;
 
@@ -202,8 +204,14 @@ async fn shutdown_signal() {
 // Handlers
 // ===================================================================
 
-async fn health() -> Json<Value> {
-    Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
+async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
+    // `availableSlots` is the live free-concurrency count — a fleet gateway uses
+    // it to steer away from a node that's near saturation before even trying it.
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "availableSlots": state.gate.available_permits(),
+    }))
 }
 
 /// Firecrawl-shaped scrape request. `onlyMainContent` and `waitFor` are
@@ -261,6 +269,13 @@ struct ScrapeRequest {
     /// Extra request headers forwarded to the fetch (Firecrawl `headers`).
     #[serde(default)]
     headers: Option<std::collections::HashMap<String, String>>,
+    /// First-class per-request cookies (name→value). Folded into the `Cookie`
+    /// request header before the fetch and merged with any `Cookie` already in
+    /// `headers`. The commercial gateway injects a minted `cf_clearance` here on
+    /// the fast lane (cookie-to-IP bound); a first-class field keeps callers from
+    /// hand-assembling the header.
+    #[serde(default)]
+    cookies: Option<std::collections::HashMap<String, String>>,
 }
 
 async fn scrape(
@@ -293,11 +308,10 @@ async fn scrape(
             .unwrap_or(state.defaults.only_main_content),
         include_tags: req.include_tags.clone().unwrap_or_default(),
         exclude_tags: req.exclude_tags.clone().unwrap_or_default(),
-        headers: req
-            .headers
-            .clone()
-            .map(|m| m.into_iter().collect())
-            .unwrap_or_default(),
+        headers: merge_cookie_header(
+            req.headers.clone().unwrap_or_default(),
+            req.cookies.clone().unwrap_or_default(),
+        ),
         proxy: req.proxy.clone().or_else(|| state.defaults.proxy.clone()),
         timeout_ms: req.timeout.unwrap_or(state.defaults.timeout_ms),
         tier_max: req.tier_max.unwrap_or(state.defaults.tier_max),
@@ -320,14 +334,17 @@ async fn scrape(
         ..state.defaults.clone()
     };
 
-    // Bound concurrent extractions; queue (don't fail) when saturated. The
-    // semaphore is never closed, so acquire can only fail on close — treat that
-    // as a 503 just in case.
-    let Ok(_permit) = state.gate.acquire().await else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(error_body("server is shutting down")),
-        );
+    // Bound concurrent extractions. Fail FAST at saturation (try_acquire, not
+    // acquire().await) so a fleet gateway retries another node instead of the
+    // request queuing here behind a full isolate pool. `status:"saturated"` lets
+    // the gateway tell capacity pressure apart from a genuine upstream error.
+    let _permit = match state.gate.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let mut body = error_body("node at capacity");
+            body["status"] = json!("saturated");
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(body));
+        }
     };
     let result = extract_with_pool(&req.url, &config, &state.tier2_pool).await;
     let (code, body) = to_firecrawl(&result);
@@ -408,6 +425,43 @@ pub(crate) fn parse_formats(formats: &[String]) -> Result<FormatSet, FormatRejec
         set.markdown = true;
     }
     Ok(set)
+}
+
+/// Merge first-class `cookies` into the request `headers` as a single `Cookie`
+/// header, preserving any `Cookie` the caller already put in `headers` (the
+/// explicit-header pairs come first, then the structured cookies). Returns the
+/// ordered header list Draco's fetch consumes. Deterministic: structured cookies
+/// are sorted by name so the same request hashes to the same cache key upstream.
+pub(crate) fn merge_cookie_header(
+    headers: std::collections::HashMap<String, String>,
+    cookies: std::collections::HashMap<String, String>,
+) -> Vec<(String, String)> {
+    if cookies.is_empty() {
+        return headers.into_iter().collect();
+    }
+    let mut sorted: Vec<(String, String)> = cookies.into_iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let cookie_pairs = sorted
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    let mut out: Vec<(String, String)> = Vec::with_capacity(headers.len() + 1);
+    let mut existing_cookie: Option<String> = None;
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("cookie") {
+            existing_cookie = Some(v);
+        } else {
+            out.push((k, v));
+        }
+    }
+    let merged = match existing_cookie {
+        Some(prev) if !prev.trim().is_empty() => format!("{prev}; {cookie_pairs}"),
+        _ => cookie_pairs,
+    };
+    out.push(("Cookie".to_string(), merged));
+    out
 }
 
 /// Firecrawl error envelope.
@@ -503,7 +557,12 @@ pub(crate) fn to_firecrawl(result: &ExtractionResult) -> (StatusCode, Value) {
             .clone()
             .unwrap_or_else(|| json!({ "sourceURL": result.url, "url": result.url }));
         data.insert("metadata".into(), metadata);
-        let body = json!({ "success": true, "data": Value::Object(data), "draco": draco_ext });
+        let body = json!({
+            "success": true,
+            "status": "ok",
+            "data": Value::Object(data),
+            "draco": draco_ext,
+        });
         return (StatusCode::OK, body);
     }
 
@@ -516,7 +575,22 @@ pub(crate) fn to_firecrawl(result: &ExtractionResult) -> (StatusCode, Value) {
         (Status::Unsupported | Status::NeedsBrowser, _) => StatusCode::UNPROCESSABLE_ENTITY,
         (Status::Success, _) => unreachable!("handled above"),
     };
+    // FROZEN status contract — the fleet gateway branches on this string.
+    // `needs_browser` is the ONLY value that triggers the browser fallback;
+    // everything else is terminal at the cheap tier. HTTP codes are unchanged
+    // (needs_browser & unsupported both stay 422) so existing Firecrawl clients
+    // are unaffected; the gateway keys on `status`, not the code.
+    let status_str = if is_robots_blocked(result) {
+        "blocked_robots"
+    } else {
+        match result.status {
+            Status::NeedsBrowser => "needs_browser",
+            Status::Unsupported => "unsupported",
+            _ => "error",
+        }
+    };
     let mut body = error_body(&error_summary(result));
+    body["status"] = json!(status_str);
     body["draco"] = draco_ext;
     (code, body)
 }
@@ -1005,5 +1079,106 @@ mod tests {
         assert_eq!(body["data"]["metadata"]["statusCode"], 200);
         assert_eq!(body["data"]["extract"]["heading"], "Daemon Smoke");
         assert!(body["data"].get("extractWarnings").is_none());
+    }
+
+    // ---- cookies (core addition) -------------------------------------------
+
+    #[test]
+    fn cookies_fold_into_a_sorted_cookie_header() {
+        use std::collections::HashMap;
+        let mut cookies = HashMap::new();
+        cookies.insert("sid".to_string(), "y".to_string());
+        cookies.insert("cf_clearance".to_string(), "x".to_string());
+        let merged = merge_cookie_header(HashMap::new(), cookies);
+        let cookie = merged
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+            .unwrap();
+        // Sorted by name → deterministic, so the same request hashes to the same
+        // upstream cache key regardless of map iteration order.
+        assert_eq!(cookie.1, "cf_clearance=x; sid=y");
+    }
+
+    #[test]
+    fn cookies_merge_with_an_existing_cookie_header() {
+        use std::collections::HashMap;
+        let mut headers = HashMap::new();
+        headers.insert("Cookie".to_string(), "existing=1".to_string());
+        let mut cookies = HashMap::new();
+        cookies.insert("cf_clearance".to_string(), "x".to_string());
+        let merged = merge_cookie_header(headers, cookies);
+        let cookie_hdrs: Vec<_> = merged
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+            .collect();
+        assert_eq!(cookie_hdrs.len(), 1, "exactly one Cookie header");
+        assert_eq!(cookie_hdrs[0].1, "existing=1; cf_clearance=x");
+    }
+
+    #[test]
+    fn no_cookies_leaves_headers_untouched() {
+        use std::collections::HashMap;
+        let mut headers = HashMap::new();
+        headers.insert("User-Agent".to_string(), "x".to_string());
+        let merged = merge_cookie_header(headers, HashMap::new());
+        assert_eq!(merged, vec![("User-Agent".to_string(), "x".to_string())]);
+    }
+
+    #[test]
+    fn scrape_request_deserializes_cookies() {
+        let req: ScrapeRequest = serde_json::from_value(json!({
+            "url": "https://example.com",
+            "cookies": { "cf_clearance": "abc", "sid": "def" }
+        }))
+        .unwrap();
+        let c = req.cookies.unwrap();
+        assert_eq!(c.get("cf_clearance").map(String::as_str), Some("abc"));
+    }
+
+    // ---- frozen status contract (core addition) ----------------------------
+
+    #[test]
+    fn success_body_carries_status_ok() {
+        let (_, body) = to_firecrawl(&success_result());
+        assert_eq!(body["status"], "ok");
+    }
+
+    #[test]
+    fn needs_browser_carries_frozen_status() {
+        let mut r = success_result();
+        r.status = Status::NeedsBrowser;
+        r.markdown = None;
+        r.data = None;
+        let (code, body) = to_firecrawl(&r);
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["success"], false);
+        // The gateway's ONLY browser-fallback trigger.
+        assert_eq!(body["status"], "needs_browser");
+    }
+
+    #[test]
+    fn unsupported_and_needs_browser_are_distinguishable_by_status() {
+        let mut r = success_result();
+        r.status = Status::Unsupported;
+        r.markdown = None;
+        r.data = None;
+        let (_, body) = to_firecrawl(&r);
+        // Same HTTP 422 as needs_browser, but a distinct status the gateway
+        // must NOT route to the browser.
+        assert_eq!(body["status"], "unsupported");
+    }
+
+    #[test]
+    fn robots_block_carries_blocked_robots_status() {
+        let mut r = success_result();
+        r.status = Status::Error;
+        r.markdown = None;
+        r.data = None;
+        r.error = Some(DracoError::Network {
+            reason: draco_types::NetKind::Robots,
+            detail: "blocked by robots.txt: /x".into(),
+        });
+        let (_, body) = to_firecrawl(&r);
+        assert_eq!(body["status"], "blocked_robots");
     }
 }
