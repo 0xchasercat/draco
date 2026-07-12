@@ -513,7 +513,6 @@ pub(crate) async fn act_handler(
         Ok(result) => result,
         Err(error) => return store_error_response(error),
     };
-    let batch_ok = report.ok;
     let (status, mut body) = to_firecrawl(&result);
     if status != StatusCode::OK {
         return (status, Json(body));
@@ -537,15 +536,6 @@ pub(crate) async fn act_handler(
             ),
         );
         data.insert("logs".into(), json!(report.logs));
-    }
-    // A failed step fails the request: top-level `success` mirrors the batch
-    // outcome so a caller checking only the envelope can't mistake a rejected
-    // action for a completed one. The post-action page + step trace still ride
-    // in `data` (HTTP 200) — the caller needs to see the state it's actually in.
-    if !batch_ok {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("success".into(), Value::Bool(false));
-        }
     }
     (status, Json(body))
 }

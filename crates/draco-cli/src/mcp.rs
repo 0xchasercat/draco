@@ -760,7 +760,6 @@ async fn call_interact(
                 Ok(report) => report,
                 Err(error) => return Ok(interact_store_error(error)),
             };
-            let batch_ok = report.ok;
             let formats = FormatSet {
                 markdown: true,
                 raw_html: true,
@@ -797,13 +796,6 @@ async fn call_interact(
                     ),
                 );
                 data.insert("logs".into(), json!(report.logs));
-            }
-            // Mirror the batch outcome at the top level (matches the REST act
-            // handler): a failed step must not read as `success: true`.
-            if !batch_ok {
-                if let Some(obj) = body.as_object_mut() {
-                    obj.insert("success".into(), Value::Bool(false));
-                }
             }
             body
         }
