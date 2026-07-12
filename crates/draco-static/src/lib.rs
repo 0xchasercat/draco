@@ -29,6 +29,9 @@ use draco_types::{ExtractOrigin, ExtractedData, SourceTier};
 use serde_json::Value;
 
 pub mod content;
+/// Selector-schema structured extraction (the `extract` request field): a JSON
+/// schema of CSS selectors evaluated against fetched/rendered HTML.
+pub mod extract_schema;
 
 /// Result of a Tier 0 static extraction attempt.
 #[derive(Debug, Clone)]

@@ -238,6 +238,9 @@ fn tool_descriptors(interact: bool) -> Vec<Value> {
         scrape_tool_descriptor(),
         discover_tool_descriptor(),
         search_tool_descriptor(),
+        map_tool_descriptor(),
+        crawl_tool_descriptor(),
+        batch_scrape_tool_descriptor(),
     ];
     #[cfg(feature = "tier2")]
     {
@@ -299,6 +302,13 @@ fn scrape_tool_descriptor() -> Value {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "CSS selectors to drop before extraction."
+                },
+                "extract": {
+                    "type": "object",
+                    "description": "Selector-schema structured extraction: an object mapping \
+                                    output field names to CSS-selector specs (string shorthand, \
+                                    or {selector, all, attr, fields} for arrays/attributes/nested \
+                                    objects). Result rides the response as `extract`."
                 },
                 "headers": {
                     "type": "object",
@@ -400,6 +410,102 @@ fn search_tool_descriptor() -> Value {
     })
 }
 
+/// Descriptor for `draco_map`: sitemap + on-page link discovery, the MCP face
+/// of the daemon's `/v1/map`.
+fn map_tool_descriptor() -> Value {
+    json!({
+        "name": "draco_map",
+        "title": "Map site links",
+        "description": "Discover a site's URLs fast: robots.txt sitemaps, the default \
+                        sitemap, and on-page links, merged/deduped/filtered — no browser, \
+                        a couple of fetches. The reconnaissance step before draco_crawl or \
+                        draco_batch_scrape.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "The site (or section) to map." },
+                "search": { "type": "string", "description": "Case-insensitive substring filter on the URL list." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 5000,
+                           "description": "Max links to return (default 100)." },
+                "includeSubdomains": { "type": "boolean", "description": "Treat subdomains as same-site (default true)." },
+                "ignoreSitemap": { "type": "boolean", "description": "Skip sitemap sources; on-page hrefs only." },
+                "timeout": { "type": "integer", "description": "Per-fetch timeout in ms." },
+                "ignoreRobots": { "type": "boolean", "description": "Bypass robots.txt." }
+            },
+            "required": ["url"]
+        },
+        "annotations": { "readOnlyHint": true, "openWorldHint": true }
+    })
+}
+
+/// Descriptor for `draco_crawl`: a bounded synchronous crawl sized for agent
+/// tool calls. Large async jobs stay on the daemon's `/v1/crawl`.
+fn crawl_tool_descriptor() -> Value {
+    json!({
+        "name": "draco_crawl",
+        "title": "Crawl site (bounded)",
+        "description": "Bounded synchronous crawl: map the site's links, then scrape the \
+                        first N same-site pages inline and return their content in one \
+                        response (limit ≤ 25). Per-page failures are reported inline, not \
+                        fatal. For large or long-running crawls use POST /v1/crawl on the \
+                        daemon, which runs as an async job.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "The site (or section) to crawl; scraped first." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 25,
+                           "description": "Max pages to scrape including the seed (default 10)." },
+                "search": { "type": "string", "description": "Substring filter applied when picking mapped links." },
+                "formats": {
+                    "type": "array",
+                    "items": { "type": "string", "enum": ["markdown", "html", "rawHtml", "links"] },
+                    "description": "Per-page output formats; defaults to [\"markdown\"]."
+                },
+                "extract": { "type": "object", "description": "Selector-schema extraction run on every page." },
+                "onlyMainContent": { "type": "boolean", "description": "Strip chrome to main content (default true)." },
+                "timeout": { "type": "integer", "description": "Per-page timeout in ms." },
+                "ignoreRobots": { "type": "boolean", "description": "Bypass robots.txt." }
+            },
+            "required": ["url"]
+        },
+        "annotations": { "readOnlyHint": true, "openWorldHint": true }
+    })
+}
+
+/// Descriptor for `draco_batch_scrape`: the same bounded inline loop over a
+/// caller-supplied URL list.
+fn batch_scrape_tool_descriptor() -> Value {
+    json!({
+        "name": "draco_batch_scrape",
+        "title": "Batch scrape URLs",
+        "description": "Scrape up to 25 URLs in one call and return each page's content \
+                        (per-URL failures reported inline). For larger batches use \
+                        POST /v1/batch/scrape on the daemon, which runs as an async job.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "urls": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "maxItems": 25,
+                    "description": "The http(s) URLs to scrape."
+                },
+                "formats": {
+                    "type": "array",
+                    "items": { "type": "string", "enum": ["markdown", "html", "rawHtml", "links", "json", "endpoints"] },
+                    "description": "Per-page output formats; defaults to [\"markdown\"]."
+                },
+                "extract": { "type": "object", "description": "Selector-schema extraction run on every page." },
+                "onlyMainContent": { "type": "boolean", "description": "Strip chrome to main content (default true)." },
+                "timeout": { "type": "integer", "description": "Per-page timeout in ms." },
+                "ignoreRobots": { "type": "boolean", "description": "Bypass robots.txt." }
+            },
+            "required": ["urls"]
+        },
+        "annotations": { "readOnlyHint": true, "openWorldHint": true }
+    })
+}
+
 #[cfg(feature = "tier2")]
 fn interact_tool_descriptors() -> Vec<Value> {
     vec![
@@ -460,6 +566,10 @@ fn interact_tool_descriptors() -> Vec<Value> {
                             "required": ["type"],
                             "additionalProperties": true
                         }
+                    },
+                    "extract": {
+                        "type": "object",
+                        "description": "Selector-schema extraction run on the post-action DOM."
                     }
                 },
                 "required": ["sessionId", "actions"]
@@ -494,6 +604,10 @@ fn interact_tool_descriptors() -> Vec<Value> {
                             "type": "string",
                             "enum": ["markdown", "html", "rawHtml", "links"]
                         }
+                    },
+                    "extract": {
+                        "type": "object",
+                        "description": "Selector-schema extraction run on the serialized DOM."
                     }
                 },
                 "required": ["sessionId"]
@@ -535,6 +649,15 @@ async fn call_tool(
     // its own fan-out + consensus.
     if name == "draco_search" {
         return call_search(params, defaults, gate, pool).await;
+    }
+    // Link discovery + bounded multi-page scrapes: agent-sized mirrors of the
+    // daemon's /v1/map, /v1/crawl, /v1/batch/scrape (which remain the path for
+    // large async jobs).
+    if name == "draco_map" {
+        return call_map(params, defaults).await;
+    }
+    if name == "draco_crawl" || name == "draco_batch_scrape" {
+        return call_multi_scrape(name, params, defaults, gate, pool).await;
     }
     // Two tools share the same execution path; `draco_discover` just forces
     // endpoint discovery and headlines the catalog in its result.
@@ -596,6 +719,9 @@ async fn call_tool(
             .iter()
             .filter_map(|v| v.as_str().map(String::from))
             .collect();
+    }
+    if let Some(schema) = args.get("extract").filter(|v| v.is_object()) {
+        config.extract_schema = Some(schema.clone());
     }
     if let Some(obj) = args.get("headers").and_then(Value::as_object) {
         config.headers = obj
@@ -680,6 +806,216 @@ fn required_interact_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, (i64
         .ok_or((-32602, format!("\"{key}\" (string) is required")))
 }
 
+/// Cap on pages per `draco_crawl` / `draco_batch_scrape` call. Tool calls are
+/// synchronous; anything larger belongs on the daemon's async job endpoints.
+const MAX_MULTI_PAGES: usize = 25;
+
+/// `draco_map` — link discovery through the same core the REST `/v1/map`
+/// handler wraps ([`crate::serve::map::map_site`]). A couple of fetches, no
+/// isolate, so it skips the scrape gate.
+async fn call_map(params: &Value, defaults: &Config) -> Result<Value, (i64, String)> {
+    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let url = args
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .ok_or((-32602, "\"url\" (string) is required".to_string()))?;
+    let target = crate::serve::map::parse_http_url(url).map_err(|e| (-32602, e))?;
+
+    let mut config = defaults.clone();
+    if let Some(t) = args.get("timeout").and_then(Value::as_u64) {
+        config.timeout_ms = t;
+    }
+    if let Some(true) = args.get("ignoreRobots").and_then(Value::as_bool) {
+        config.respect_robots = false;
+    }
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(100)
+        .clamp(1, 5_000) as usize;
+
+    let opts = crate::serve::map::MapOptions {
+        target,
+        session: session_opts(&config),
+        search: args
+            .get("search")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        limit,
+        include_subdomains: args
+            .get("includeSubdomains")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        ignore_sitemap: args
+            .get("ignoreSitemap")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        sitemap_only: false,
+    };
+    match crate::serve::map::map_site(&opts).await {
+        Ok(out) => Ok(json!({
+            "success": true,
+            "count": out.links.len(),
+            "links": out.links,
+        })),
+        Err(crate::serve::map::MapError::BadRequest(m))
+        | Err(crate::serve::map::MapError::Upstream(m)) => Ok(tool_error(&m)),
+    }
+}
+
+/// `draco_crawl` (map the site, scrape the first N pages inline) and
+/// `draco_batch_scrape` (the same loop over caller-given URLs). Bounded at
+/// [`MAX_MULTI_PAGES`]; sequential under the shared gate so a tool call can
+/// never monopolize the daemon. Per-page failures ride inline in `data` —
+/// one dead URL must not cost the agent the other results.
+async fn call_multi_scrape(
+    name: &str,
+    params: &Value,
+    defaults: &Config,
+    gate: Option<&Semaphore>,
+    pool: Option<&Tier2Pool>,
+) -> Result<Value, (i64, String)> {
+    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+
+    // Shared per-page config from the common scrape knobs.
+    let formats: Vec<String> = args
+        .get("formats")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut config = defaults.clone();
+    config.formats = parse_formats(&formats).map_err(|rej| (-32602, rej.message))?;
+    if let Some(only_main) = args.get("onlyMainContent").and_then(Value::as_bool) {
+        config.only_main_content = only_main;
+    }
+    if let Some(schema) = args.get("extract").filter(|v| v.is_object()) {
+        config.extract_schema = Some(schema.clone());
+    }
+    if let Some(t) = args.get("timeout").and_then(Value::as_u64) {
+        config.timeout_ms = t;
+    }
+    if let Some(true) = args.get("ignoreRobots").and_then(Value::as_bool) {
+        config.respect_robots = false;
+    }
+
+    // Resolve the page list.
+    let urls: Vec<String> = if name == "draco_batch_scrape" {
+        let list = args.get("urls").and_then(Value::as_array).ok_or((
+            -32602,
+            "\"urls\" (array of strings) is required".to_string(),
+        ))?;
+        let urls: Vec<String> = list
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(str::to_string)
+            .collect();
+        if urls.is_empty() {
+            return Err((-32602, "\"urls\" must contain at least one URL".to_string()));
+        }
+        if urls.len() > MAX_MULTI_PAGES {
+            return Err((
+                -32602,
+                format!(
+                    "\"urls\" is capped at {MAX_MULTI_PAGES} per tool call; use \
+                     POST /v1/batch/scrape on the daemon for larger jobs"
+                ),
+            ));
+        }
+        urls
+    } else {
+        // Crawl: the seed page first, then mapped same-site links up to `limit`.
+        // A failed map is non-fatal — the seed alone still gets scraped.
+        let url = args
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .ok_or((-32602, "\"url\" (string) is required".to_string()))?;
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(10)
+            .clamp(1, MAX_MULTI_PAGES as u64) as usize;
+        let target = crate::serve::map::parse_http_url(url).map_err(|e| (-32602, e))?;
+        let opts = crate::serve::map::MapOptions {
+            target: target.clone(),
+            session: session_opts(&config),
+            search: args
+                .get("search")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            limit,
+            include_subdomains: args
+                .get("includeSubdomains")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            ignore_sitemap: false,
+            sitemap_only: false,
+        };
+        let mut urls = vec![target.to_string()];
+        if let Ok(out) = crate::serve::map::map_site(&opts).await {
+            for link in out.links {
+                if urls.len() >= limit {
+                    break;
+                }
+                if !urls.contains(&link) {
+                    urls.push(link);
+                }
+            }
+        }
+        urls
+    };
+
+    // Scrape sequentially, re-acquiring the shared gate per page so long
+    // batches interleave fairly with other daemon work.
+    let mut docs = Vec::with_capacity(urls.len());
+    let mut completed = 0usize;
+    for url in &urls {
+        let permit = match gate {
+            Some(g) => match g.acquire().await {
+                Ok(p) => Some(p),
+                Err(_) => return Ok(tool_error("server is shutting down")),
+            },
+            None => None,
+        };
+        let result = match pool {
+            Some(p) => extract_with_pool(url, &config, p).await,
+            None => extract(url, &config).await,
+        };
+        drop(permit);
+        let (code, body) = to_firecrawl(&result);
+        if code == StatusCode::OK {
+            completed += 1;
+            let mut doc = body["data"].clone();
+            if let Some(obj) = doc.as_object_mut() {
+                obj.insert("url".into(), json!(url));
+            }
+            docs.push(doc);
+        } else {
+            docs.push(json!({
+                "url": url,
+                "success": false,
+                "error": body["error"].clone(),
+            }));
+        }
+    }
+    Ok(json!({
+        "success": true,
+        "total": urls.len(),
+        "completed": completed,
+        "data": docs,
+    }))
+}
+
 #[cfg(feature = "tier2")]
 async fn call_interact(
     name: &str,
@@ -705,8 +1041,13 @@ async fn call_interact(
                 Err(error) => return Ok(interact_store_error(error)),
             };
             let snapshot = opened.snapshot_html.as_deref().map(|html| {
-                let result =
-                    draco_core::scrape_interact_html(url, html, FormatSet::markdown_only(), true);
+                let result = draco_core::scrape_interact_html(
+                    url,
+                    html,
+                    FormatSet::markdown_only(),
+                    true,
+                    None,
+                );
                 json!({
                     "markdown": result.markdown,
                     "html": html,
@@ -766,7 +1107,8 @@ async fn call_interact(
                 raw_html: true,
                 ..FormatSet::none()
             };
-            let result = match store.scrape(id, formats, true).await {
+            let extract = args.get("extract").filter(|v| v.is_object()).cloned();
+            let result = match store.scrape(id, formats, true, extract.as_ref()).await {
                 Ok(result) => result,
                 Err(error) => return Ok(interact_store_error(error)),
             };
@@ -840,7 +1182,8 @@ async fn call_interact(
                     "interact scrape supports markdown, html, rawHtml, and links".to_string(),
                 ));
             }
-            let result = match store.scrape(id, formats, true).await {
+            let extract = args.get("extract").filter(|v| v.is_object()).cloned();
+            let result = match store.scrape(id, formats, true, extract.as_ref()).await {
                 Ok(result) => result,
                 Err(error) => return Ok(interact_store_error(error)),
             };
@@ -1088,6 +1431,11 @@ mod tests {
         assert!(names.contains(&"draco_scrape"), "tools: {names:?}");
         assert!(names.contains(&"draco_discover"), "tools: {names:?}");
         assert!(names.contains(&"draco_search"), "tools: {names:?}");
+        // Link discovery + bounded multi-page scrapes are transport-independent:
+        // they run through direct calls (no daemon job store), so stdio has them.
+        assert!(names.contains(&"draco_map"), "tools: {names:?}");
+        assert!(names.contains(&"draco_crawl"), "tools: {names:?}");
+        assert!(names.contains(&"draco_batch_scrape"), "tools: {names:?}");
         assert!(
             !names.iter().any(|name| name.starts_with("draco_interact_")),
             "stdio must not advertise daemon-only interact tools: {names:?}"

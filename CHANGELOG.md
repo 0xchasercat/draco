@@ -3,6 +3,35 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.19.0] — 2026-07-12
+
+### Added
+- **`extract` — selector-schema structured extraction, everywhere.** The one
+  genuine gap an external agent audit found: no way to say "give me all the
+  product prices as a JSON array." Now: pass `extract` (a JSON object mapping
+  output fields to CSS-selector specs — string shorthand, or
+  `{selector, all, attr, fields}` for arrays / attributes / nested objects)
+  and the result rides the response as `extract` (+ `extractWarnings`).
+  Deterministic and LLM-free by design: Firecrawl's `extract` nests a
+  server-side model; Draco's consumers *are* LLMs, so the engine provides the
+  precise, reproducible primitive — an agent inspects a page once, derives
+  selectors, and every extraction after that is instant and exact. Invalid
+  selectors null their field and warn (via the trace as `extract.warning`),
+  never fail the scrape; bounded (nesting ≤ 5, 1000 matches, 100 fields);
+  URL attributes absolutized. Surfaces: `/v1/scrape`, `/v1/batch/scrape` and
+  `/v1/crawl` page options, interact `scrape` + `act`, MCP (`draco_scrape`,
+  `draco_interact_scrape`, `draco_interact_act`), CLI `--extract-schema`.
+  Tier-independent — works on static scrapes and rendered pages alike.
+- **MCP tool parity: `draco_map`, `draco_crawl`, `draco_batch_scrape`.** The
+  daemon has had `/v1/map`, `/v1/crawl`, `/v1/batch/scrape` for releases, but
+  MCP never advertised them — an MCP-connected agent auditing Draco concluded
+  it "can't crawl." Three new transport-independent tools (stdio + daemon):
+  `draco_map` (sitemap + on-page link discovery via the same `map_site` core),
+  `draco_crawl` (bounded synchronous crawl — seed + mapped same-site links,
+  ≤ 25 pages scraped inline under the shared gate, per-page failures inline),
+  and `draco_batch_scrape` (the same loop over caller-given URLs). Honest
+  scope in the descriptions: large/async jobs stay on the REST job endpoints.
+
 ## [0.18.0] — 2026-07-12
 
 ### Added

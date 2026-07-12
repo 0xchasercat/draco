@@ -152,6 +152,14 @@ enum Command {
         /// JSONPath filter applied to `.data` before printing.
         #[arg(long)]
         extract: Option<String>,
+        /// Selector-schema structured extraction: a JSON object mapping output
+        /// field names to CSS-selector specs (string shorthand, or
+        /// `{selector, all, attr, fields}`), evaluated against the fetched or
+        /// rendered HTML. The result rides the envelope as `extract`. Distinct
+        /// from `--extract`, which JSONPath-filters the tiered `data` payload.
+        /// Implies the JSON envelope output.
+        #[arg(long, value_name = "JSON")]
+        extract_schema: Option<String>,
         /// http/https/socks5 proxy URL.
         #[arg(long)]
         proxy: Option<String>,
@@ -592,7 +600,9 @@ async fn interact_snapshot(
             ..FormatSet::none()
         },
     };
-    Ok(draco_core::scrape_interact_html(url, &html, formats, true))
+    Ok(draco_core::scrape_interact_html(
+        url, &html, formats, true, None,
+    ))
 }
 
 /// Decide what to print to stdout, and return it **with a trailing newline**.
@@ -647,6 +657,7 @@ async fn async_main() {
             format,
             json,
             extract: extract_expr,
+            extract_schema,
             proxy,
             delay,
             timeout,
@@ -666,8 +677,24 @@ async fn async_main() {
             pretty,
         } => {
             let formats = formats_from_args(&format);
+            let extract_schema = match extract_schema.as_deref() {
+                None => None,
+                Some(raw) => match serde_json::from_str::<serde_json::Value>(raw) {
+                    Ok(v) if v.is_object() => Some(v),
+                    Ok(_) => {
+                        eprintln!("draco: --extract-schema must be a JSON object");
+                        std::process::exit(2);
+                    }
+                    Err(e) => {
+                        eprintln!("draco: invalid --extract-schema JSON: {e}");
+                        std::process::exit(2);
+                    }
+                },
+            };
+            let has_extract_schema = extract_schema.is_some();
             let config = Config {
                 formats,
+                extract_schema,
                 only_main_content: !no_main_content,
                 include_tags: include_tag,
                 exclude_tags: exclude_tag,
@@ -690,8 +717,9 @@ async fn async_main() {
             if let Some(expr) = extract_expr.as_deref() {
                 result = filter_result(result, expr);
             }
-            // `--runtime-log` implies the envelope: the trace carries the logs.
-            let json = json || runtime_log;
+            // `--runtime-log` implies the envelope (the trace carries the logs);
+            // `--extract-schema` does too (the extraction rides the envelope).
+            let json = json || runtime_log || has_extract_schema;
             print!("{}", render_output(&result, formats, json, pretty));
             std::process::exit(status_to_exit_code(result.status));
         }
@@ -719,6 +747,7 @@ async fn async_main() {
                     endpoints: true,
                     ..FormatSet::none()
                 },
+                extract_schema: None,
                 only_main_content: true,
                 include_tags: Vec::new(),
                 exclude_tags: Vec::new(),
@@ -1064,6 +1093,7 @@ async fn async_main() {
                 // Per-request `formats` decides markdown/json/…; this default is
                 // overwritten on every request but keeps the struct total.
                 formats: FormatSet::markdown_only(),
+                extract_schema: None,
                 only_main_content: true,
                 include_tags: Vec::new(),
                 exclude_tags: Vec::new(),
@@ -1115,6 +1145,7 @@ async fn async_main() {
         } => {
             let defaults = Config {
                 formats: FormatSet::markdown_only(),
+                extract_schema: None,
                 only_main_content: true,
                 include_tags: Vec::new(),
                 exclude_tags: Vec::new(),
@@ -1224,6 +1255,7 @@ mod tests {
             status: Status::Success,
             source_tier: Some(SourceTier::Static),
             data: Some(data),
+            extract: None,
             markdown: None,
             metadata: None,
             html: None,
@@ -1306,6 +1338,7 @@ mod tests {
             status: Status::Success,
             source_tier: Some(SourceTier::Static),
             data: None,
+            extract: None,
             markdown: Some("# Title\n\nBody text.".into()),
             metadata: Some(json!({ "title": "Title", "statusCode": 200 })),
             html: None,

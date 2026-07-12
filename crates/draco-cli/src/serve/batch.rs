@@ -39,6 +39,8 @@ pub(crate) struct BatchRequest {
     #[serde(default)]
     formats: Vec<String>,
     #[serde(default)]
+    extract: Option<Value>,
+    #[serde(default)]
     only_main_content: Option<bool>,
     #[serde(default)]
     include_tags: Option<Vec<String>>,
@@ -126,6 +128,7 @@ pub(crate) async fn start_handler(
 
     let mut config = state.defaults.clone();
     config.formats = formats;
+    config.extract_schema = req.extract.clone();
     config.only_main_content = req
         .only_main_content
         .unwrap_or(state.defaults.only_main_content);
@@ -338,6 +341,18 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn batch_request_deserializes_flat_extract_schema() {
+        let schema = json!({ "title": "h1" });
+        let req: BatchRequest = serde_json::from_value(json!({
+            "urls": ["https://example.com"],
+            "extract": schema.clone(),
+            "futureOption": true
+        }))
+        .unwrap();
+        assert_eq!(req.extract, Some(schema));
+    }
+
     #[tokio::test]
     async fn empty_urls_is_bad_request() {
         let app = batch_router(test_state());
@@ -399,6 +414,58 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn flat_extract_reaches_each_url_config() {
+        let fixture = Router::new().route(
+            "/article",
+            get(|| async {
+                axum::response::Html(
+                    "<!doctype html><html><body><article><h1>Batch Extract</h1>\
+                     <p>Static fixture text.</p></article></body></html>",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, fixture).await.unwrap();
+        });
+
+        let app = batch_router(test_state());
+        let resp = post_batch(
+            &app,
+            json!({
+                "urls": [format!("http://127.0.0.1:{port}/article")],
+                "extract": { "heading": "h1" }
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let started = body_json(resp).await;
+        let id = started["id"].as_str().unwrap();
+
+        let mut last = Value::Null;
+        for _ in 0..200 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/batch/scrape/{id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            last = body_json(resp).await;
+            if last["status"] != "scraping" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(last["status"], "completed", "job: {last}");
+        assert_eq!(last["data"][0]["extract"]["heading"], "Batch Extract");
     }
 
     #[tokio::test]
