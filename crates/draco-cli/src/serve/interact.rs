@@ -246,6 +246,7 @@ impl SessionStore {
         id: &str,
         formats: FormatSet,
         only_main_content: bool,
+        extract_schema: Option<&serde_json::Value>,
     ) -> Result<ExtractionResult, SessionStoreError> {
         let info = self.get(id).ok_or(SessionStoreError::NotFound)?;
         let (handle, _) = self.acquire(id)?;
@@ -264,6 +265,7 @@ impl SessionStore {
             &html,
             formats,
             only_main_content,
+            extract_schema,
         ))
     }
 
@@ -394,6 +396,7 @@ pub(crate) async fn open_handler(
                     html,
                     FormatSet::markdown_only(),
                     true,
+                    None,
                 );
                 json!({
                     "markdown": result.markdown,
@@ -509,7 +512,7 @@ pub(crate) async fn act_handler(
     let only_main = req
         .only_main_content
         .unwrap_or(state.defaults.only_main_content);
-    let result = match state.sessions.scrape(&id, formats, only_main).await {
+    let result = match state.sessions.scrape(&id, formats, only_main, None).await {
         Ok(result) => result,
         Err(error) => return store_error_response(error),
     };
@@ -577,7 +580,7 @@ pub(crate) async fn scrape_handler(
     let only_main = req
         .only_main_content
         .unwrap_or(state.defaults.only_main_content);
-    match state.sessions.scrape(&id, formats, only_main).await {
+    match state.sessions.scrape(&id, formats, only_main, None).await {
         Ok(result) => {
             let (status, body) = to_firecrawl(&result);
             (status, Json(body))

@@ -56,6 +56,7 @@ mod interact;
 // ---- Public API -----------------------------------------------------------
 
 pub use challenge::{detect_challenge, ChallengeKind};
+pub use draco_static::extract_schema::extract_with_schema;
 #[cfg(feature = "tier2")]
 pub use draco_runtime::session::{
     ActReport, ActStep, Action, ExecOptions, ExecReport, NavReport, Session,
@@ -164,6 +165,10 @@ impl FormatSet {
 pub struct Config {
     /// What to produce — the set of requested output formats. Default: markdown.
     pub formats: FormatSet,
+    /// Selector-schema extraction — Draco's deterministic, LLM-free analog of
+    /// Firecrawl `extract` — evaluated against the fetched or winning rendered DOM.
+    /// `None` disables it (default).
+    pub extract_schema: Option<serde_json::Value>,
     /// Strip boilerplate (nav/header/footer/ads) to the main content —
     /// Firecrawl's `onlyMainContent`. Applies to the `markdown` and `html`
     /// formats (`rawHtml` is always the unmodified fetch). Default: `true`.
@@ -219,6 +224,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             formats: FormatSet::markdown_only(),
+            extract_schema: None,
             only_main_content: true,
             include_tags: Vec::new(),
             exclude_tags: Vec::new(),
@@ -270,6 +276,7 @@ mod tests {
         // Default output is Markdown (Firecrawl-style scrape).
         assert_eq!(c.formats, FormatSet::markdown_only());
         assert!(c.formats.markdown && !c.formats.json && !c.formats.endpoints);
+        assert!(c.extract_schema.is_none());
         // The JSON ladder ceiling is still fully available for --format json/both.
         assert_eq!(c.tier_max, 2);
         assert!(c.respect_robots);

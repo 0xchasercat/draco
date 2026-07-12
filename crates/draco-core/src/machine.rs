@@ -184,6 +184,8 @@ struct Run {
     raw_html: Option<String>,
     /// Absolutized `<a href>` list (`links` format); staged when requested.
     links: Option<Vec<String>>,
+    /// Selector-schema extraction, staged independently of requested formats.
+    extract: Option<serde_json::Value>,
     /// The tier the staged Markdown came from: [`SourceTier::Static`] for a
     /// plain fetch+parse, or [`SourceTier::RuntimeInterception`] once the
     /// render-then-Markdown escalation hydrated a thin shell and re-scraped it.
@@ -218,6 +220,7 @@ impl Run {
             html: None,
             raw_html: None,
             links: None,
+            extract: None,
             md_tier: SourceTier::Static,
             endpoints: None,
         }
@@ -262,7 +265,7 @@ impl Run {
             status,
             source_tier,
             data,
-            extract: None,
+            extract: self.extract,
             markdown: self.markdown,
             metadata: self.metadata,
             html: self.html,
@@ -273,6 +276,24 @@ impl Run {
             trace: self.trace,
             error,
         }
+    }
+}
+
+/// Attach nonfatal selector-schema diagnostics without charging a timing bucket.
+fn record_extract_warnings(
+    run: &mut Run,
+    tier: SourceTier,
+    warnings: impl IntoIterator<Item = String>,
+) {
+    for warning in warnings {
+        run.record(
+            tier,
+            "extract.warning",
+            StepOutcome::Matched,
+            0,
+            Bucket::None,
+            Some(warning),
+        );
     }
 }
 
@@ -392,6 +413,23 @@ where
         return run.finish(Status::NeedsBrowser, None, None, None);
     }
 
+    // ---- Selector-schema extraction (independent of requested formats) ---
+    // Stage against the fetched document before any format-specific branch so
+    // extract-only and json requests receive it too. Redirects matter for URL
+    // attributes, so the extractor's base is the response's final URL.
+    if let Some(schema) = config.extract_schema.as_ref() {
+        let (extract, warnings) = draco_static::extract_schema::extract_with_schema(
+            &body,
+            &resp.meta.final_url,
+            schema,
+        );
+        run.extract = Some(extract);
+        record_extract_warnings(&mut run, SourceTier::Static, warnings);
+    }
+    if run.extract.is_some() && config.formats == crate::FormatSet::none() {
+        return run.finish(Status::Success, Some(SourceTier::Static), None, None);
+    }
+
     // ---- Markdown scrape (the DEFAULT fast path; spec: Firecrawl-style) --
     //
     // For `Markdown` this is terminal: fetch → challenge → scrape → Success,
@@ -492,6 +530,7 @@ where
             try_render_markdown(
                 &mut run,
                 url,
+                &resp.meta.final_url,
                 &body,
                 resp.meta.status,
                 &content_type,
@@ -611,10 +650,10 @@ where
     // ---- Finalize: ran the whole (permitted) ladder, nothing matched ---
     //
     // Under `Both`, the JSON ladder found nothing — but we already produced
-    // Markdown + metadata, which is the primary deliverable of that mode. So a
-    // `Both` run with staged Markdown is a `Success` (source_tier: Static),
-    // just without a `data` payload. A pure `Json` run stays `Unsupported`.
-    if run.markdown.is_some() {
+    // Markdown + metadata, which is the primary deliverable of that mode. An
+    // extract-only/json request likewise succeeds when selector extraction was
+    // staged, even without a tiered `data` payload.
+    if run.markdown.is_some() || run.extract.is_some() {
         let tier = run.md_tier;
         return run.finish(Status::Success, Some(tier), None, None);
     }
@@ -1001,6 +1040,7 @@ fn nonws_len(s: &str) -> usize {
 async fn try_render_markdown<T>(
     run: &mut Run,
     url: &str,
+    page_url: &str,
     body: &str,
     status: u16,
     content_type: &str,
@@ -1090,6 +1130,14 @@ async fn try_render_markdown<T>(
         && !draco_static::content::is_thin_content(&rescraped.markdown, THIN_CONTENT_CHARS);
 
     if !rescraped.incomplete && (resolved_skeleton || added_content) {
+        // The hydrated merged DOM replaces the staged selector extraction only
+        // when it wins the same content decision as Markdown/HTML/links.
+        if let Some(schema) = config.extract_schema.as_ref() {
+            let (extract, warnings) =
+                draco_static::extract_schema::extract_with_schema(&merged, page_url, schema);
+            run.extract = Some(extract);
+            record_extract_warnings(run, SourceTier::RuntimeInterception, warnings);
+        }
         run.markdown = Some(rescraped.markdown);
         run.metadata = Some(rescraped.metadata);
         run.md_tier = SourceTier::RuntimeInterception;
@@ -1143,19 +1191,18 @@ async fn try_render_markdown<T>(
 /// feature-agnostic.
 #[cfg(not(feature = "tier2"))]
 #[allow(clippy::too_many_arguments)]
-async fn try_render_markdown<F, T>(
+async fn try_render_markdown<T>(
     run: &mut Run,
     _url: &str,
+    _page_url: &str,
     _body: &str,
     _status: u16,
     _content_type: &str,
     _shell_incomplete: bool,
     _config: &Config,
     _opts: &SessionOpts,
-    _fetcher: &F,
     _capture: &T,
 ) where
-    F: PageFetcher + ?Sized,
     T: Tier2Capture + ?Sized,
 {
     run.record(
@@ -1319,6 +1366,7 @@ impl Run {
             html: self.html.take(),
             raw_html: self.raw_html.take(),
             links: self.links.take(),
+            extract: self.extract.take(),
             md_tier: self.md_tier,
             endpoints: self.endpoints.take(),
         }
@@ -1587,6 +1635,74 @@ mod tests {
         let actions: Vec<&str> = r.trace.iter().map(|t| t.action.as_str()).collect();
         assert_eq!(actions, vec!["net.fetch", "core.challenge"]);
         assert_eq!(r.trace[1].detail.as_deref(), Some("cloudflare"));
+    }
+
+    #[tokio::test]
+    async fn selector_extract_stages_for_json_requests_and_warns_nonfatally() {
+        let html = r#"<html><body><a class="item" href="/products/1">Widget</a></body></html>"#;
+        let fetcher = MockFetcher::ok_html(200, html);
+        let statics = MockStatic::hit_next_data();
+        let config = Config {
+            extract_schema: Some(json!({
+                "url": { "selector": "a.item", "attr": "href" },
+                "bad": ":::invalid"
+            })),
+            ..cfg(0)
+        };
+
+        let r = run_ladder(
+            "https://origin.example/start",
+            &config,
+            &fetcher,
+            &statics,
+            &noop_capture(),
+        )
+        .await;
+
+        assert_eq!(r.status, Status::Success);
+        let extract = r.extract.expect("selector extraction staged");
+        assert_eq!(extract["url"], "https://x.com/products/1");
+        assert_eq!(extract["bad"], serde_json::Value::Null);
+        let warning = r
+            .trace
+            .iter()
+            .find(|step| step.action == "extract.warning")
+            .expect("invalid selector warning is traced");
+        assert_eq!(warning.outcome, StepOutcome::Matched);
+        assert_eq!(warning.elapsed_ms, 0);
+        assert_eq!(warning.tier, SourceTier::Static);
+        assert!(warning
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("invalid CSS selector"));
+    }
+
+    #[tokio::test]
+    async fn selector_extract_alone_is_a_successful_static_result() {
+        let fetcher = MockFetcher::ok_html(200, "<html><body><h1>Only extract</h1></body></html>");
+        let statics = MockStatic::miss_no_build_id();
+        let config = Config {
+            formats: FormatSet::none(),
+            extract_schema: Some(json!({ "title": "h1" })),
+            tier_max: 0,
+            ..Config::default()
+        };
+
+        let r = run_ladder(
+            "https://x.com/",
+            &config,
+            &fetcher,
+            &statics,
+            &noop_capture(),
+        )
+        .await;
+
+        assert_eq!(r.status, Status::Success);
+        assert_eq!(r.source_tier, Some(SourceTier::Static));
+        assert_eq!(r.extract, Some(json!({ "title": "Only extract" })));
+        assert!(r.data.is_none());
+        assert!(r.markdown.is_none());
     }
 
     #[tokio::test]
@@ -2096,6 +2212,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn losing_hydrated_dom_retains_static_selector_extract() {
+        let shell = r#"<html><body><div id="root" data-version="static">x</div></body></html>"#;
+        let fetcher = MockFetcher::ok_html(200, shell);
+        let statics = MockStatic::default().with_markdown("x");
+        let hydrated =
+            r#"<html><body><div id="root" data-version="hydrated">y</div></body></html>"#;
+        let capture = MockCapture::rendered(hydrated);
+        let config = Config {
+            extract_schema: Some(json!({
+                "version": { "selector": "#root", "attr": "data-version" }
+            })),
+            ..cfg_markdown()
+        };
+
+        let r = run_ladder(
+            "https://spa.example/",
+            &config,
+            &fetcher,
+            &statics,
+            &capture,
+        )
+        .await;
+
+        assert_eq!(r.status, Status::Success);
+        assert_eq!(r.source_tier, Some(SourceTier::Static));
+        assert_eq!(
+            r.extract.as_ref().expect("selector extraction present")["version"],
+            "static"
+        );
+        assert_eq!(capture.calls(), 1);
+        assert_eq!(
+            r.trace
+                .iter()
+                .find(|step| step.action == "runtime.render")
+                .unwrap()
+                .outcome,
+            StepOutcome::Missed
+        );
+    }
+
+    #[tokio::test]
     async fn markdown_render_escalation_upgrades_thin_shell() {
         // The full render-then-Markdown win: a thin shell whose Tier 2 hydration
         // returns a content-rich serialized DOM. The engine re-scrapes it, the
@@ -2115,10 +2272,14 @@ mod tests {
                 .repeat(3)
         );
         let capture = MockCapture::rendered(hydrated);
+        let config = Config {
+            extract_schema: Some(json!({ "title": "h1" })),
+            ..cfg_markdown()
+        };
 
         let r = run_ladder(
             "https://docs.example/guide",
-            &cfg_markdown(),
+            &config,
             &fetcher,
             &statics,
             &capture,
@@ -2130,6 +2291,11 @@ mod tests {
             r.source_tier,
             Some(SourceTier::RuntimeInterception),
             "a successful render escalation should be attributed to Tier 2"
+        );
+        assert_eq!(
+            r.extract.as_ref().expect("selector extraction present")["title"],
+            "Realtime Docs",
+            "winning hydrated DOM replaces the staged static extraction"
         );
         let md = r.markdown.expect("markdown present");
         assert!(

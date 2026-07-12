@@ -592,7 +592,7 @@ async fn interact_snapshot(
             ..FormatSet::none()
         },
     };
-    Ok(draco_core::scrape_interact_html(url, &html, formats, true))
+    Ok(draco_core::scrape_interact_html(url, &html, formats, true, None))
 }
 
 /// Decide what to print to stdout, and return it **with a trailing newline**.
@@ -668,6 +668,7 @@ async fn async_main() {
             let formats = formats_from_args(&format);
             let config = Config {
                 formats,
+                extract_schema: None,
                 only_main_content: !no_main_content,
                 include_tags: include_tag,
                 exclude_tags: exclude_tag,
@@ -719,6 +720,7 @@ async fn async_main() {
                     endpoints: true,
                     ..FormatSet::none()
                 },
+                extract_schema: None,
                 only_main_content: true,
                 include_tags: Vec::new(),
                 exclude_tags: Vec::new(),
@@ -1064,6 +1066,7 @@ async fn async_main() {
                 // Per-request `formats` decides markdown/json/…; this default is
                 // overwritten on every request but keeps the struct total.
                 formats: FormatSet::markdown_only(),
+                extract_schema: None,
                 only_main_content: true,
                 include_tags: Vec::new(),
                 exclude_tags: Vec::new(),
@@ -1115,6 +1118,7 @@ async fn async_main() {
         } => {
             let defaults = Config {
                 formats: FormatSet::markdown_only(),
+                extract_schema: None,
                 only_main_content: true,
                 include_tags: Vec::new(),
                 exclude_tags: Vec::new(),

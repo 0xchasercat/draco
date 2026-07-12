@@ -705,8 +705,13 @@ async fn call_interact(
                 Err(error) => return Ok(interact_store_error(error)),
             };
             let snapshot = opened.snapshot_html.as_deref().map(|html| {
-                let result =
-                    draco_core::scrape_interact_html(url, html, FormatSet::markdown_only(), true);
+                let result = draco_core::scrape_interact_html(
+                    url,
+                    html,
+                    FormatSet::markdown_only(),
+                    true,
+                    None,
+                );
                 json!({
                     "markdown": result.markdown,
                     "html": html,
@@ -766,7 +771,7 @@ async fn call_interact(
                 raw_html: true,
                 ..FormatSet::none()
             };
-            let result = match store.scrape(id, formats, true).await {
+            let result = match store.scrape(id, formats, true, None).await {
                 Ok(result) => result,
                 Err(error) => return Ok(interact_store_error(error)),
             };
@@ -840,7 +845,7 @@ async fn call_interact(
                     "interact scrape supports markdown, html, rawHtml, and links".to_string(),
                 ));
             }
-            let result = match store.scrape(id, formats, true).await {
+            let result = match store.scrape(id, formats, true, None).await {
                 Ok(result) => result,
                 Err(error) => return Ok(interact_store_error(error)),
             };

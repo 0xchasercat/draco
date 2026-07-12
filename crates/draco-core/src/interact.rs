@@ -10,7 +10,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 
-use draco_types::{DracoError, ExtractionResult, JailKind, SourceTier, Status, Timing};
+use draco_types::{
+    DracoError, ExtractionResult, JailKind, SourceTier, Status, StepOutcome, Timing, TraceStep,
+};
 
 use crate::chunk_cache::ChunkCache;
 use crate::tier2::prod::{capture_config, NetApiFetcher, NetScriptFetcher};
@@ -93,12 +95,14 @@ pub async fn open_interact_session(
 ///
 /// Interact serialization is already the current full document, so no shell
 /// merge is needed. Only DOM-derived formats are meaningful here; callers reject
-/// `json` and `endpoints` before invoking this helper.
+/// `json` and `endpoints` before invoking this helper. Selector-schema extraction
+/// runs independently of those formats when `extract_schema` is present.
 pub fn scrape_interact_html(
     url: &str,
     html: &str,
     formats: FormatSet,
     only_main_content: bool,
+    extract_schema: Option<&serde_json::Value>,
 ) -> ExtractionResult {
     let scraped = draco_static::content::scrape(
         html,
@@ -107,12 +111,29 @@ pub fn scrape_interact_html(
         "text/html; charset=utf-8",
         only_main_content,
     );
+    let (extract, trace) = match extract_schema {
+        Some(schema) => {
+            let (extract, warnings) = crate::extract_with_schema(html, url, schema);
+            let trace = warnings
+                .into_iter()
+                .map(|warning| TraceStep {
+                    tier: SourceTier::RuntimeInterception,
+                    action: "extract.warning".to_string(),
+                    outcome: StepOutcome::Matched,
+                    elapsed_ms: 0,
+                    detail: Some(warning),
+                })
+                .collect();
+            (Some(extract), trace)
+        }
+        None => (None, Vec::new()),
+    };
     ExtractionResult {
         url: url.to_string(),
         status: Status::Success,
         source_tier: Some(SourceTier::RuntimeInterception),
         data: None,
-        extract: None,
+        extract,
         markdown: formats.markdown.then_some(scraped.markdown),
         metadata: Some(scraped.metadata),
         html: formats
@@ -124,7 +145,40 @@ pub fn scrape_interact_html(
             .then(|| draco_static::content::extract_links(html, url)),
         endpoints: None,
         timing: Timing::default(),
-        trace: Vec::new(),
+        trace,
         error: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn interact_selector_extract_populates_result_and_warning_trace() {
+        let schema = json!({
+            "link": { "selector": "a", "attr": "href" },
+            "bad": ":::invalid"
+        });
+        let result = scrape_interact_html(
+            "https://example.com/base/",
+            r#"<html><body><a href="next">Next</a></body></html>"#,
+            FormatSet::none(),
+            true,
+            Some(&schema),
+        );
+
+        let extract = result.extract.expect("selector extraction present");
+        assert_eq!(extract["link"], "https://example.com/base/next");
+        assert_eq!(extract["bad"], serde_json::Value::Null);
+        let warning = result
+            .trace
+            .iter()
+            .find(|step| step.action == "extract.warning")
+            .expect("invalid selector warning traced");
+        assert_eq!(warning.tier, SourceTier::RuntimeInterception);
+        assert_eq!(warning.outcome, StepOutcome::Matched);
+        assert_eq!(warning.elapsed_ms, 0);
     }
 }
