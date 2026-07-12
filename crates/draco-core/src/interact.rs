@@ -112,6 +112,7 @@ pub fn scrape_interact_html(
         status: Status::Success,
         source_tier: Some(SourceTier::RuntimeInterception),
         data: None,
+        extract: None,
         markdown: formats.markdown.then_some(scraped.markdown),
         metadata: Some(scraped.metadata),
         html: formats

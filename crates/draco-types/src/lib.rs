@@ -94,6 +94,8 @@ pub struct ExtractionResult {
     /// Present iff `status == Success`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extract: Option<serde_json::Value>,
     /// Clean Markdown of the page's main content (the default Markdown-scrape
     /// output). Present when the Markdown path ran (`format` = markdown / both).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -399,6 +401,7 @@ mod tests {
             status: Status::Success,
             source_tier: Some(SourceTier::RuntimeInterception),
             data: Some(json!({ "price": 42, "title": "Widget" })),
+            extract: None,
             markdown: Some("# Widget\n\nA great widget.".into()),
             metadata: Some(json!({ "title": "Widget", "statusCode": 200 })),
             html: None,
@@ -495,6 +498,7 @@ mod tests {
             status: Status::Unsupported,
             source_tier: None,
             data: None,
+            extract: None,
             markdown: None,
             metadata: None,
             html: None,

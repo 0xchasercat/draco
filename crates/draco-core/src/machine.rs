@@ -262,6 +262,7 @@ impl Run {
             status,
             source_tier,
             data,
+            extract: None,
             markdown: self.markdown,
             metadata: self.metadata,
             html: self.html,

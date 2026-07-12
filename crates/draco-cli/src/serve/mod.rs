@@ -687,6 +687,7 @@ mod tests {
             // `data.json` in the body must set it explicitly (see
             // `json_format_attaches_data_json`).
             data: None,
+            extract: None,
             markdown: Some("# Title\n\nBody.".into()),
             metadata: Some(json!({
                 "title": "Title",
