@@ -114,14 +114,19 @@ pub struct SessionConfig {
 /// What a turn produced. Slice 4 adds `navigated: Option<(String, String)>`.
 #[derive(Debug, Clone, Default)]
 pub struct ExecReport {
-    /// `false` if the script threw at evaluation time (the throw text is in
-    /// `error` and appended to `logs`).
+    /// `false` if the turn threw — at evaluation time (a compile/dispatch error)
+    /// **or** inside the page JS (an async throw the wrapper caught). Either way
+    /// the throw text is in `error`.
     pub ok: bool,
-    /// Evaluation-time throw, if any.
+    /// The turn's throw, if any: evaluation-time errors and page-side caught
+    /// throws (which arrive from the wrapper as an `{ "__error": … }` value) are
+    /// both promoted here, so callers never have to fish an error out of `result`.
     pub error: Option<String>,
     /// The turn's completion value — whatever the JS `return`ed — serialized to
-    /// JSON under the size budget (see [`ExecOptions`]). `None` when the turn
-    /// returned `undefined`/nothing (or threw). DOM nodes/functions/cycles are
+    /// JSON under the size budget (see [`ExecOptions`]). A turn that completes
+    /// with `undefined`/nothing yields a `{ "__undefined": true }` descriptor, so
+    /// it is distinguishable from an expression that *evaluates to* `null`.
+    /// `None` only when the turn threw. DOM nodes/functions/cycles are
     /// *described* rather than dropped; an over-budget value becomes a
     /// `{ "__truncated": true, "bytes", "maxBytes", "preview" }` descriptor unless
     /// `full` was set. This is the devtools-console return value.
@@ -251,12 +256,14 @@ pub enum Action {
     Select { selector: String, value: String },
     /// Hover: pointerover/mouseover/mouseenter/mousemove.
     Hover { selector: String },
-    /// Wait until `selector` appears (up to `timeout_ms`), or a fixed
-    /// `milliseconds` pause. Defaults: 5000 ms selector timeout.
+    /// Wait until `selector` appears, or a fixed `milliseconds` pause (both
+    /// ceilinged by the capture window). `ms` is accepted as an alias for
+    /// `milliseconds` (Firecrawl uses the long name; agents habitually send
+    /// the short one).
     Wait {
         #[serde(default)]
         selector: Option<String>,
-        #[serde(default)]
+        #[serde(default, alias = "ms")]
         milliseconds: Option<u64>,
     },
 }
@@ -758,6 +765,27 @@ async fn do_exec(
         });
         (logs, result)
     };
+    // Normalize the page-side channel into first-class report fields:
+    // - a throw the wrapper caught arrives as `{ "__error": <stack> }` — promote
+    //   it to `error` (=> ok:false) instead of leaving it buried in `result`
+    //   while `error` reads null;
+    // - `undefined` calls no op — surface it as a `{ "__undefined": true }`
+    //   descriptor so it is distinguishable from a turn that evaluated to `null`.
+    let result = match result {
+        Some(serde_json::Value::Object(map)) if map.contains_key("__error") => {
+            if error.is_none() {
+                error = map
+                    .get("__error")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| Some("exec threw".to_string()));
+            }
+            None
+        }
+        Some(v) => Some(v),
+        None if error.is_none() => Some(serde_json::json!({ "__undefined": true })),
+        None => None,
+    };
     ExecReport {
         ok: error.is_none(),
         error,
@@ -768,9 +796,10 @@ async fn do_exec(
 
 /// Build the page-side exec wrapper: run the turn as an async body, then serialize
 /// its return value to JSON under `budget` and hand it to `op_raze_exec_result`.
-/// A `undefined` return calls no op (the caller reads back `None`); a throw is
-/// reported through the same channel as an `{ "__error": ... }` value while the
-/// turn's `error`/logs still carry the raw throw.
+/// An `undefined` return calls no op; a throw is reported through the same channel
+/// as an `{ "__error": ... }` value. `do_exec` normalizes both after the turn —
+/// no-op → a `{ "__undefined": true }` result, `__error` → the report's `error`
+/// field (ok:false) — so surfaces never have to interpret the raw channel.
 fn build_exec_wrapper(js: &str, budget: f64) -> String {
     // The user source is embedded as a STRING and evaluated for its completion
     // value (devtools-console / REPL semantics) rather than spliced as a function
@@ -993,7 +1022,9 @@ async fn wait_action(
     }
     let sel = match selector {
         Some(s) => s,
-        None => return Err("wait requires `selector` or `milliseconds`".to_string()),
+        None => {
+            return Err("wait requires `selector` or `milliseconds` (alias: `ms`)".to_string())
+        }
     };
     let check_js = SEL_PRESENT_JS.replace("__SEL__", &json_string_literal(sel));
     let ceiling = Duration::from_millis(cfg.capture_window_ms);
