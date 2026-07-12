@@ -362,6 +362,17 @@ pub(crate) struct ActRequest {
     only_main_content: Option<bool>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ActRequest {
+    #[serde(default)]
+    actions: Value,
+    #[serde(default)]
+    formats: Vec<String>,
+    #[serde(default)]
+    only_main_content: Option<bool>,
+}
+
 pub(crate) async fn open_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenRequest>,
