@@ -418,11 +418,8 @@ where
     // extract-only and json requests receive it too. Redirects matter for URL
     // attributes, so the extractor's base is the response's final URL.
     if let Some(schema) = config.extract_schema.as_ref() {
-        let (extract, warnings) = draco_static::extract_schema::extract_with_schema(
-            &body,
-            &resp.meta.final_url,
-            schema,
-        );
+        let (extract, warnings) =
+            draco_static::extract_schema::extract_with_schema(&body, &resp.meta.final_url, schema);
         run.extract = Some(extract);
         record_extract_warnings(&mut run, SourceTier::Static, warnings);
     }

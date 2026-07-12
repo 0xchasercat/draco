@@ -600,7 +600,9 @@ async fn interact_snapshot(
             ..FormatSet::none()
         },
     };
-    Ok(draco_core::scrape_interact_html(url, &html, formats, true, None))
+    Ok(draco_core::scrape_interact_html(
+        url, &html, formats, true, None,
+    ))
 }
 
 /// Decide what to print to stdout, and return it **with a trailing newline**.

@@ -76,12 +76,21 @@ const URL_ATTRS: [&str; 4] = ["href", "src", "action", "poster"];
 pub fn extract_with_schema(html: &str, page_url: &str, schema: &Value) -> (Value, Vec<String>) {
     let mut warnings = Vec::new();
     let Some(fields) = schema.as_object() else {
-        warnings.push("extract schema must be a JSON object mapping field names to selector specs".to_string());
+        warnings.push(
+            "extract schema must be a JSON object mapping field names to selector specs"
+                .to_string(),
+        );
         return (json!({}), warnings);
     };
     let doc = Html::parse_document(html);
     let base = url::Url::parse(page_url).ok();
-    let out = eval_fields(EvalScope::Document(&doc), fields, base.as_ref(), 0, &mut warnings);
+    let out = eval_fields(
+        EvalScope::Document(&doc),
+        fields,
+        base.as_ref(),
+        0,
+        &mut warnings,
+    );
     (Value::Object(out), warnings)
 }
 
@@ -144,7 +153,9 @@ fn eval_spec(
         Value::String(s) => (s.as_str(), false, "text", None),
         Value::Object(o) => {
             let Some(sel) = o.get("selector").and_then(Value::as_str) else {
-                warnings.push(format!("field {name:?}: object spec is missing \"selector\""));
+                warnings.push(format!(
+                    "field {name:?}: object spec is missing \"selector\""
+                ));
                 return Value::Null;
             };
             (
@@ -163,7 +174,9 @@ fn eval_spec(
     };
 
     let Ok(selector) = Selector::parse(selector_str) else {
-        warnings.push(format!("field {name:?}: invalid CSS selector {selector_str:?}"));
+        warnings.push(format!(
+            "field {name:?}: invalid CSS selector {selector_str:?}"
+        ));
         return Value::Null;
     };
 
@@ -288,8 +301,11 @@ mod tests {
 
     #[test]
     fn all_collects_every_match() {
-        let (v, w) =
-            extract_with_schema(PAGE, URL, &json!({ "prices": { "selector": ".price", "all": true } }));
+        let (v, w) = extract_with_schema(
+            PAGE,
+            URL,
+            &json!({ "prices": { "selector": ".price", "all": true } }),
+        );
         assert_eq!(v["prices"], json!(["$9.99", "$19.99", "$4.49"]));
         assert!(w.is_empty());
     }

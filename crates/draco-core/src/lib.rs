@@ -56,11 +56,11 @@ mod interact;
 // ---- Public API -----------------------------------------------------------
 
 pub use challenge::{detect_challenge, ChallengeKind};
-pub use draco_static::extract_schema::extract_with_schema;
 #[cfg(feature = "tier2")]
 pub use draco_runtime::session::{
     ActReport, ActStep, Action, ExecOptions, ExecReport, NavReport, Session,
 };
+pub use draco_static::extract_schema::extract_with_schema;
 pub use fetcher::{NetFetcher, PageFetcher};
 #[cfg(feature = "tier2")]
 pub use interact::{open_interact_session, scrape_interact_html};

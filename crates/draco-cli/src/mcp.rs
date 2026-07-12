@@ -410,7 +410,6 @@ fn search_tool_descriptor() -> Value {
     })
 }
 
-
 /// Descriptor for `draco_map`: sitemap + on-page link discovery, the MCP face
 /// of the daemon's `/v1/map`.
 fn map_tool_descriptor() -> Value {
@@ -807,7 +806,6 @@ fn required_interact_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, (i64
         .ok_or((-32602, format!("\"{key}\" (string) is required")))
 }
 
-
 /// Cap on pages per `draco_crawl` / `draco_batch_scrape` call. Tool calls are
 /// synchronous; anything larger belongs on the daemon's async job endpoints.
 const MAX_MULTI_PAGES: usize = 25;
@@ -909,10 +907,10 @@ async fn call_multi_scrape(
 
     // Resolve the page list.
     let urls: Vec<String> = if name == "draco_batch_scrape" {
-        let list = args
-            .get("urls")
-            .and_then(Value::as_array)
-            .ok_or((-32602, "\"urls\" (array of strings) is required".to_string()))?;
+        let list = args.get("urls").and_then(Value::as_array).ok_or((
+            -32602,
+            "\"urls\" (array of strings) is required".to_string(),
+        ))?;
         let urls: Vec<String> = list
             .iter()
             .filter_map(Value::as_str)
