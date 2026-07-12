@@ -778,8 +778,7 @@ async fn call_tool(
         if let Some(w) = data.get("extractWarnings") {
             payload["extractWarnings"] = w.clone();
         }
-        let pretty =
-            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+        let pretty = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
         content.push(json!({ "type": "text", "text": pretty }));
     }
     if is_discover {
