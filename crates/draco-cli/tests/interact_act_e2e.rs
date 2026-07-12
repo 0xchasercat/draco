@@ -3,6 +3,11 @@
 //! through `draco_core::open_interact_session` + `Session::act`, proving the
 //! faithful-event dispatch fires the page's own listener AND the DOM-content-
 //! settled pump captures the mount. tier2 + serve gated.
+//!
+//! The marker text is CONCATENATED in the page script (`'MODAL-' + 'OPENED'`)
+//! so the literal never appears in the inline `<script>` source — `serialize()`
+//! returns `outerHTML`, which includes script text, so a literal marker would
+//! trip the "before" assertion without any click.
 #![cfg(all(feature = "tier2", feature = "serve"))]
 
 use axum::response::Html;
@@ -22,7 +27,7 @@ async fn click_captures_a_fetchless_reactive_modal() {
                  document.getElementById('open').addEventListener('click', function () {\
                    var d = document.createElement('div');\
                    d.id = 'modal';\
-                   d.textContent = 'MODAL-OPENED';\
+                   d.textContent = 'MODAL-' + 'OPENED';\
                    document.body.appendChild(d);\
                  });\
                  </script></body></html>",
