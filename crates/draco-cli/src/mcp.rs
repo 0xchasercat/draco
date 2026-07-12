@@ -1398,7 +1398,7 @@ fn tool_error(message: &str) -> Value {
 mod tests {
     use super::*;
     use axum::body::{to_bytes, Body};
-    use axum::http::Request;
+    use axum::http::{header::CONTENT_TYPE, Request};
     use axum::routing::{get, post};
     use axum::Router;
     use tower::ServiceExt;
@@ -1655,6 +1655,82 @@ mod tests {
         assert_eq!(result["isError"], false, "result: {result}");
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("Tool Call Smoke"), "content: {text}");
+    }
+
+    /// A lossy UTF-8 page used to panic inside Markdown post-processing while
+    /// `draco_crawl` handled its seed. That killed the stdio MCP process and
+    /// stranded every later tool call in the same session.
+    #[tokio::test]
+    async fn crawl_survives_lossy_utf8_and_keeps_the_session_usable() {
+        let fixture = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    (
+                        [(CONTENT_TYPE, "text/html; charset=utf-8")],
+                        Body::from(
+                            b"<html><body><p>[\xffSkip to Content](#main)</p></body></html>"
+                                .to_vec(),
+                        ),
+                    )
+                }),
+            )
+            .route(
+                "/json",
+                get(|| async {
+                    (
+                        [(CONTENT_TYPE, "application/json")],
+                        Body::from(
+                            b"{\n  \"slides\": [\n    { \"title\": \"One\" }\n  ]\n}".to_vec(),
+                        ),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, fixture).await.unwrap();
+        });
+
+        let crawl = dispatch(json!({
+            "jsonrpc": "2.0", "id": 43, "method": "tools/call",
+            "params": {
+                "name": "draco_crawl",
+                "arguments": {
+                    "url": format!("http://127.0.0.1:{port}/"),
+                    "limit": 1,
+                    "formats": ["markdown"]
+                }
+            }
+        }))
+        .await
+        .unwrap();
+        assert!(crawl.get("error").is_none(), "crawl: {crawl}");
+        assert_eq!(crawl["result"]["isError"], false, "crawl: {crawl}");
+
+        // The same post-processing path is used by batch scrape. Array brackets
+        // in a JSON response are data, not an unfinished Markdown link label.
+        let batch = dispatch(json!({
+            "jsonrpc": "2.0", "id": 44, "method": "tools/call",
+            "params": {
+                "name": "draco_batch_scrape",
+                "arguments": {
+                    "urls": [format!("http://127.0.0.1:{port}/json")],
+                    "formats": ["markdown"]
+                }
+            }
+        }))
+        .await
+        .unwrap();
+        let text = batch["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains(r"\["), "JSON array was escaped: {text}");
+
+        // In a real stdio session this is the next RPC line; reaching it proves
+        // the crawl path returned normally instead of taking down the process.
+        let ping = dispatch(json!({ "jsonrpc": "2.0", "id": 45, "method": "ping" }))
+            .await
+            .unwrap();
+        assert_eq!(ping["result"], json!({}));
     }
 
     /// An unreachable target is a TOOL-level failure (isError), not a JSON-RPC

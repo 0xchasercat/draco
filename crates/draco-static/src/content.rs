@@ -100,18 +100,26 @@ pub fn scrape(
     only_main_content: bool,
 ) -> ScrapeResult {
     let metadata = extract_metadata(html, url, status, content_type);
+    let is_json = is_json_content_type(content_type);
 
-    // Pass 1: DOM pre-processing — strip chrome/scripts, absolutize URLs,
-    // normalise code languages and strikethrough (Firecrawl's transform_html).
-    let cleaned = preprocess_dom(html, url, only_main_content);
-    let mut markdown = post_process_markdown(&html_to_markdown(&cleaned));
+    // JSON is already the meaningful document. Sending it through the HTML
+    // converter escapes structural brackets as Markdown syntax (for example
+    // `[` becomes `\\[`), which corrupts JSON returned in Markdown mode.
+    let mut markdown = if is_json {
+        json_to_markdown(html)
+    } else {
+        // Pass 1: DOM pre-processing — strip chrome/scripts, absolutize URLs,
+        // normalise code languages and strikethrough (Firecrawl's transform_html).
+        let cleaned = preprocess_dom(html, url, only_main_content);
+        post_process_markdown(&html_to_markdown(&cleaned))
+    };
 
     // Pass 2: Readability fallback. Firecrawl falls back to full-content
     // extraction when main-content stripping produces empty Markdown; we go one
     // better and try Readability over the *original* document first (it often
     // recovers a clean article from pages our selector list can't isolate),
     // then fall back to the un-stripped body.
-    if only_main_content && is_thin_content(&markdown, MIN_MAIN_CONTENT_CHARS) {
+    if !is_json && only_main_content && is_thin_content(&markdown, MIN_MAIN_CONTENT_CHARS) {
         if let Some(article) = readability_html(html, url) {
             let alt = post_process_markdown(&html_to_markdown(&article));
             if alt.chars().filter(|c| !c.is_whitespace()).count()
@@ -138,14 +146,39 @@ pub fn scrape(
     // (b) strip the placeholder lines so `Loading…` noise never reaches the user
     // regardless of whether the render pass runs or succeeds. Detection runs on
     // the pre-strip Markdown.
-    let incomplete = is_incomplete_render(&markdown);
-    let markdown = strip_incomplete_markers(&markdown);
+    let incomplete = !is_json && is_incomplete_render(&markdown);
+    if !is_json {
+        markdown = strip_incomplete_markers(&markdown);
+    }
 
     ScrapeResult {
         markdown,
         metadata,
         incomplete,
     }
+}
+
+/// Return whether the media type identifies a JSON document. Parameters such as
+/// `charset=utf-8` are irrelevant, and structured `application/*+json` types
+/// are JSON too.
+fn is_json_content_type(content_type: &str) -> bool {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    media_type == "application/json" || media_type.ends_with("+json")
+}
+
+/// Keep a JSON response as JSON when Markdown is requested. Pretty-print valid
+/// JSON for readable agent output; a malformed JSON response is still surfaced
+/// verbatim rather than treated as HTML.
+fn json_to_markdown(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| body.trim().to_string())
 }
 
 /// Minimum number of skeleton placeholder lines before a page is judged an
@@ -962,25 +995,40 @@ fn image_alt_span(s: &str, start: usize) -> Option<(usize, usize)> {
     Some((after_alt, after_alt + 1))
 }
 
-/// Firecrawl's `processMultiLineLinks`: while inside link *text* (unbalanced
-/// `[`), a newline is emitted as `\` + newline so a wrapped link label doesn't
-/// break the Markdown link.
+/// Firecrawl's `processMultiLineLinks`: while inside a Markdown link *label*, a
+/// newline is emitted as `\` + newline so a wrapped link label doesn't break
+/// the link. Brackets on their own are not a link label (notably JSON arrays),
+/// so they must be left alone.
 fn process_multiline_links(markdown: &str) -> String {
     let mut out = String::with_capacity(markdown.len());
-    let mut link_open: usize = 0;
-    for ch in markdown.chars() {
-        match ch {
-            '[' => link_open += 1,
-            ']' => link_open = link_open.saturating_sub(1),
-            _ => {}
-        }
-        if link_open > 0 && ch == '\n' {
-            out.push('\\');
-            out.push('\n');
+    let mut copy_from = 0;
+    let mut search_from = 0;
+
+    while let Some(open_rel) = markdown[search_from..].find('[') {
+        let open = search_from + open_rel;
+        let label_start = open + 1;
+        let Some(close_rel) = markdown[label_start..].find(']') else {
+            break;
+        };
+        let close = label_start + close_rel;
+        let after_close = close + 1;
+
+        // Only an actual `[label](destination)` construct gets the Firecrawl
+        // continuation treatment. Treating every unbalanced `[` as a link made
+        // multiline JSON arrays acquire literal backslashes.
+        if markdown[after_close..].starts_with('(') {
+            out.push_str(&markdown[copy_from..label_start]);
+            out.push_str(&markdown[label_start..close].replace('\n', "\\\n"));
+            out.push(']');
+            copy_from = after_close;
+            search_from = after_close;
         } else {
-            out.push(ch);
+            // Keep looking after this opening bracket. Its bytes remain part of
+            // the next copied span because it was not a Markdown link.
+            search_from = label_start;
         }
     }
+    out.push_str(&markdown[copy_from..]);
     out
 }
 
@@ -999,7 +1047,10 @@ fn remove_skip_to_content_links(markdown: &str) -> String {
             let label_start = i + 1;
             let label_end = label_start + LABEL.len();
             if label_end <= len
-                && markdown[label_start..label_end].eq_ignore_ascii_case(LABEL)
+                && matches!(
+                    markdown.get(label_start..label_end),
+                    Some(label) if label.eq_ignore_ascii_case(LABEL)
+                )
                 && label_end + 2 < len
                 && bytes[label_end] == b']'
                 && bytes[label_end + 1] == b'('
@@ -1664,6 +1715,29 @@ mod tests {
         assert_eq!(out, "[line one\\\nline two](http://x)");
         // Text outside links is untouched.
         assert_eq!(process_multiline_links("a\nb"), "a\nb");
+    }
+
+    #[test]
+    fn multiple_links_do_not_rescan_an_already_processed_label() {
+        let markdown = "[first](https://one.example) [second line\ncontinued](https://two.example)";
+        assert_eq!(
+            process_multiline_links(markdown),
+            "[first](https://one.example) [second line\\\ncontinued](https://two.example)"
+        );
+    }
+
+    #[test]
+    fn bare_brackets_do_not_escape_json_arrays() {
+        let json = "{\n  \"slides\": [\n    { \"title\": \"One\" }\n  ]\n}";
+        assert_eq!(process_multiline_links(json), json);
+    }
+
+    #[test]
+    fn malformed_utf8_replacement_after_bracket_never_panics() {
+        // `String::from_utf8_lossy` can produce U+FFFD in a fetched page. The
+        // byte-counted Skip-to-Content lookahead must not slice through it.
+        let markdown = "[� not a skip link]";
+        assert_eq!(post_process_markdown(markdown), markdown);
     }
 
     // ---- Code-language normalization -----------------------------------
