@@ -362,7 +362,6 @@ pub(crate) struct ActRequest {
     only_main_content: Option<bool>,
 }
 
-
 pub(crate) async fn open_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenRequest>,
