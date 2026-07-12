@@ -37,7 +37,9 @@ async fn click_captures_a_fetchless_reactive_modal() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
 
     let base = format!("http://127.0.0.1:{port}/");
     let config = draco_core::Config {

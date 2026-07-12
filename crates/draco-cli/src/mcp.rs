@@ -772,7 +772,9 @@ async fn call_interact(
             let (status, mut body) = to_firecrawl(&result);
             if status != StatusCode::OK {
                 return Ok(tool_error(
-                    body["error"].as_str().unwrap_or("interact act readback failed"),
+                    body["error"]
+                        .as_str()
+                        .unwrap_or("interact act readback failed"),
                 ));
             }
             if let Some(data) = body.get_mut("data").and_then(Value::as_object_mut) {

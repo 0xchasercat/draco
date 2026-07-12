@@ -957,8 +957,7 @@ fn run_action_snippet(
     let raw = cap.borrow_mut().exec_result.take();
     match raw {
         Some(s) => {
-            let v: serde_json::Value =
-                serde_json::from_str(&s).unwrap_or(serde_json::Value::Null);
+            let v: serde_json::Value = serde_json::from_str(&s).unwrap_or(serde_json::Value::Null);
             if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
                 Ok(())
             } else {
@@ -1047,8 +1046,9 @@ fn build_action_js(action: &Action) -> String {
             .replace("__VALUE__", &json_string_literal(value)),
         Action::Hover { selector } => HOVER_JS.replace("__SEL__", &json_string_literal(selector)),
         // `wait` never reaches here (handled Rust-side in `do_act`).
-        Action::Wait { .. } => "Deno.core.ops.op_raze_exec_result(JSON.stringify({ok:true}));"
-            .to_string(),
+        Action::Wait { .. } => {
+            "Deno.core.ops.op_raze_exec_result(JSON.stringify({ok:true}));".to_string()
+        }
     };
     WRAP_JS.replace("__BODY__", &body)
 }

@@ -837,8 +837,7 @@ async fn async_main() {
                         match session.act(actions).await {
                             Ok(report) => {
                                 println!("{}", render_value(&act_report_value(report), pretty));
-                                let snapshot_format =
-                                    format.unwrap_or(InteractFormatArg::Markdown);
+                                let snapshot_format = format.unwrap_or(InteractFormatArg::Markdown);
                                 match interact_snapshot(&session, &url, snapshot_format).await {
                                     Ok(result) => println!("{}", render(&result, pretty)),
                                     Err(error) => {
