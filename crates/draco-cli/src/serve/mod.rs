@@ -219,6 +219,9 @@ struct ScrapeRequest {
     url: String,
     #[serde(default)]
     formats: Vec<String>,
+    /// Selector-schema extraction request (Firecrawl field).
+    #[serde(default)]
+    extract: Option<serde_json::Value>,
     /// Total request timeout in ms (Firecrawl field).
     #[serde(default)]
     timeout: Option<u64>,
@@ -284,6 +287,7 @@ async fn scrape(
 
     let config = Config {
         formats,
+        extract_schema: req.extract.clone(),
         only_main_content: req
             .only_main_content
             .unwrap_or(state.defaults.only_main_content),
@@ -469,6 +473,20 @@ pub(crate) fn to_firecrawl(result: &ExtractionResult) -> (StatusCode, Value) {
         if let Some(d) = &result.data {
             data.insert("json".into(), d.clone());
         }
+        if let Some(extract) = &result.extract {
+            data.insert("extract".into(), extract.clone());
+        }
+        let extract_warnings: Vec<Value> = result
+            .trace
+            .iter()
+            .filter(|step| step.action == "extract.warning")
+            .filter_map(|step| step.detail.as_ref())
+            .cloned()
+            .map(Value::String)
+            .collect();
+        if !extract_warnings.is_empty() {
+            data.insert("extractWarnings".into(), Value::Array(extract_warnings));
+        }
         // The discovered API-endpoint catalog (the `endpoints` format), when
         // discovery ran. Rides `data.endpoints` alongside the content formats.
         if let Some(endpoints) = &result.endpoints {
@@ -537,7 +555,7 @@ mod tests {
     use super::*;
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
-    use draco_types::Timing;
+    use draco_types::{SourceTier, StepOutcome, Timing, TraceStep};
     use tower::ServiceExt;
 
     fn test_state(defaults: Config) -> Arc<AppState> {
@@ -655,6 +673,21 @@ mod tests {
     }
 
     #[test]
+    fn scrape_request_deserializes_extract_schema() {
+        let schema = json!({
+            "title": "h1",
+            "links": { "selector": "a", "attr": "href", "all": true }
+        });
+        let req: ScrapeRequest = serde_json::from_value(json!({
+            "url": "https://example.com",
+            "extract": schema.clone(),
+            "futureOption": true
+        }))
+        .unwrap();
+        assert_eq!(req.extract, Some(schema));
+    }
+
+    #[test]
     fn draco_extension_fields_deserialize() {
         let req: ScrapeRequest = serde_json::from_value(json!({
             "url": "https://example.com",
@@ -714,8 +747,10 @@ mod tests {
             body["data"]["metadata"]["sourceURL"],
             "https://site.example/a"
         );
-        // markdown-only request: the JSON-API payload is not attached.
+        // markdown-only request: optional structured outputs are not attached.
         assert!(body["data"].get("json").is_none());
+        assert!(body["data"].get("extract").is_none());
+        assert!(body["data"].get("extractWarnings").is_none());
         // The draco extension is always present.
         assert!(body["draco"].get("timing").is_some());
     }
@@ -726,6 +761,52 @@ mod tests {
         r.data = Some(json!({ "items": [1, 2] }));
         let (_, body) = to_firecrawl(&r);
         assert_eq!(body["data"]["json"]["items"][0], 1);
+    }
+
+    #[test]
+    fn selector_extract_and_warnings_attach_to_data() {
+        let mut r = success_result();
+        r.extract = Some(json!({ "title": "Title", "links": ["/a"] }));
+        r.trace = vec![
+            TraceStep {
+                tier: SourceTier::Static,
+                action: "extract.warning".into(),
+                outcome: StepOutcome::Matched,
+                elapsed_ms: 0,
+                detail: Some("missing selector for price".into()),
+            },
+            TraceStep {
+                tier: SourceTier::Static,
+                action: "extract.warning".into(),
+                outcome: StepOutcome::Matched,
+                elapsed_ms: 0,
+                detail: None,
+            },
+            TraceStep {
+                tier: SourceTier::Static,
+                action: "extract.warning.extra".into(),
+                outcome: StepOutcome::Matched,
+                elapsed_ms: 0,
+                detail: Some("not an exact action match".into()),
+            },
+            TraceStep {
+                tier: SourceTier::RuntimeInterception,
+                action: "extract.warning".into(),
+                outcome: StepOutcome::Matched,
+                elapsed_ms: 0,
+                detail: Some("invalid selector for cost".into()),
+            },
+        ];
+
+        let (_, body) = to_firecrawl(&r);
+        assert_eq!(
+            body["data"]["extract"],
+            json!({ "title": "Title", "links": ["/a"] })
+        );
+        assert_eq!(
+            body["data"]["extractWarnings"],
+            json!(["missing selector for price", "invalid selector for cost"])
+        );
     }
 
     #[test]
@@ -905,7 +986,11 @@ mod tests {
                     .uri("/v1/scrape")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        json!({ "url": format!("http://127.0.0.1:{port}/article") }).to_string(),
+                        json!({
+                            "url": format!("http://127.0.0.1:{port}/article"),
+                            "extract": { "heading": "h1" }
+                        })
+                        .to_string(),
                     ))
                     .unwrap(),
             )
@@ -918,5 +1003,7 @@ mod tests {
         assert!(md.contains("Daemon Smoke"), "markdown: {md}");
         assert_eq!(body["data"]["metadata"]["title"], "Fixture");
         assert_eq!(body["data"]["metadata"]["statusCode"], 200);
+        assert_eq!(body["data"]["extract"]["heading"], "Daemon Smoke");
+        assert!(body["data"].get("extractWarnings").is_none());
     }
 }

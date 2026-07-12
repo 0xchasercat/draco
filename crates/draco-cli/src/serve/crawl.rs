@@ -107,6 +107,8 @@ struct ScrapeOptions {
     #[serde(default)]
     formats: Vec<String>,
     #[serde(default)]
+    extract: Option<Value>,
+    #[serde(default)]
     include_tags: Option<Vec<String>>,
     #[serde(default)]
     exclude_tags: Option<Vec<String>>,
@@ -186,6 +188,7 @@ pub(crate) async fn start_handler(
     config.formats = parsed_formats;
     // Per-page content shaping from the nested scrapeOptions (Firecrawl parity).
     if let Some(opts) = req.scrape_options.as_ref() {
+        config.extract_schema = opts.extract.clone();
         if let Some(inc) = &opts.include_tags {
             config.include_tags = inc.clone();
         }
@@ -463,6 +466,20 @@ mod tests {
     // ---- pure helpers -------------------------------------------------------
 
     #[test]
+    fn crawl_request_deserializes_nested_extract_schema() {
+        let schema = json!({ "title": "h1" });
+        let req: CrawlRequest = serde_json::from_value(json!({
+            "url": "https://example.com",
+            "scrapeOptions": {
+                "extract": schema.clone(),
+                "futureOption": true
+            }
+        }))
+        .unwrap();
+        assert_eq!(req.scrape_options.unwrap().extract, Some(schema));
+    }
+
+    #[test]
     fn markdown_link_harvesting() {
         let md = "# T\n\nSee [a](https://s.example/a) and ![img](https://s.example/i.png)\n\
                   and [titled](https://s.example/t \"Title\") and <https://s.example/auto>\n\
@@ -723,7 +740,8 @@ mod tests {
                         json!({
                             "url": format!("http://127.0.0.1:{port}/a"),
                             "limit": 3,
-                            "maxDepth": 2
+                            "maxDepth": 2,
+                            "scrapeOptions": { "extract": { "title": "h1" } }
                         })
                         .to_string(),
                     ))
@@ -769,8 +787,10 @@ mod tests {
         for expected in ["Page A", "Page B", "Page C"] {
             assert!(all_md.contains(expected), "missing {expected}: {all_md}");
         }
-        // Every entry carries Firecrawl-keyed metadata.
+        // Every entry carries Firecrawl-keyed metadata and nested scrapeOptions
+        // selector extraction.
         assert!(data.iter().all(|d| d["metadata"]["sourceURL"].is_string()));
+        assert!(data.iter().all(|d| d["extract"]["title"].is_string()));
     }
 
     #[tokio::test]

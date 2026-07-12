@@ -344,6 +344,8 @@ pub(crate) struct ScrapeRequest {
     #[serde(default)]
     formats: Vec<String>,
     #[serde(default)]
+    extract: Option<Value>,
+    #[serde(default)]
     only_main_content: Option<bool>,
 }
 
@@ -354,6 +356,8 @@ pub(crate) struct ActRequest {
     actions: Value,
     #[serde(default)]
     formats: Vec<String>,
+    #[serde(default)]
+    extract: Option<Value>,
     #[serde(default)]
     only_main_content: Option<bool>,
 }
@@ -512,7 +516,11 @@ pub(crate) async fn act_handler(
     let only_main = req
         .only_main_content
         .unwrap_or(state.defaults.only_main_content);
-    let result = match state.sessions.scrape(&id, formats, only_main, None).await {
+    let result = match state
+        .sessions
+        .scrape(&id, formats, only_main, req.extract.as_ref())
+        .await
+    {
         Ok(result) => result,
         Err(error) => return store_error_response(error),
     };
@@ -580,7 +588,11 @@ pub(crate) async fn scrape_handler(
     let only_main = req
         .only_main_content
         .unwrap_or(state.defaults.only_main_content);
-    match state.sessions.scrape(&id, formats, only_main, None).await {
+    match state
+        .sessions
+        .scrape(&id, formats, only_main, req.extract.as_ref())
+        .await
+    {
         Ok(result) => {
             let (status, body) = to_firecrawl(&result);
             (status, Json(body))
@@ -617,5 +629,40 @@ fn store_error_response(error: SessionStoreError) -> (StatusCode, Json<Value>) {
             StatusCode::BAD_GATEWAY,
             Json(error_body(&format!("interact session error: {message}"))),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrape_and_act_requests_deserialize_extract_schema() {
+        let schema = json!({ "title": "h1" });
+        let scrape: ScrapeRequest = serde_json::from_value(json!({
+            "formats": ["markdown"],
+            "extract": schema.clone(),
+            "futureOption": true
+        }))
+        .unwrap();
+        assert_eq!(scrape.extract, Some(schema.clone()));
+
+        let act: ActRequest = serde_json::from_value(json!({
+            "actions": [],
+            "extract": schema.clone(),
+            "futureOption": true
+        }))
+        .unwrap();
+        assert_eq!(act.extract, Some(schema));
+    }
+
+    #[test]
+    fn open_request_accepts_but_does_not_model_extract() {
+        let open: OpenRequest = serde_json::from_value(json!({
+            "url": "https://example.com",
+            "extract": { "title": "h1" }
+        }))
+        .unwrap();
+        assert_eq!(open.url, "https://example.com");
     }
 }
