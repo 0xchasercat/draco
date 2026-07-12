@@ -3,6 +3,40 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## [0.18.0] — 2026-07-12
+
+### Added
+- **`act` — high-fidelity batch interactions for interact sessions.** The
+  interaction-fidelity threshold: a bare `.click()` fires an event, but a
+  framework-gated handler (React/SvelteKit) often listens for the *pointer
+  sequence*, and a modal that mounts from a reactive store update makes **no
+  network request** — so the exec settle (fetch-activity quiesce) never saw it.
+  `act` closes both gaps:
+  - **Faithful event sequences.** Each action dispatches what a real user
+    produces: `click` → `scrollIntoView` + `focus` + `pointerover/enter/down`,
+    `mousedown`, `pointerup`, `mouseup`, `click` (real bubbling, cancelable,
+    composed `MouseEvent`s); `type` → focus + clear + value set + `input` +
+    `change`; `press` → `keydown`/`keyup`; plus `scroll`, `select`, `hover`,
+    and `wait` (selector-appears or fixed pause). Selector-not-found is a
+    structured per-step error, not a throw.
+  - **DOM-content-settled pump.** After each action the event loop is pumped
+    until the DOM *stops changing* (element-count stable for a quiesce window,
+    no loads in flight) or the loop drains — bounded by the capture window —
+    so a fetch-less modal mount or client-side route render is captured before
+    the next action or the readback.
+  - **Batch surface, Firecrawl-shaped.** `actions: [{ "type": "click",
+    "selector": "…" }, …]` with `click` / `type` / `press` / `scroll` /
+    `select` / `hover` / `wait`. Steps run in order and stop at the first
+    failure; the response carries the per-step trace (`steps[]`: action, ok,
+    error) *and* the post-action page, so one call shows what the interaction
+    did: `POST /v1/interact/{id}/act` (returns the scrape envelope + `ok` /
+    `steps` / `logs`), MCP `draco_interact_act` (markdown + rawHtml snapshot),
+    and CLI `draco interact --act '<json>'` one-shot / `:act <json>` in the
+    REPL (trace + snapshot).
+  - **e2e proof.** `interact_act_e2e` mounts a modal from a click listener with
+    zero network and asserts the serialized DOM contains it — the exact case
+    that raw `.click()` + fetch-quiesce missed.
+
 ## [0.17.0] — 2026-07-11
 
 ### Added

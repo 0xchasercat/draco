@@ -56,6 +56,7 @@ use std::time::{Duration, Instant};
 
 use deno_core::{JsRuntime, RuntimeOptions};
 use futures::future::LocalBoxFuture;
+use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
@@ -195,6 +196,12 @@ enum Command {
         url: String,
         reply: oneshot::Sender<NavReport>,
     },
+    /// Run a batch of high-fidelity interactions (click/type/…), settling the DOM
+    /// after each so a reactive render (modal, route swap) is captured.
+    Act {
+        actions: Vec<Action>,
+        reply: oneshot::Sender<ActReport>,
+    },
     /// Tear the isolate down and end the thread.
     Close { reply: oneshot::Sender<()> },
 }
@@ -208,6 +215,75 @@ pub struct NavReport {
     pub url: Option<String>,
     /// Why navigation failed (no page fetcher, fetch failed, or re-hydrate threw).
     pub error: Option<String>,
+}
+
+/// One high-fidelity interaction. Firecrawl-shaped (`{ "type": "...", ... }`),
+/// deserialized directly from the request `actions[]`. Unknown fields ignored.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum Action {
+    /// Click an element: focus + a faithful pointer/mouse event sequence.
+    Click { selector: String },
+    /// Focus `selector` (or the active element) and type `text`, dispatching
+    /// `input`/`change` so framework bindings update.
+    Type {
+        #[serde(default)]
+        selector: Option<String>,
+        text: String,
+        /// Clear the field first (default true).
+        #[serde(default = "default_true")]
+        clear: bool,
+    },
+    /// Dispatch a `keydown`/`keyup` for `key` on `selector` (or the document).
+    Press {
+        #[serde(default)]
+        selector: Option<String>,
+        key: String,
+    },
+    /// Scroll `selector` into view, or the window by `direction` (`up`/`down`).
+    Scroll {
+        #[serde(default)]
+        selector: Option<String>,
+        #[serde(default)]
+        direction: Option<String>,
+    },
+    /// Set a `<select>`'s value and dispatch `change`.
+    Select { selector: String, value: String },
+    /// Hover: pointerover/mouseover/mouseenter/mousemove.
+    Hover { selector: String },
+    /// Wait until `selector` appears (up to `timeout_ms`), or a fixed
+    /// `milliseconds` pause. Defaults: 5000 ms selector timeout.
+    Wait {
+        #[serde(default)]
+        selector: Option<String>,
+        #[serde(default)]
+        milliseconds: Option<u64>,
+    },
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Per-action outcome within an [`ActReport`].
+#[derive(Debug, Clone)]
+pub struct ActStep {
+    /// A short label for the action (e.g. `click a.login`).
+    pub action: String,
+    pub ok: bool,
+    /// Why this step failed (selector not found, JS throw, wait timeout).
+    pub error: Option<String>,
+}
+
+/// Outcome of a [`Session::act`] batch. `ok` is true iff every step succeeded;
+/// steps stop at the first failure (a later action usually depends on an earlier
+/// one landing). The caller reads the resulting DOM via `serialize`/`scrape`.
+#[derive(Debug, Clone, Default)]
+pub struct ActReport {
+    pub ok: bool,
+    pub steps: Vec<ActStep>,
+    /// Console lines emitted across the batch.
+    pub logs: Vec<String>,
 }
 
 /// A live interact session: a `Send` handle to the isolate running on its own
@@ -299,6 +375,18 @@ impl Session {
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::Navigate { url, reply })
+            .map_err(|_| SessionError::Closed)?;
+        rx.await.map_err(|_| SessionError::Closed)
+    }
+
+    /// Run a batch of interactions in order, dispatching a faithful event
+    /// sequence per action and settling the DOM after each so a reactive render
+    /// (a modal, a route swap) is captured. Stops at the first failed step.
+    /// Read the resulting page with `serialize`/`scrape` afterwards.
+    pub async fn act(&self, actions: Vec<Action>) -> Result<ActReport, SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::Act { actions, reply })
             .map_err(|_| SessionError::Closed)?;
         rx.await.map_err(|_| SessionError::Closed)
     }
@@ -439,6 +527,16 @@ async fn actor_main(
                         if old_dropped && !ok {
                             break;
                         }
+                    }
+                    Some(Command::Act { actions, reply }) => {
+                        let report = do_act(
+                            runtime.as_mut().unwrap(),
+                            cap.as_ref().unwrap(),
+                            &config.capture,
+                            &actions,
+                        )
+                        .await;
+                        let _ = reply.send(report);
                     }
                     Some(Command::Close { reply }) => {
                         let _ = reply.send(());
@@ -754,6 +852,313 @@ fn build_exec_wrapper(js: &str, budget: f64) -> String {
   try {{ Deno.core.ops.op_raze_exec_result(json); }} catch (_e) {{}}
 }})();"#
     )
+}
+
+// ===================================================================
+// act — high-fidelity interaction primitives
+// ===================================================================
+
+/// Run a batch of interactions in order. Each action dispatches a faithful event
+/// sequence in page scope, then the DOM is settled (see [`pump_to_dom_settled`])
+/// so a reactive render triggered by the action is captured. Stops at the first
+/// failed step. Reads back nothing itself — the caller `serialize`s afterwards.
+async fn do_act(
+    runtime: &mut JsRuntime,
+    cap: &Rc<RefCell<CaptureState>>,
+    cfg: &CaptureConfig,
+    actions: &[Action],
+) -> ActReport {
+    let log_start = cap.borrow().logs.len();
+    let mut steps: Vec<ActStep> = Vec::with_capacity(actions.len());
+    let mut all_ok = true;
+
+    for action in actions {
+        let label = action_label(action);
+        // `wait` is driven Rust-side (poll for the selector, or a bounded sleep);
+        // every other action runs a page-scope event snippet that reports
+        // `{ok,error}` back through `op_raze_exec_result`.
+        let outcome = match action {
+            Action::Wait {
+                selector,
+                milliseconds,
+            } => wait_action(runtime, cap, cfg, selector.as_deref(), *milliseconds).await,
+            _ => run_action_snippet(runtime, cap, &build_action_js(action)),
+        };
+        let ok = outcome.is_ok();
+        steps.push(ActStep {
+            action: label,
+            ok,
+            error: outcome.err(),
+        });
+        if !ok {
+            all_ok = false;
+            break;
+        }
+        // Let the SPA react (modal mount, route render) before the next action.
+        pump_to_dom_settled(runtime, cap, cfg).await;
+    }
+
+    let logs = {
+        let cs = cap.borrow();
+        cs.logs
+            .get(log_start..)
+            .map(|s| s.to_vec())
+            .unwrap_or_default()
+    };
+    ActReport {
+        ok: all_ok,
+        steps,
+        logs,
+    }
+}
+
+/// A short human label for an action, for the [`ActStep`] trace.
+fn action_label(a: &Action) -> String {
+    match a {
+        Action::Click { selector } => format!("click {selector}"),
+        Action::Type { selector, .. } => {
+            format!("type {}", selector.as_deref().unwrap_or("<focused>"))
+        }
+        Action::Press { key, .. } => format!("press {key}"),
+        Action::Scroll {
+            selector,
+            direction,
+        } => format!(
+            "scroll {}",
+            selector
+                .as_deref()
+                .or(direction.as_deref())
+                .unwrap_or("down")
+        ),
+        Action::Select { selector, .. } => format!("select {selector}"),
+        Action::Hover { selector } => format!("hover {selector}"),
+        Action::Wait {
+            selector,
+            milliseconds,
+        } => match (selector, milliseconds) {
+            (Some(s), _) => format!("wait {s}"),
+            (None, Some(ms)) => format!("wait {ms}ms"),
+            _ => "wait".to_string(),
+        },
+    }
+}
+
+/// Run one action's event snippet and read back its `{ok,error}` result.
+fn run_action_snippet(
+    runtime: &mut JsRuntime,
+    cap: &Rc<RefCell<CaptureState>>,
+    js: &str,
+) -> Result<(), String> {
+    cap.borrow_mut().exec_result = None;
+    if let Err(e) = runtime.execute_script("draco:interact:act", js.to_string()) {
+        return Err(format!("act snippet threw: {e}"));
+    }
+    let _ = poll_once(runtime);
+    let raw = cap.borrow_mut().exec_result.take();
+    match raw {
+        Some(s) => {
+            let v: serde_json::Value = serde_json::from_str(&s).unwrap_or(serde_json::Value::Null);
+            if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
+                Ok(())
+            } else {
+                Err(v
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("action failed")
+                    .to_string())
+            }
+        }
+        None => Err("action produced no result".to_string()),
+    }
+}
+
+/// `wait`: a fixed bounded sleep (pumping the loop) or poll until `selector`
+/// appears, ceilinged by the capture window.
+async fn wait_action(
+    runtime: &mut JsRuntime,
+    cap: &Rc<RefCell<CaptureState>>,
+    cfg: &CaptureConfig,
+    selector: Option<&str>,
+    milliseconds: Option<u64>,
+) -> Result<(), String> {
+    let tick = Duration::from_millis(30);
+    if let Some(ms) = milliseconds {
+        let ms = ms.min(cfg.capture_window_ms.max(1));
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(ms) {
+            let _ = poll_once(runtime);
+            tokio::time::sleep(tick).await;
+        }
+        return Ok(());
+    }
+    let sel = match selector {
+        Some(s) => s,
+        None => return Err("wait requires `selector` or `milliseconds`".to_string()),
+    };
+    let check_js = SEL_PRESENT_JS.replace("__SEL__", &json_string_literal(sel));
+    let ceiling = Duration::from_millis(cfg.capture_window_ms);
+    let start = Instant::now();
+    loop {
+        let _ = poll_once(runtime);
+        cap.borrow_mut().exec_result = None;
+        let _ = runtime.execute_script("draco:interact:wait", check_js.clone());
+        let _ = poll_once(runtime);
+        if cap.borrow().exec_result.as_deref() == Some("1") {
+            return Ok(());
+        }
+        if start.elapsed() >= ceiling {
+            return Err(format!("wait timed out for selector: {sel}"));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Build the page-scope event snippet for a (non-`wait`) action. Placeholder
+/// substitution (not `format!`) keeps the embedded JS free of brace-escaping.
+fn build_action_js(action: &Action) -> String {
+    let body = match action {
+        Action::Click { selector } => CLICK_JS.replace("__SEL__", &json_string_literal(selector)),
+        // Free-form user values (`__TEXT__`, `__VALUE__`, `__KEY__`) are always
+        // substituted LAST so a later `.replace` can never rescan a placeholder
+        // token that happened to appear inside them.
+        Action::Type {
+            selector,
+            text,
+            clear,
+        } => TYPE_JS
+            .replace("__CLEAR__", if *clear { "true" } else { "false" })
+            .replace("__SEL__", &opt_lit(selector))
+            .replace("__TEXT__", &json_string_literal(text)),
+        Action::Press { selector, key } => PRESS_JS
+            .replace("__SEL__", &opt_lit(selector))
+            .replace("__KEY__", &json_string_literal(key)),
+        Action::Scroll {
+            selector,
+            direction,
+        } => SCROLL_JS
+            .replace(
+                "__DIR__",
+                &json_string_literal(direction.as_deref().unwrap_or("down")),
+            )
+            .replace("__SEL__", &opt_lit(selector)),
+        Action::Select { selector, value } => SELECT_JS
+            .replace("__SEL__", &json_string_literal(selector))
+            .replace("__VALUE__", &json_string_literal(value)),
+        Action::Hover { selector } => HOVER_JS.replace("__SEL__", &json_string_literal(selector)),
+        // `wait` never reaches here (handled Rust-side in `do_act`).
+        Action::Wait { .. } => {
+            "Deno.core.ops.op_raze_exec_result(JSON.stringify({ok:true}));".to_string()
+        }
+    };
+    WRAP_JS.replace("__BODY__", &body)
+}
+
+/// `None` selector → the JS literal `null`; `Some` → a quoted string literal.
+fn opt_lit(s: &Option<String>) -> String {
+    match s {
+        Some(v) => json_string_literal(v),
+        None => "null".to_string(),
+    }
+}
+
+const WRAP_JS: &str = r#"(() => { try { __BODY__
+  Deno.core.ops.op_raze_exec_result(JSON.stringify({ ok: true })); } catch (e) { try { Deno.core.ops.op_raze_exec_result(JSON.stringify({ ok: false, error: String((e && e.stack) || e) })); } catch (_e) {} } })();"#;
+
+const CLICK_JS: &str = r#"const el = document.querySelector(__SEL__);
+  if (!el) { Deno.core.ops.op_raze_exec_result(JSON.stringify({ ok: false, error: "selector not found: " + __SEL__ })); return; }
+  try { if (el.scrollIntoView) el.scrollIntoView(); } catch (_e) {}
+  try { if (el.focus) el.focus(); } catch (_e) {}
+  const mk = (t) => { try { return new MouseEvent(t, { bubbles: true, cancelable: true, composed: true, view: (typeof window !== "undefined" ? window : null) }); } catch (_e) { return new Event(t, { bubbles: true, cancelable: true }); } };
+  ["pointerover","pointerenter","pointerdown","mousedown","pointerup","mouseup","click"].forEach((t) => { try { el.dispatchEvent(mk(t)); } catch (_e) {} });"#;
+
+const TYPE_JS: &str = r#"const el = __SEL__ ? document.querySelector(__SEL__) : (document.activeElement || null);
+  if (!el) { Deno.core.ops.op_raze_exec_result(JSON.stringify({ ok: false, error: "no element to type into" })); return; }
+  try { if (el.focus) el.focus(); } catch (_e) {}
+  const hasValue = ("value" in el);
+  if (__CLEAR__) { try { if (hasValue) { el.value = ""; } else { el.textContent = ""; } el.dispatchEvent(new Event("input", { bubbles: true })); } catch (_e) {} }
+  try { if (hasValue) { el.value = (el.value || "") + __TEXT__; } else { el.textContent = (el.textContent || "") + __TEXT__; } } catch (_e) {}
+  try { el.dispatchEvent(new Event("input", { bubbles: true })); } catch (_e) {}
+  try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch (_e) {}"#;
+
+const PRESS_JS: &str = r#"const el = __SEL__ ? document.querySelector(__SEL__) : (document.activeElement || document.body || document.documentElement);
+  if (!el) { Deno.core.ops.op_raze_exec_result(JSON.stringify({ ok: false, error: "no element for keypress" })); return; }
+  const mk = (t) => { try { return new KeyboardEvent(t, { key: __KEY__, bubbles: true, cancelable: true }); } catch (_e) { return new Event(t, { bubbles: true, cancelable: true }); } };
+  ["keydown","keyup"].forEach((t) => { try { el.dispatchEvent(mk(t)); } catch (_e) {} });"#;
+
+const SCROLL_JS: &str = r#"if (__SEL__) { const el = document.querySelector(__SEL__); if (!el) { Deno.core.ops.op_raze_exec_result(JSON.stringify({ ok: false, error: "selector not found: " + __SEL__ })); return; } try { if (el.scrollIntoView) el.scrollIntoView(); } catch (_e) {} }
+  else { const dy = (__DIR__ === "up") ? -1000 : 1000; try { if (typeof window !== "undefined" && window.scrollBy) window.scrollBy(0, dy); } catch (_e) {} }"#;
+
+const SELECT_JS: &str = r#"const el = document.querySelector(__SEL__);
+  if (!el) { Deno.core.ops.op_raze_exec_result(JSON.stringify({ ok: false, error: "selector not found: " + __SEL__ })); return; }
+  try { el.value = __VALUE__; } catch (_e) {}
+  try { el.dispatchEvent(new Event("input", { bubbles: true })); } catch (_e) {}
+  try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch (_e) {}"#;
+
+const HOVER_JS: &str = r#"const el = document.querySelector(__SEL__);
+  if (!el) { Deno.core.ops.op_raze_exec_result(JSON.stringify({ ok: false, error: "selector not found: " + __SEL__ })); return; }
+  const mk = (t) => { try { return new MouseEvent(t, { bubbles: true, cancelable: true, composed: true }); } catch (_e) { return new Event(t, { bubbles: true }); } };
+  ["pointerover","mouseover","mouseenter","mousemove"].forEach((t) => { try { el.dispatchEvent(mk(t)); } catch (_e) {} });"#;
+
+const SEL_PRESENT_JS: &str = r#"try { Deno.core.ops.op_raze_exec_result(document.querySelector(__SEL__) ? "1" : "0"); } catch (_e) { try { Deno.core.ops.op_raze_exec_result("0"); } catch (_e2) {} }"#;
+
+/// After an action, pump the event loop until the DOM stops changing for a
+/// stability window — a reactive modal/route render lands with no network, which
+/// `pump_to_quiesce` (fetch-activity based) would miss. Bounded by the capture
+/// window; also exits once loads are done and the DOM is stable.
+async fn pump_to_dom_settled(
+    runtime: &mut JsRuntime,
+    cap: &Rc<RefCell<CaptureState>>,
+    cfg: &CaptureConfig,
+) {
+    let start = Instant::now();
+    let hard_cap = Duration::from_millis(cfg.capture_window_ms);
+    let stability = Duration::from_millis(cfg.quiesce_ms.max(120));
+    let tick = Duration::from_millis(30);
+    let inflight = cap.borrow().inflight.clone();
+    let mut last_size: i64 = -1;
+    let mut stable_since = Instant::now();
+    loop {
+        // A drained loop (no pending timers/promises/loads) can never mutate the
+        // DOM further — microtasks are already flushed — so stop immediately once
+        // any in-flight loads are done. Pages with a live interval stay `Pending`
+        // and fall through to the stability-window / hard-cap checks below.
+        let drained = matches!(poll_once(runtime), std::task::Poll::Ready(_));
+        let size = probe_dom_size(runtime, cap);
+        if size != last_size {
+            last_size = size;
+            stable_since = Instant::now();
+        }
+        if start.elapsed() >= hard_cap {
+            break;
+        }
+        if drained && inflight.get() == 0 {
+            break;
+        }
+        if stable_since.elapsed() >= stability && inflight.get() == 0 {
+            break;
+        }
+        tokio::time::sleep(tick).await;
+    }
+}
+
+/// Cheap DOM-size probe (element count) via a one-shot page-scope script that
+/// hands the number back through `op_raze_exec_result`; `-1` if unavailable.
+fn probe_dom_size(runtime: &mut JsRuntime, cap: &Rc<RefCell<CaptureState>>) -> i64 {
+    cap.borrow_mut().exec_result = None;
+    let _ = runtime.execute_script(
+        "draco:interact:probe",
+        r#"try { Deno.core.ops.op_raze_exec_result(String((document.getElementsByTagName("*") || []).length)); } catch (_e) {}"#
+            .to_string(),
+    );
+    let _ = poll_once(runtime);
+    let n = cap
+        .borrow()
+        .exec_result
+        .as_deref()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(-1);
+    cap.borrow_mut().exec_result = None;
+    n
 }
 
 /// Pump the event loop until it quiesces (no new content activity for `quiesce_ms`

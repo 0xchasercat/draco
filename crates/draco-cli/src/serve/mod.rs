@@ -166,6 +166,7 @@ fn router(state: Arc<AppState>) -> Router {
     let router = router
         .route("/v1/interact", post(interact::open_handler))
         .route("/v1/interact/{id}/exec", post(interact::exec_handler))
+        .route("/v1/interact/{id}/act", post(interact::act_handler))
         .route(
             "/v1/interact/{id}/navigate",
             post(interact::navigate_handler),

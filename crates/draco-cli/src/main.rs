@@ -274,8 +274,11 @@ enum Command {
         /// Initial document URL.
         url: String,
         /// Run one JavaScript turn and exit instead of starting the line REPL.
-        #[arg(long = "exec")]
+        #[arg(long = "exec", conflicts_with = "act_json")]
         exec_js: Option<String>,
+        /// Run one Firecrawl-shaped action batch from a JSON array and exit.
+        #[arg(long = "act", value_name = "JSON", conflicts_with = "exec_js")]
+        act_json: Option<String>,
         /// Emit one final serialized-DOM snapshot when the command exits.
         #[arg(long, value_enum)]
         format: Option<InteractFormatArg>,
@@ -540,6 +543,30 @@ fn exec_report_value(report: draco_core::ExecReport) -> Value {
 }
 
 #[cfg(feature = "tier2")]
+fn act_report_value(report: draco_core::ActReport) -> Value {
+    serde_json::json!({
+        "success": report.ok,
+        "steps": report
+            .steps
+            .into_iter()
+            .map(|step| {
+                serde_json::json!({
+                    "action": step.action,
+                    "ok": step.ok,
+                    "error": step.error,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "logs": report.logs,
+    })
+}
+
+#[cfg(feature = "tier2")]
+fn parse_actions(value: &str) -> Result<Vec<draco_core::Action>, String> {
+    serde_json::from_str(value).map_err(|error| format!("invalid actions JSON: {error}"))
+}
+
+#[cfg(feature = "tier2")]
 async fn interact_snapshot(
     session: &draco_core::Session,
     url: &str,
@@ -715,6 +742,7 @@ async fn async_main() {
         Command::Interact {
             url,
             exec_js,
+            act_json,
             format,
             proxy,
             timeout,
@@ -738,6 +766,7 @@ async fn async_main() {
             };
 
             let mut exit_code = 0;
+            let mut one_shot_act_ran = false;
             if let Some(js) = exec_js {
                 match session.exec(js, draco_core::ExecOptions::default()).await {
                     Ok(report) => {
@@ -751,8 +780,30 @@ async fn async_main() {
                         exit_code = 1;
                     }
                 }
+            } else if let Some(value) = act_json {
+                match parse_actions(&value) {
+                    Ok(actions) => match session.act(actions).await {
+                        Ok(report) => {
+                            one_shot_act_ran = true;
+                            if !report.ok {
+                                exit_code = 1;
+                            }
+                            println!("{}", render_value(&act_report_value(report), pretty));
+                        }
+                        Err(error) => {
+                            eprintln!("draco interact: {error}");
+                            exit_code = 1;
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!("draco interact: {error}");
+                        exit_code = 1;
+                    }
+                }
             } else {
-                eprintln!("draco interact: enter JavaScript; :quit or EOF closes the session");
+                eprintln!(
+                    "draco interact: enter JavaScript or :act <json>; :quit or EOF closes the session"
+                );
                 let mut lines = BufReader::new(tokio::io::stdin()).lines();
                 loop {
                     let line = match lines.next_line().await {
@@ -764,15 +815,48 @@ async fn async_main() {
                             break;
                         }
                     };
-                    let js = line.trim();
-                    if matches!(js, ":quit" | ":exit") {
+                    let input = line.trim();
+                    if matches!(input, ":quit" | ":exit") {
                         break;
                     }
-                    if js.is_empty() {
+                    if input.is_empty() {
+                        continue;
+                    }
+                    if input == ":act" {
+                        eprintln!("draco interact: :act requires a JSON actions array");
+                        continue;
+                    }
+                    if let Some(value) = input.strip_prefix(":act ") {
+                        let actions = match parse_actions(value.trim()) {
+                            Ok(actions) => actions,
+                            Err(error) => {
+                                eprintln!("draco interact: {error}");
+                                continue;
+                            }
+                        };
+                        match session.act(actions).await {
+                            Ok(report) => {
+                                println!("{}", render_value(&act_report_value(report), pretty));
+                                let snapshot_format = format.unwrap_or(InteractFormatArg::Markdown);
+                                match interact_snapshot(&session, &url, snapshot_format).await {
+                                    Ok(result) => println!("{}", render(&result, pretty)),
+                                    Err(error) => {
+                                        eprintln!("draco interact: snapshot: {error}");
+                                        exit_code = 1;
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("draco interact: {error}");
+                                exit_code = 1;
+                                break;
+                            }
+                        }
                         continue;
                     }
                     match session
-                        .exec(js.to_string(), draco_core::ExecOptions::default())
+                        .exec(input.to_string(), draco_core::ExecOptions::default())
                         .await
                     {
                         Ok(report) => {
@@ -787,7 +871,12 @@ async fn async_main() {
                 }
             }
 
-            if let Some(format) = format {
+            let snapshot_format = if one_shot_act_ran {
+                Some(format.unwrap_or(InteractFormatArg::Markdown))
+            } else {
+                format
+            };
+            if let Some(format) = snapshot_format {
                 match interact_snapshot(&session, &url, format).await {
                     Ok(result) => println!("{}", render(&result, pretty)),
                     Err(error) => {
@@ -1478,17 +1567,66 @@ mod tests {
             Command::Interact {
                 url,
                 exec_js,
+                act_json,
                 format,
                 pretty,
                 ..
             } => {
                 assert_eq!(url, "https://example.com");
                 assert_eq!(exec_js.as_deref(), Some("return document.title"));
+                assert!(act_json.is_none());
                 assert_eq!(format, Some(InteractFormatArg::RawHtml));
                 assert!(pretty);
             }
             _ => panic!("expected Command::Interact"),
         }
+    }
+
+    #[cfg(feature = "tier2")]
+    #[test]
+    fn interact_command_parses_act_json() {
+        let actions = r##"[{"type":"click","selector":"#open"}]"##;
+        let cli = Cli::try_parse_from([
+            "draco",
+            "interact",
+            "https://example.com",
+            "--act",
+            actions,
+            "--format",
+            "markdown",
+            "--pretty",
+        ])
+        .expect("interact --act should parse");
+        match cli.command {
+            Command::Interact {
+                exec_js,
+                act_json,
+                format,
+                pretty,
+                ..
+            } => {
+                assert!(exec_js.is_none());
+                assert_eq!(act_json.as_deref(), Some(actions));
+                assert_eq!(format, Some(InteractFormatArg::Markdown));
+                assert!(pretty);
+            }
+            _ => panic!("expected Command::Interact"),
+        }
+    }
+
+    #[cfg(feature = "tier2")]
+    #[test]
+    fn interact_exec_and_act_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from([
+            "draco",
+            "interact",
+            "https://example.com",
+            "--exec",
+            "document.title",
+            "--act",
+            "[]",
+        ])
+        .is_err());
     }
 
     #[cfg(feature = "serve")]

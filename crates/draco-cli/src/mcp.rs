@@ -439,6 +439,34 @@ fn interact_tool_descriptors() -> Vec<Value> {
             "annotations": { "readOnlyHint": false, "openWorldHint": true }
         }),
         json!({
+            "name": "draco_interact_act",
+            "title": "Act in interact session",
+            "description": "Dispatch faithful DOM interactions in order, settle after each, \
+                            and return the step trace plus the post-action page snapshot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sessionId": { "type": "string" },
+                    "actions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {
+                                    "type": "string",
+                                    "enum": ["click", "type", "press", "scroll", "select", "hover", "wait"]
+                                }
+                            },
+                            "required": ["type"],
+                            "additionalProperties": true
+                        }
+                    }
+                },
+                "required": ["sessionId", "actions"]
+            },
+            "annotations": { "readOnlyHint": false, "openWorldHint": true }
+        }),
+        json!({
             "name": "draco_interact_navigate",
             "title": "Navigate interact session",
             "description": "Fetch and hydrate another URL in the same cookie-persisting session.",
@@ -719,6 +747,57 @@ async fn call_interact(
                 "logs": report.logs,
                 "error": report.error,
             })
+        }
+        "draco_interact_act" => {
+            let id = required_interact_arg(&args, "sessionId")?;
+            let actions = args
+                .get("actions")
+                .cloned()
+                .ok_or((-32602, "\"actions\" (array) is required".to_string()))?;
+            let actions: Vec<draco_core::Action> = serde_json::from_value(actions)
+                .map_err(|error| (-32602, format!("invalid \"actions\": {error}")))?;
+            let report = match store.act(id, actions).await {
+                Ok(report) => report,
+                Err(error) => return Ok(interact_store_error(error)),
+            };
+            let formats = FormatSet {
+                markdown: true,
+                raw_html: true,
+                ..FormatSet::none()
+            };
+            let result = match store.scrape(id, formats, true).await {
+                Ok(result) => result,
+                Err(error) => return Ok(interact_store_error(error)),
+            };
+            let (status, mut body) = to_firecrawl(&result);
+            if status != StatusCode::OK {
+                return Ok(tool_error(
+                    body["error"]
+                        .as_str()
+                        .unwrap_or("interact act readback failed"),
+                ));
+            }
+            if let Some(data) = body.get_mut("data").and_then(Value::as_object_mut) {
+                data.insert("ok".into(), Value::Bool(report.ok));
+                data.insert(
+                    "steps".into(),
+                    Value::Array(
+                        report
+                            .steps
+                            .into_iter()
+                            .map(|step| {
+                                json!({
+                                    "action": step.action,
+                                    "ok": step.ok,
+                                    "error": step.error,
+                                })
+                            })
+                            .collect(),
+                    ),
+                );
+                data.insert("logs".into(), json!(report.logs));
+            }
+            body
         }
         "draco_interact_navigate" => {
             let id = required_interact_arg(&args, "sessionId")?;
@@ -1023,6 +1102,7 @@ mod tests {
         for name in [
             "draco_interact_open",
             "draco_interact_exec",
+            "draco_interact_act",
             "draco_interact_navigate",
             "draco_interact_scrape",
             "draco_interact_close",
