@@ -23,6 +23,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use draco_core::{extract, Config, FormatSet};
 
+mod heavy_local;
 /// MCP server — stdio transport (`draco mcp`) + HTTP binding (`POST /mcp`).
 #[cfg(feature = "serve")]
 mod mcp;
@@ -713,7 +714,8 @@ async fn async_main() {
                 runtime_log,
                 force_render,
             };
-            let mut result = extract(&url, &config).await;
+            let result = extract(&url, &config).await;
+            let mut result = heavy_local::maybe_escalate(&url, &config, result).await;
             if let Some(expr) = extract_expr.as_deref() {
                 result = filter_result(result, expr);
             }
