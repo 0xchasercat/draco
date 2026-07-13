@@ -34,14 +34,22 @@ async fn run() -> Result<(), String> {
             Ok(())
         }
         None => {
-            let resolved = resolve(&config.cache_path, ttl, false);
-            if let Some(error) = &resolved.cache_error {
-                eprintln!(
-                    "draco-heavy: warning: discovery cache unavailable at {}: {error}",
-                    config.cache_path.display()
-                );
+            #[cfg(feature = "pipe")]
+            {
+                let resolved = resolve(&config.cache_path, ttl, false);
+                if let Some(error) = &resolved.cache_error {
+                    eprintln!(
+                        "draco-heavy: warning: discovery cache unavailable at {}: {error}",
+                        config.cache_path.display()
+                    );
+                }
+                draco_heavy::serve(config, resolved).await
             }
-            draco_heavy::serve(config, resolved).await
+            #[cfg(not(feature = "pipe"))]
+            {
+                Err("daemon mode requires the `pipe` feature; use the library API for local fallback"
+                    .into())
+            }
         }
     }
 }
