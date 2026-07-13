@@ -144,8 +144,11 @@ fn discover(probe: HostProbe, fingerprint: String) -> HostConfig {
             .browser
             .as_ref()
             .is_some_and(browser_supports_headless_new),
-        headed: probe.display.is_some() || probe.platform_gpu,
-        display: probe.display.clone(),
+        headed: probe.display.is_some() || probe.platform_gpu || probe.xvfb_path.is_some(),
+        display: probe
+            .display
+            .clone()
+            .or_else(|| probe.xvfb_path.as_ref().map(|_| ":99".into())),
     };
 
     let (render_mode, render_tier, resolved_display, command_prefix, chrome_args) =
@@ -486,5 +489,27 @@ mod tests {
             version: None,
         };
         assert!(browser_supports_headless_new(&browser));
+    }
+
+    #[test]
+    fn xvfb_makes_headed_ladder_available() {
+        let config = discover(
+            HostProbe {
+                display: None,
+                xvfb_path: Some(PathBuf::from("/usr/bin/Xvfb")),
+                vglrun_path: None,
+                dri_present: true,
+                nvidia_present: false,
+                platform_gpu: false,
+                browser: Some(DetectedBrowser {
+                    channel: BrowserChannel::Chrome,
+                    path: PathBuf::from("chrome"),
+                    version: Some("Google Chrome 126".into()),
+                }),
+            },
+            "test".into(),
+        );
+        assert!(config.launch_capabilities.headed);
+        assert_eq!(config.launch_capabilities.display.as_deref(), Some(":99"));
     }
 }

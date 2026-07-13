@@ -6,11 +6,11 @@ pub mod discovery;
 pub mod double_tap;
 pub mod local;
 #[cfg(feature = "pipe")]
+pub mod pipe;
+#[cfg(feature = "pipe")]
 pub mod server;
 #[cfg(feature = "pipe")]
 pub mod slots;
-#[cfg(feature = "pipe")]
-pub mod stubs;
 pub mod wire;
 
 pub use browser::{BrowserDriver, BrowserSession, LaunchMode};
