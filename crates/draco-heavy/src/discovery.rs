@@ -102,11 +102,11 @@ pub fn discover(fingerprint: String) -> HostConfig {
         && env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none();
 
     let (render_mode, render_tier, resolved_display, command_prefix, chrome_args) =
-        if let Some(display) = display.filter(|_| gpu_present) {
+        if gpu_present && (display.is_some() || platform_gpu) {
             (
                 RenderMode::Gpu,
                 RenderTier::NativeDisplayGpu,
-                Some(display),
+                display,
                 Vec::new(),
                 gpu_chrome_args(),
             )
