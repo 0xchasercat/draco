@@ -234,6 +234,7 @@ mod tests {
                 channel: BrowserChannel::Chrome,
                 path: "chrome".into(),
                 version: Some("Google Chrome 126".into()),
+                preferred: false,
             }),
             launch_capabilities: LaunchCapabilities {
                 headless_new: true,

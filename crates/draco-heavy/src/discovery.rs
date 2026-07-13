@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-const CACHE_SCHEMA: u32 = 2;
+const CACHE_SCHEMA: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -28,6 +28,7 @@ pub enum RenderTier {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserChannel {
+    Cloakbrowser,
     Chrome,
     Chromium,
     Edge,
@@ -38,8 +39,11 @@ pub enum BrowserChannel {
 #[serde(rename_all = "camelCase")]
 pub struct DetectedBrowser {
     pub channel: BrowserChannel,
+    #[serde(rename = "executablePath")]
     pub path: PathBuf,
     pub version: Option<String>,
+    #[serde(default)]
+    pub preferred: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,11 +148,8 @@ fn discover(probe: HostProbe, fingerprint: String) -> HostConfig {
             .browser
             .as_ref()
             .is_some_and(browser_supports_headless_new),
-        headed: probe.display.is_some() || probe.platform_gpu || probe.xvfb_path.is_some(),
-        display: probe
-            .display
-            .clone()
-            .or_else(|| probe.xvfb_path.as_ref().map(|_| ":99".into())),
+        headed: probe.display.is_some() || probe.platform_gpu,
+        display: probe.display.clone(),
     };
 
     let (render_mode, render_tier, resolved_display, command_prefix, chrome_args) =
@@ -212,10 +213,19 @@ fn native_display() -> Option<String> {
 }
 
 fn detect_browser() -> Option<DetectedBrowser> {
-    browser_candidates().into_iter().find_map(|candidate| {
+    detect_browser_from_candidates(browser_candidates())
+}
+
+fn detect_browser_from_candidates(
+    candidates: impl IntoIterator<Item = BrowserCandidate>,
+) -> Option<DetectedBrowser> {
+    candidates.into_iter().find_map(|candidate| {
         candidate.path.is_file().then(|| DetectedBrowser {
             channel: candidate.channel,
-            version: browser_version(&candidate.path),
+            version: candidate
+                .version
+                .or_else(|| browser_version(&candidate.path)),
+            preferred: candidate.channel == BrowserChannel::Cloakbrowser,
             path: candidate.path,
         })
     })
@@ -224,10 +234,65 @@ fn detect_browser() -> Option<DetectedBrowser> {
 struct BrowserCandidate {
     channel: BrowserChannel,
     path: PathBuf,
+    version: Option<String>,
+}
+
+fn cloakbrowser_candidates(root: &Path, platform: &str) -> Vec<BrowserCandidate> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<BrowserCandidate> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let version = if name == "chromium" {
+                None
+            } else {
+                Some(name.strip_prefix("chromium-")?.to_owned())
+            };
+            let path = cloakbrowser_executable(&entry.path(), platform)?;
+            Some(BrowserCandidate {
+                channel: BrowserChannel::Cloakbrowser,
+                path,
+                version,
+            })
+        })
+        .collect();
+    candidates.sort_by(|left, right| {
+        version_key(right.version.as_deref()).cmp(&version_key(left.version.as_deref()))
+    });
+    candidates
+}
+
+fn cloakbrowser_executable(build: &Path, platform: &str) -> Option<PathBuf> {
+    let relative_paths: &[&str] = match platform {
+        "macos" => &["Chromium.app/Contents/MacOS/Chromium"],
+        "windows" => &["chrome.exe", "chromium.exe"],
+        _ => &["chrome", "chromium"],
+    };
+    relative_paths
+        .iter()
+        .map(|relative| build.join(relative))
+        .find(|candidate| candidate.is_file())
+}
+
+fn version_key(version: Option<&str>) -> Vec<u64> {
+    version
+        .unwrap_or_default()
+        .split('.')
+        .map(|part| part.parse().unwrap_or_default())
+        .collect()
 }
 
 fn browser_candidates() -> Vec<BrowserCandidate> {
-    let mut candidates = Vec::new();
+    let cloak_root = env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".cloakbrowser"));
+    let mut candidates = cloak_root
+        .as_deref()
+        .map(|root| cloakbrowser_candidates(root, env::consts::OS))
+        .unwrap_or_default();
     let names: &[(BrowserChannel, &str)] = match env::consts::OS {
         "windows" => &[
             (BrowserChannel::Chrome, "chrome.exe"),
@@ -285,7 +350,18 @@ fn browser_candidates() -> Vec<BrowserCandidate> {
         _ => {}
     }
 
+    candidates.sort_by_key(|candidate| browser_priority(candidate.channel));
     candidates
+}
+
+fn browser_priority(channel: BrowserChannel) -> u8 {
+    match channel {
+        BrowserChannel::Cloakbrowser => 0,
+        BrowserChannel::Chrome => 1,
+        BrowserChannel::Chromium => 2,
+        BrowserChannel::Edge => 3,
+        BrowserChannel::Brave => 4,
+    }
 }
 
 fn add_windows_candidates(candidates: &mut Vec<BrowserCandidate>) {
@@ -316,7 +392,11 @@ fn add_windows_candidates(candidates: &mut Vec<BrowserCandidate>) {
 
 fn push_candidate(candidates: &mut Vec<BrowserCandidate>, channel: BrowserChannel, path: PathBuf) {
     if !candidates.iter().any(|candidate| candidate.path == path) {
-        candidates.push(BrowserCandidate { channel, path });
+        candidates.push(BrowserCandidate {
+            channel,
+            path,
+            version: None,
+        });
     }
 }
 
@@ -477,6 +557,7 @@ mod tests {
             channel: BrowserChannel::Chromium,
             path: PathBuf::from("chromium"),
             version: Some("Chromium 108.0".into()),
+            preferred: false,
         };
         assert!(!browser_supports_headless_new(&browser));
     }
@@ -487,29 +568,73 @@ mod tests {
             channel: BrowserChannel::Chrome,
             path: PathBuf::from("chrome"),
             version: None,
+            preferred: false,
         };
         assert!(browser_supports_headless_new(&browser));
     }
 
+    fn fake_executable(root: &Path, build: &str, relative: &str) -> PathBuf {
+        let executable = root.join(build).join(relative);
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"fake browser").unwrap();
+        executable
+    }
+
     #[test]
-    fn xvfb_makes_headed_ladder_available() {
-        let config = discover(
-            HostProbe {
-                display: None,
-                xvfb_path: Some(PathBuf::from("/usr/bin/Xvfb")),
-                vglrun_path: None,
-                dri_present: true,
-                nvidia_present: false,
-                platform_gpu: false,
-                browser: Some(DetectedBrowser {
-                    channel: BrowserChannel::Chrome,
-                    path: PathBuf::from("chrome"),
-                    version: Some("Google Chrome 126".into()),
-                }),
-            },
-            "test".into(),
+    fn resolves_cloakbrowser_executable_for_each_platform() {
+        for (platform, relative) in [
+            ("macos", "Chromium.app/Contents/MacOS/Chromium"),
+            ("linux", "chrome"),
+            ("windows", "chrome.exe"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let expected = fake_executable(temp.path(), "chromium-145.0.7632.109.2", relative);
+            let candidates = cloakbrowser_candidates(temp.path(), platform);
+            assert_eq!(candidates.len(), 1, "platform {platform}");
+            assert_eq!(candidates[0].path, expected, "platform {platform}");
+            assert_eq!(candidates[0].version.as_deref(), Some("145.0.7632.109.2"));
+            assert_eq!(candidates[0].channel, BrowserChannel::Cloakbrowser);
+        }
+    }
+
+    #[test]
+    fn browser_channel_priority_is_locked() {
+        assert!(
+            browser_priority(BrowserChannel::Cloakbrowser)
+                < browser_priority(BrowserChannel::Chrome)
         );
-        assert!(config.launch_capabilities.headed);
-        assert_eq!(config.launch_capabilities.display.as_deref(), Some(":99"));
+        assert!(
+            browser_priority(BrowserChannel::Chrome) < browser_priority(BrowserChannel::Chromium)
+        );
+        assert!(
+            browser_priority(BrowserChannel::Chromium) < browser_priority(BrowserChannel::Edge)
+        );
+        assert!(browser_priority(BrowserChannel::Edge) < browser_priority(BrowserChannel::Brave));
+    }
+
+    #[test]
+    fn highest_cloakbrowser_version_wins_over_plain_and_system_chrome() {
+        let temp = tempfile::tempdir().unwrap();
+        let expected = fake_executable(temp.path(), "chromium-145.0.7632.109.2", "chrome");
+        fake_executable(temp.path(), "chromium-144.9", "chrome");
+        fake_executable(temp.path(), "chromium", "chrome");
+        let system = temp.path().join("system-chrome");
+        fs::write(&system, b"system browser").unwrap();
+
+        let mut candidates = cloakbrowser_candidates(temp.path(), "linux");
+        candidates.push(BrowserCandidate {
+            channel: BrowserChannel::Chrome,
+            path: system,
+            version: Some("Google Chrome 150".into()),
+        });
+        let selected = detect_browser_from_candidates(candidates).unwrap();
+        assert_eq!(selected.channel, BrowserChannel::Cloakbrowser);
+        assert!(selected.preferred);
+        assert_eq!(selected.path, expected);
+        assert_eq!(selected.version.as_deref(), Some("145.0.7632.109.2"));
+        assert!(browser_supports_headless_new(&selected));
+        let wire = serde_json::to_value(&selected).unwrap();
+        assert_eq!(wire["executablePath"], selected.path.display().to_string());
+        assert_eq!(wire["preferred"], true);
     }
 }
