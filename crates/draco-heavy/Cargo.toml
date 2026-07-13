@@ -9,14 +9,28 @@ description = "Real-browser fallback daemon for Draco."
 name = "draco-heavy"
 path = "src/main.rs"
 
+[features]
+default = []
+# Linux-box daemon plumbing. The portable in-process local fallback deliberately
+# excludes netns/tun2socks/relay concerns and builds without axum.
+pipe = [
+    "dep:axum",
+    "dep:url",
+    "tokio/io-util",
+    "tokio/net",
+    "tokio/signal",
+    "tokio/sync",
+]
+
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", optional = true }
 clap = { workspace = true, features = ["env"] }
 draco-static = { workspace = true }
 draco-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["net", "signal"] }
+tokio = { workspace = true, features = ["process", "time"] }
+url = { version = "2", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
