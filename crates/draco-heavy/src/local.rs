@@ -151,7 +151,7 @@ fn failed_attempt(mode: LaunchMode, error: BrowserError) -> AttemptFailure {
     }
 }
 
-fn looks_like_wall(html: &str) -> bool {
+pub(crate) fn looks_like_wall(html: &str) -> bool {
     let lower = html.to_ascii_lowercase();
     [
         "cf-chl-",
