@@ -8,19 +8,28 @@ use draco_types::{ExtractionResult, SourceTier, Status, StepOutcome, Timing, Tra
 /// synchronous reuse of Draco's static content engine.
 pub fn extract_rendered_html(url: &str, html: &str) -> ExtractionResult {
     let started = Instant::now();
-    let scraped = draco_static::content::scrape(html, url, 200, "text/html; charset=utf-8", true);
+    let scraped = draco_static::content::scrape(
+        html,
+        url,
+        200,
+        "text/html; charset=utf-8",
+        true,
+    );
     let parse_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
     ExtractionResult {
         url: url.to_owned(),
         status: Status::Success,
-        source_tier: Some(SourceTier::RuntimeInterception),
+        // The frozen enum has no browser tier. Avoid mislabeling the result as
+        // Tier 2 runtime interception; the static Double Tap is recorded below.
+        source_tier: None,
         data: None,
         extract: None,
         markdown: Some(scraped.markdown),
         metadata: Some(scraped.metadata),
         html: Some(html.to_owned()),
-        raw_html: Some(html.to_owned()),
+        // Browser DOM is rendered output, not the unmodified network response.
+        raw_html: None,
         links: None,
         endpoints: None,
         timing: Timing {
@@ -30,7 +39,7 @@ pub fn extract_rendered_html(url: &str, html: &str) -> ExtractionResult {
             total_ms: parse_ms,
         },
         trace: vec![TraceStep {
-            tier: SourceTier::RuntimeInterception,
+            tier: SourceTier::Static,
             action: "browser.double_tap".into(),
             outcome: StepOutcome::Matched,
             elapsed_ms: parse_ms,
@@ -53,11 +62,7 @@ mod tests {
         assert_eq!(result.status, Status::Success);
         assert!(result.markdown.as_deref().unwrap().contains("Hello"));
         assert!(result.html.as_deref().unwrap().contains("<main>"));
-    }
-}
-_eq!(result.html.as_deref().unwrap().contains("<main>"), true);
-    }
-}
-sult.html.as_deref().unwrap().contains("<main>"), true);
+        assert!(result.source_tier.is_none());
+        assert!(result.raw_html.is_none());
     }
 }
