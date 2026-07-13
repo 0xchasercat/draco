@@ -97,10 +97,10 @@ pub fn default_cache_path() -> PathBuf {
 }
 
 pub fn resolve(cache_path: &Path, ttl: Duration, refresh: bool) -> ResolvedHostConfig {
-    let probe = probe_host();
-    let fingerprint = host_fingerprint(&probe);
+    // TTL is the invalidation policy for the fast path. A valid entry avoids
+    // every host probe, including nvidia-smi and browser process execution.
     if !refresh {
-        if let Some(config) = read_valid_cache(cache_path, ttl, &fingerprint) {
+        if let Some(config) = read_valid_cache(cache_path, ttl) {
             return ResolvedHostConfig {
                 config,
                 cache_hit: true,
@@ -110,6 +110,8 @@ pub fn resolve(cache_path: &Path, ttl: Duration, refresh: bool) -> ResolvedHostC
         }
     }
 
+    let probe = probe_host();
+    let fingerprint = host_fingerprint(&probe);
     let config = discover(probe, fingerprint);
     let cache_error = write_cache(cache_path, &config)
         .err()
@@ -352,10 +354,10 @@ fn gpu_chrome_args() -> Vec<String> {
     .collect()
 }
 
-fn read_valid_cache(path: &Path, ttl: Duration, fingerprint: &str) -> Option<HostConfig> {
+fn read_valid_cache(path: &Path, ttl: Duration) -> Option<HostConfig> {
     let bytes = fs::read(path).ok()?;
     let config: HostConfig = serde_json::from_slice(&bytes).ok()?;
-    if config.schema_version != CACHE_SCHEMA || config.fingerprint != fingerprint {
+    if config.schema_version != CACHE_SCHEMA {
         return None;
     }
     let age = unix_now().saturating_sub(config.discovered_at_unix);
