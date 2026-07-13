@@ -8,13 +8,7 @@ use draco_types::{ExtractionResult, SourceTier, Status, StepOutcome, Timing, Tra
 /// synchronous reuse of Draco's static content engine.
 pub fn extract_rendered_html(url: &str, html: &str) -> ExtractionResult {
     let started = Instant::now();
-    let scraped = draco_static::content::scrape(
-        html,
-        url,
-        200,
-        "text/html; charset=utf-8",
-        true,
-    );
+    let scraped = draco_static::content::scrape(html, url, 200, "text/html; charset=utf-8", true);
     let parse_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
     ExtractionResult {

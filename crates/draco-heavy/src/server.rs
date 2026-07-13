@@ -153,13 +153,21 @@ mod tests {
     #[tokio::test]
     async fn health_reports_render_and_slot_state() {
         let response = router(test_state(2))
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await;
         assert_eq!(body["slots"], json!({"total": 2, "busy": 0, "free": 2}));
-        assert!(matches!(body["renderMode"].as_str(), Some("gpu" | "swiftshader")));
+        assert!(matches!(
+            body["renderMode"].as_str(),
+            Some("gpu" | "swiftshader")
+        ));
         assert!(body["hostConfigCached"].as_bool().unwrap());
     }
 
@@ -172,18 +180,20 @@ mod tests {
                     .uri("/mint")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        json!({"url":"https://example.com","proxy":"socks5h://proxy"})
-                            .to_string(),
+                        json!({"url":"https://example.com","proxy":"socks5h://proxy"}).to_string(),
                     ))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(json_body(response).await, json!({
-            "success": false,
-            "error": "browser tier not yet implemented"
-        }));
+        assert_eq!(
+            json_body(response).await,
+            json!({
+                "success": false,
+                "error": "browser tier not yet implemented"
+            })
+        );
     }
 
     #[tokio::test]
@@ -197,8 +207,7 @@ mod tests {
                     .uri("/mint")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        json!({"url":"https://example.com","proxy":"socks5h://proxy"})
-                            .to_string(),
+                        json!({"url":"https://example.com","proxy":"socks5h://proxy"}).to_string(),
                     ))
                     .unwrap(),
             )

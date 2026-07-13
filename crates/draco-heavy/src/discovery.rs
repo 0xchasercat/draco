@@ -73,7 +73,9 @@ pub fn resolve(cache_path: &Path, ttl: Duration, refresh: bool) -> ResolvedHostC
     }
 
     let config = discover(fingerprint);
-    let cache_error = write_cache(cache_path, &config).err().map(|error| error.to_string());
+    let cache_error = write_cache(cache_path, &config)
+        .err()
+        .map(|error| error.to_string());
     ResolvedHostConfig {
         config,
         cache_hit: false,
