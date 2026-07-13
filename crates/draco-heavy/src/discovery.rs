@@ -1,5 +1,5 @@
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-const CACHE_SCHEMA: u32 = 1;
+const CACHE_SCHEMA: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -25,6 +25,31 @@ pub enum RenderTier {
     Swiftshader,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserChannel {
+    Chrome,
+    Chromium,
+    Edge,
+    Brave,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectedBrowser {
+    pub channel: BrowserChannel,
+    pub path: PathBuf,
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchCapabilities {
+    pub headless_new: bool,
+    pub headed: bool,
+    pub display: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct HostConfig {
@@ -39,6 +64,8 @@ pub struct HostConfig {
     pub gpu_present: bool,
     pub xvfb_path: Option<PathBuf>,
     pub vglrun_path: Option<PathBuf>,
+    pub browser: Option<DetectedBrowser>,
+    pub launch_capabilities: LaunchCapabilities,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +74,16 @@ pub struct ResolvedHostConfig {
     pub cache_hit: bool,
     pub cache_present: bool,
     pub cache_error: Option<String>,
+}
+
+struct HostProbe {
+    display: Option<String>,
+    xvfb_path: Option<PathBuf>,
+    vglrun_path: Option<PathBuf>,
+    dri_present: bool,
+    nvidia_present: bool,
+    platform_gpu: bool,
+    browser: Option<DetectedBrowser>,
 }
 
 pub fn default_cache_path() -> PathBuf {
@@ -60,9 +97,10 @@ pub fn default_cache_path() -> PathBuf {
 }
 
 pub fn resolve(cache_path: &Path, ttl: Duration, refresh: bool) -> ResolvedHostConfig {
-    let fingerprint = host_fingerprint();
+    // TTL is the invalidation policy for the fast path. A valid entry avoids
+    // every host probe, including nvidia-smi and browser process execution.
     if !refresh {
-        if let Some(config) = read_valid_cache(cache_path, ttl, &fingerprint) {
+        if let Some(config) = read_valid_cache(cache_path, ttl) {
             return ResolvedHostConfig {
                 config,
                 cache_hit: true,
@@ -72,7 +110,9 @@ pub fn resolve(cache_path: &Path, ttl: Duration, refresh: bool) -> ResolvedHostC
         }
     }
 
-    let config = discover(fingerprint);
+    let probe = probe_host();
+    let fingerprint = host_fingerprint(&probe);
+    let config = discover(probe, fingerprint);
     let cache_error = write_cache(cache_path, &config)
         .err()
         .map(|error| error.to_string());
@@ -84,34 +124,42 @@ pub fn resolve(cache_path: &Path, ttl: Duration, refresh: bool) -> ResolvedHostC
     }
 }
 
-pub fn discover(fingerprint: String) -> HostConfig {
-    let display = env::var("DISPLAY")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            env::var("WAYLAND_DISPLAY")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        });
-    let xvfb_path = find_executable("Xvfb");
-    let vglrun_path = find_executable("vglrun");
-    let dri_present = Path::new("/dev/dri").exists();
-    let nvidia_present = command_succeeds("nvidia-smi", &["-L"]);
-    let platform_gpu = matches!(env::consts::OS, "macos" | "windows");
-    let gpu_present = (dri_present || nvidia_present || platform_gpu)
+fn probe_host() -> HostProbe {
+    HostProbe {
+        display: native_display(),
+        xvfb_path: find_executable("Xvfb"),
+        vglrun_path: find_executable("vglrun"),
+        dri_present: Path::new("/dev/dri").exists(),
+        nvidia_present: command_succeeds("nvidia-smi", &["-L"]),
+        platform_gpu: matches!(env::consts::OS, "macos" | "windows"),
+        browser: detect_browser(),
+    }
+}
+
+fn discover(probe: HostProbe, fingerprint: String) -> HostConfig {
+    let gpu_present = (probe.dri_present || probe.nvidia_present || probe.platform_gpu)
         && env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none();
+    let launch_capabilities = LaunchCapabilities {
+        headless_new: probe
+            .browser
+            .as_ref()
+            .is_some_and(browser_supports_headless_new),
+        headed: probe.display.is_some() || probe.platform_gpu,
+        display: probe.display.clone(),
+    };
 
     let (render_mode, render_tier, resolved_display, command_prefix, chrome_args) =
-        if gpu_present && (display.is_some() || platform_gpu) {
+        if gpu_present && (probe.display.is_some() || probe.platform_gpu) {
             (
                 RenderMode::Gpu,
                 RenderTier::NativeDisplayGpu,
-                display,
+                probe.display.clone(),
                 Vec::new(),
                 gpu_chrome_args(),
             )
-        } else if gpu_present && xvfb_path.is_some() {
-            let command_prefix = vglrun_path
+        } else if gpu_present && probe.xvfb_path.is_some() {
+            let command_prefix = probe
+                .vglrun_path
                 .as_ref()
                 .map(|path| vec![path.display().to_string(), "-d".into(), "egl0".into()])
                 .unwrap_or_default();
@@ -126,7 +174,7 @@ pub fn discover(fingerprint: String) -> HostConfig {
             (
                 RenderMode::Swiftshader,
                 RenderTier::Swiftshader,
-                xvfb_path.as_ref().map(|_| ":99".into()),
+                probe.xvfb_path.as_ref().map(|_| ":99".into()),
                 Vec::new(),
                 vec!["--use-angle=swiftshader".into()],
             )
@@ -142,9 +190,156 @@ pub fn discover(fingerprint: String) -> HostConfig {
         command_prefix,
         chrome_args,
         gpu_present,
-        xvfb_path,
-        vglrun_path,
+        xvfb_path: probe.xvfb_path,
+        vglrun_path: probe.vglrun_path,
+        browser: probe.browser,
+        launch_capabilities,
     }
+}
+
+fn native_display() -> Option<String> {
+    env::var("DISPLAY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            env::var("WAYLAND_DISPLAY")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+fn detect_browser() -> Option<DetectedBrowser> {
+    browser_candidates().into_iter().find_map(|candidate| {
+        candidate.path.is_file().then(|| DetectedBrowser {
+            channel: candidate.channel,
+            version: browser_version(&candidate.path),
+            path: candidate.path,
+        })
+    })
+}
+
+struct BrowserCandidate {
+    channel: BrowserChannel,
+    path: PathBuf,
+}
+
+fn browser_candidates() -> Vec<BrowserCandidate> {
+    let mut candidates = Vec::new();
+    let names: &[(BrowserChannel, &str)] = match env::consts::OS {
+        "windows" => &[
+            (BrowserChannel::Chrome, "chrome.exe"),
+            (BrowserChannel::Chromium, "chromium.exe"),
+            (BrowserChannel::Edge, "msedge.exe"),
+            (BrowserChannel::Brave, "brave.exe"),
+        ],
+        "macos" => &[
+            (BrowserChannel::Chrome, "Google Chrome"),
+            (BrowserChannel::Chromium, "Chromium"),
+            (BrowserChannel::Edge, "Microsoft Edge"),
+            (BrowserChannel::Brave, "Brave Browser"),
+        ],
+        _ => &[
+            (BrowserChannel::Chrome, "google-chrome-stable"),
+            (BrowserChannel::Chrome, "google-chrome"),
+            (BrowserChannel::Chromium, "chromium"),
+            (BrowserChannel::Chromium, "chromium-browser"),
+            (BrowserChannel::Edge, "microsoft-edge-stable"),
+            (BrowserChannel::Edge, "microsoft-edge"),
+            (BrowserChannel::Brave, "brave-browser"),
+        ],
+    };
+
+    for &(channel, name) in names {
+        if let Some(path) = find_executable(name) {
+            push_candidate(&mut candidates, channel, path);
+        }
+    }
+
+    match env::consts::OS {
+        "macos" => {
+            for (channel, path) in [
+                (
+                    BrowserChannel::Chrome,
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                ),
+                (
+                    BrowserChannel::Chromium,
+                    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+                ),
+                (
+                    BrowserChannel::Edge,
+                    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                ),
+                (
+                    BrowserChannel::Brave,
+                    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+                ),
+            ] {
+                push_candidate(&mut candidates, channel, PathBuf::from(path));
+            }
+        }
+        "windows" => add_windows_candidates(&mut candidates),
+        _ => {}
+    }
+
+    candidates
+}
+
+fn add_windows_candidates(candidates: &mut Vec<BrowserCandidate>) {
+    for root in ["PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"] {
+        let Some(root) = env::var_os(root) else {
+            continue;
+        };
+        let root = PathBuf::from(root);
+        for (channel, suffix) in [
+            (
+                BrowserChannel::Chrome,
+                "Google/Chrome/Application/chrome.exe",
+            ),
+            (BrowserChannel::Chromium, "Chromium/Application/chrome.exe"),
+            (
+                BrowserChannel::Edge,
+                "Microsoft/Edge/Application/msedge.exe",
+            ),
+            (
+                BrowserChannel::Brave,
+                "BraveSoftware/Brave-Browser/Application/brave.exe",
+            ),
+        ] {
+            push_candidate(candidates, channel, root.join(suffix));
+        }
+    }
+}
+
+fn push_candidate(candidates: &mut Vec<BrowserCandidate>, channel: BrowserChannel, path: PathBuf) {
+    if !candidates.iter().any(|candidate| candidate.path == path) {
+        candidates.push(BrowserCandidate { channel, path });
+    }
+}
+
+fn browser_version(path: &Path) -> Option<String> {
+    let output = Command::new(path).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn browser_supports_headless_new(browser: &DetectedBrowser) -> bool {
+    browser
+        .version
+        .as_deref()
+        .and_then(first_version_number)
+        .is_none_or(|major| major >= 109)
+}
+
+fn first_version_number(value: &str) -> Option<u32> {
+    value
+        .split(|character: char| !character.is_ascii_digit())
+        .find(|part| !part.is_empty())?
+        .parse()
+        .ok()
 }
 
 fn gpu_chrome_args() -> Vec<String> {
@@ -159,10 +354,10 @@ fn gpu_chrome_args() -> Vec<String> {
     .collect()
 }
 
-fn read_valid_cache(path: &Path, ttl: Duration, fingerprint: &str) -> Option<HostConfig> {
+fn read_valid_cache(path: &Path, ttl: Duration) -> Option<HostConfig> {
     let bytes = fs::read(path).ok()?;
     let config: HostConfig = serde_json::from_slice(&bytes).ok()?;
-    if config.schema_version != CACHE_SCHEMA || config.fingerprint != fingerprint {
+    if config.schema_version != CACHE_SCHEMA {
         return None;
     }
     let age = unix_now().saturating_sub(config.discovered_at_unix);
@@ -177,8 +372,6 @@ fn write_cache(path: &Path, config: &HostConfig) -> io::Result<()> {
     let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
     fs::write(&temp, bytes)?;
     if let Err(first_error) = fs::rename(&temp, path) {
-        // Windows does not replace an existing destination with rename. Retry
-        // after removing the stale cache; Unix normally succeeds above.
         if path.exists() {
             fs::remove_file(path)?;
             fs::rename(&temp, path)?;
@@ -190,30 +383,38 @@ fn write_cache(path: &Path, config: &HostConfig) -> io::Result<()> {
     Ok(())
 }
 
-fn host_fingerprint() -> String {
-    let display = env::var("DISPLAY")
-        .or_else(|_| env::var("WAYLAND_DISPLAY"))
-        .unwrap_or_default();
-    let dri = Path::new("/dev/dri").exists();
-    let nvidia = find_executable("nvidia-smi");
-    let xvfb = find_executable("Xvfb");
-    let vglrun = find_executable("vglrun");
+fn host_fingerprint(probe: &HostProbe) -> String {
+    let browser = probe
+        .browser
+        .as_ref()
+        .map(|browser| {
+            format!(
+                "{:?}:{}:{}",
+                browser.channel,
+                browser.path.display(),
+                browser.version.as_deref().unwrap_or("-")
+            )
+        })
+        .unwrap_or_else(|| "-".into());
     format!(
-        "v{CACHE_SCHEMA}|{}|{}|display={display}|dri={dri}|nvidia={}|xvfb={}|vglrun={}",
+        "v{CACHE_SCHEMA}|{}|{}|display={}|dri={}|nvidia={}|xvfb={}|vglrun={}|browser={browser}",
         env::consts::OS,
         env::consts::ARCH,
-        path_marker(nvidia),
-        path_marker(xvfb),
-        path_marker(vglrun),
+        probe.display.as_deref().unwrap_or("-"),
+        probe.dri_present,
+        probe.nvidia_present,
+        path_marker(probe.xvfb_path.as_ref()),
+        path_marker(probe.vglrun_path.as_ref()),
     )
 }
 
-fn path_marker(path: Option<PathBuf>) -> String {
+fn path_marker(path: Option<&PathBuf>) -> String {
     path.map(|value| value.display().to_string())
         .unwrap_or_else(|| "-".into())
 }
 
-fn find_executable(name: &str) -> Option<PathBuf> {
+fn find_executable(name: impl AsRef<OsStr>) -> Option<PathBuf> {
+    let name = name.as_ref();
     let path: OsString = env::var_os("PATH")?;
     env::split_paths(&path)
         .map(|dir| dir.join(name))
@@ -258,5 +459,32 @@ mod tests {
         let second = resolve(&path, Duration::ZERO, false);
         assert!(!second.cache_hit);
         assert!(second.config.discovered_at_unix > first.config.discovered_at_unix);
+    }
+
+    #[test]
+    fn parses_browser_major_version() {
+        assert_eq!(first_version_number("Google Chrome 126.0.1"), Some(126));
+        assert_eq!(first_version_number("Chromium 109"), Some(109));
+        assert_eq!(first_version_number("unknown"), None);
+    }
+
+    #[test]
+    fn old_browser_does_not_claim_new_headless() {
+        let browser = DetectedBrowser {
+            channel: BrowserChannel::Chromium,
+            path: PathBuf::from("chromium"),
+            version: Some("Chromium 108.0".into()),
+        };
+        assert!(!browser_supports_headless_new(&browser));
+    }
+
+    #[test]
+    fn unknown_version_optimistically_tries_new_headless() {
+        let browser = DetectedBrowser {
+            channel: BrowserChannel::Chrome,
+            path: PathBuf::from("chrome"),
+            version: None,
+        };
+        assert!(browser_supports_headless_new(&browser));
     }
 }

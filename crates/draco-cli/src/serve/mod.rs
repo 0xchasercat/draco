@@ -347,6 +347,7 @@ async fn scrape(
         }
     };
     let result = extract_with_pool(&req.url, &config, &state.tier2_pool).await;
+    let result = crate::heavy_local::maybe_escalate(&req.url, &config, result).await;
     let (code, body) = to_firecrawl(&result);
     (code, Json(body))
 }

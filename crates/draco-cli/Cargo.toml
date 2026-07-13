@@ -14,8 +14,12 @@ path = "src/main.rs"
 # (deno_core/V8). With `--no-default-features` the CLI builds V8-free: the
 # Tier 2 branch compiles out, and Tier 2 finalizes
 # `Unsupported`. Both configurations MUST build (canonical §4).
-default = ["tier2", "serve"]
+default = ["tier2", "serve", "heavy-local"]
 tier2 = ["draco-core/tier2"]
+# Portable, in-process local browser escalation. Production edge builds use
+# `--no-default-features`, so the optional heavy crate is absent entirely and
+# `needs_browser` remains the terminal core result.
+heavy-local = ["dep:draco-heavy"]
 # DEFAULT ON. `draco serve` — the persistent daemon with the Firecrawl-compatible
 # REST API (axum). Independent of `tier2`: a lean serve build (`--no-default-features
 # --features serve`) exposes the same API with the ladder capped at the static
@@ -45,6 +49,7 @@ serve = [
 # without `tier2` ⇒ no draco-runtime ⇒ V8-free.
 [dependencies]
 draco-core = { path = "../draco-core", default-features = false }
+draco-heavy = { path = "../draco-heavy", optional = true, default-features = false }
 draco-types = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
