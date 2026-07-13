@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
@@ -86,11 +87,31 @@ pub trait BrowserSession: Send {
 #[derive(Debug, Clone)]
 pub struct CommandBrowserDriver {
     timeout: Duration,
+    wrapper: Option<(PathBuf, Vec<String>)>,
+    extra_args: Vec<String>,
 }
 
 impl CommandBrowserDriver {
     pub fn new(timeout: Duration) -> Self {
-        Self { timeout }
+        Self {
+            timeout,
+            wrapper: None,
+            extra_args: Vec::new(),
+        }
+    }
+
+    pub fn with_wrapper(
+        mut self,
+        program: impl Into<PathBuf>,
+        args: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.wrapper = Some((program.into(), args.into_iter().collect()));
+        self
+    }
+
+    pub fn with_extra_args(mut self, args: impl IntoIterator<Item = String>) -> Self {
+        self.extra_args.extend(args);
+        self
     }
 }
 
@@ -110,6 +131,8 @@ impl BrowserDriver for CommandBrowserDriver {
             browser: browser.clone(),
             mode,
             timeout: self.timeout,
+            wrapper: self.wrapper.clone(),
+            extra_args: self.extra_args.clone(),
         }))
     }
 }
@@ -118,6 +141,8 @@ struct CommandBrowserSession {
     browser: DetectedBrowser,
     mode: LaunchMode,
     timeout: Duration,
+    wrapper: Option<(PathBuf, Vec<String>)>,
+    extra_args: Vec<String>,
 }
 
 impl BrowserSession for CommandBrowserSession {
@@ -133,7 +158,14 @@ impl BrowserSession for CommandBrowserSession {
                 ));
             }
 
-            let mut command = Command::new(&self.browser.path);
+            let mut command = match &self.wrapper {
+                Some((program, args)) => {
+                    let mut command = Command::new(program);
+                    command.args(args).arg(&self.browser.path);
+                    command
+                }
+                None => Command::new(&self.browser.path),
+            };
             command
                 .arg("--headless=new")
                 .arg("--dump-dom")
@@ -143,6 +175,7 @@ impl BrowserSession for CommandBrowserSession {
                 .arg("--disable-component-update")
                 .arg("--disable-sync")
                 .arg("--hide-scrollbars")
+                .args(&self.extra_args)
                 .arg(virtual_time_budget(wait_strategy))
                 .arg(url)
                 .stdin(Stdio::null())
