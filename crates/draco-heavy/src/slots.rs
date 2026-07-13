@@ -1,15 +1,15 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::stubs::{BrowserWorker, NetworkNamespace, SocksRelay};
+use crate::pipe::leak::LeakGate;
+use crate::pipe::upstream::UpstreamMap;
+use crate::pipe::{PipeConfig, PipeSlot};
 
 #[derive(Debug)]
 pub struct Slot {
     pub id: usize,
     busy: AtomicBool,
-    pub netns: NetworkNamespace,
-    pub relay: SocksRelay,
-    pub worker: BrowserWorker,
+    pub pipe: Option<Arc<PipeSlot>>,
 }
 
 #[derive(Debug)]
@@ -22,6 +22,7 @@ pub struct SlotCounts {
     pub total: usize,
     pub busy: usize,
     pub free: usize,
+    pub quarantined: usize,
 }
 
 pub struct SlotLease {
@@ -30,6 +31,26 @@ pub struct SlotLease {
 }
 
 impl SlotRegistry {
+    /// Provision a production pool. All slots share the source-keyed upstream
+    /// map and leak gate, while each owns a stable relay port and namespace.
+    pub async fn provision(count: usize, config: &PipeConfig) -> Result<Arc<Self>, String> {
+        let count = count.max(1);
+        let upstreams = UpstreamMap::default();
+        let gate = LeakGate::default();
+        let mut slots = Vec::with_capacity(count);
+        for id in 0..count {
+            let pipe = PipeSlot::provision(id, config, upstreams.clone(), gate.clone()).await?;
+            slots.push(Slot {
+                id,
+                busy: AtomicBool::new(false),
+                pipe: Some(pipe),
+            });
+        }
+        Ok(Arc::new(Self { slots }))
+    }
+
+    /// Unprovisioned registry for protocol/router unit tests. Production daemon
+    /// startup uses [`Self::provision`] and refuses to serve partial pools.
     pub fn new(count: usize) -> Arc<Self> {
         let count = count.max(1);
         Arc::new(Self {
@@ -37,20 +58,22 @@ impl SlotRegistry {
                 .map(|id| Slot {
                     id,
                     busy: AtomicBool::new(false),
-                    netns: NetworkNamespace { slot_id: id },
-                    relay: SocksRelay { slot_id: id },
-                    worker: BrowserWorker {
-                        slot_id: id,
-                        profile_dir: std::path::PathBuf::from(format!("profiles/slot-{id}")),
-                    },
+                    pipe: None,
                 })
                 .collect(),
         })
     }
 
-    /// Acquire immediately or return `None`; requests never queue behind a full pool.
     pub fn try_acquire(self: &Arc<Self>) -> Option<SlotLease> {
         self.slots.iter().enumerate().find_map(|(index, slot)| {
+            if slot.pipe.as_ref().is_some_and(|pipe| {
+                matches!(
+                    pipe.state(),
+                    crate::pipe::leak::SlotServiceState::Quarantined(_)
+                )
+            }) {
+                return None;
+            }
             slot.busy
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .ok()
@@ -67,10 +90,36 @@ impl SlotRegistry {
             .iter()
             .filter(|slot| slot.busy.load(Ordering::Acquire))
             .count();
+        let quarantined = self
+            .slots
+            .iter()
+            .filter(|slot| {
+                slot.pipe.as_ref().is_some_and(|pipe| {
+                    matches!(
+                        pipe.state(),
+                        crate::pipe::leak::SlotServiceState::Quarantined(_)
+                    )
+                })
+            })
+            .count();
+        let free = self
+            .slots
+            .iter()
+            .filter(|slot| {
+                !slot.busy.load(Ordering::Acquire)
+                    && !slot.pipe.as_ref().is_some_and(|pipe| {
+                        matches!(
+                            pipe.state(),
+                            crate::pipe::leak::SlotServiceState::Quarantined(_)
+                        )
+                    })
+            })
+            .count();
         SlotCounts {
             total: self.slots.len(),
             busy,
-            free: self.slots.len() - busy,
+            free,
+            quarantined,
         }
     }
 }
@@ -83,9 +132,11 @@ impl SlotLease {
 
 impl Drop for SlotLease {
     fn drop(&mut self) {
-        self.registry.slots[self.index]
-            .busy
-            .store(false, Ordering::Release);
+        let slot = &self.registry.slots[self.index];
+        if let Some(pipe) = &slot.pipe {
+            pipe.release();
+        }
+        slot.busy.store(false, Ordering::Release);
     }
 }
 

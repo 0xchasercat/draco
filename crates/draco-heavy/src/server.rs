@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -5,16 +6,21 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
+use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::discovery::{RenderMode, ResolvedHostConfig};
+use crate::local::{mint_local_with, LocalMintConfig};
+use crate::pipe::browser::NamespaceBrowserDriver;
+use crate::pipe::PipeConfig;
 use crate::slots::SlotRegistry;
-use crate::wire::{ErrorResponse, MintRequest};
+use crate::wire::{ErrorResponse, MintRequest, MintSuccess};
 
 #[derive(Debug)]
 pub struct AppState {
     host: ResolvedHostConfig,
     slots: Arc<SlotRegistry>,
+    pipe: Arc<PipeConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -33,17 +39,17 @@ struct HealthSlots {
     total: usize,
     busy: usize,
     free: usize,
+    quarantined: usize,
 }
 
 pub async fn serve(config: Config, host: ResolvedHostConfig) -> Result<(), String> {
+    let pipe = Arc::new(config.pipe_config()?);
+    let slots = SlotRegistry::provision(config.slots, &pipe).await?;
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .map_err(|error| format!("bind {}: {error}", config.bind))?;
     let local = listener.local_addr().unwrap_or(config.bind);
-    let app = router(Arc::new(AppState {
-        host,
-        slots: SlotRegistry::new(config.slots),
-    }));
+    let app = router(Arc::new(AppState { host, slots, pipe }));
     eprintln!("draco-heavy: listening on http://{local}");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -68,6 +74,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
             total: counts.total,
             busy: counts.busy,
             free: counts.free,
+            quarantined: counts.quarantined,
         },
         host_config_cached: state.host.cache_present,
         discovery_cache_hit: state.host.cache_hit,
@@ -77,33 +84,97 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
 async fn mint(
     State(state): State<Arc<AppState>>,
     Json(request): Json<MintRequest>,
-) -> (StatusCode, Json<ErrorResponse>) {
+) -> (StatusCode, Json<Value>) {
     let lease = match state.slots.try_acquire() {
         Some(lease) => lease,
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse::new("browser tier saturated")),
+                Json(error_value("browser tier saturated")),
+            )
+        }
+    };
+    let Some(pipe) = lease.slot().pipe.as_ref() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(error_value("pipe slot is not provisioned")),
+        );
+    };
+    let expected_exit_ip = match expected_exit_ip(&request) {
+        Ok(ip) => ip,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(error_value(&error))),
+    };
+    let decision = match pipe
+        .assign_box(&request.proxy, expected_exit_ip, &state.pipe)
+        .await
+    {
+        Ok(decision) => decision,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(error_value(&format!("pipe leak probe failed: {error}"))),
             )
         }
     };
 
-    // Exercise the real lifecycle now: a slot is reserved until this handler
-    // returns, and Drop makes it available again. Later slices replace only the
-    // body below with relay swap, leak probe, worker mint, and Double Tap.
-    let _slot_id = lease.slot().id;
-    let _render_mode = state.host.config.render_mode;
-    let _future_job = (
-        request.url,
-        request.proxy,
-        request.render_opts,
-        request.wait_strategy,
-    );
-
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(ErrorResponse::new("browser tier not yet implemented")),
+    let driver = NamespaceBrowserDriver {
+        namespace: pipe.namespace_name().unwrap_or_default().to_string(),
+        quic_enabled: decision.quic_enabled,
+    };
+    let result = match mint_local_with(
+        &driver,
+        &state.host.config,
+        &LocalMintConfig::default(),
+        &request.url,
     )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(error_value(&format!("browser worker seam: {error}"))),
+            )
+        }
+    };
+
+    let response = MintSuccess {
+        success: true,
+        final_url: result.url,
+        cookies: std::collections::HashMap::new(),
+        html: result.html.unwrap_or_default(),
+        markdown: result.markdown.unwrap_or_default(),
+        render_mode: state.host.config.render_mode,
+        ms: result.timing.total_ms,
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(response).unwrap_or_else(|_| {
+            json!({
+                "success": false,
+                "error": "serialize mint response"
+            })
+        })),
+    )
+}
+
+fn expected_exit_ip(request: &MintRequest) -> Result<Option<IpAddr>, String> {
+    request
+        .render_opts
+        .as_ref()
+        .and_then(|options| options.get("expectedExitIp"))
+        .and_then(Value::as_str)
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|error| format!("invalid renderOpts.expectedExitIp: {error}"))
+        })
+        .transpose()
+}
+
+fn error_value(error: &str) -> Value {
+    serde_json::to_value(ErrorResponse::new(error))
+        .unwrap_or_else(|_| json!({ "success": false, "error": "serialize error response" }))
 }
 
 async fn shutdown_signal() {
@@ -142,6 +213,7 @@ mod tests {
         Arc::new(AppState {
             host: resolved,
             slots: SlotRegistry::new(slots),
+            pipe: Arc::new(PipeConfig::default()),
         })
     }
 
@@ -163,7 +235,10 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await;
-        assert_eq!(body["slots"], json!({"total": 2, "busy": 0, "free": 2}));
+        assert_eq!(
+            body["slots"],
+            json!({"total": 2, "busy": 0, "free": 2, "quarantined": 0})
+        );
         assert!(matches!(
             body["renderMode"].as_str(),
             Some("gpu" | "swiftshader")
@@ -172,7 +247,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_returns_frozen_stub_failure() {
+    async fn unprovisioned_test_slot_fails_closed() {
         let response = router(test_state(1))
             .oneshot(
                 Request::builder()
@@ -191,7 +266,7 @@ mod tests {
             json_body(response).await,
             json!({
                 "success": false,
-                "error": "browser tier not yet implemented"
+                "error": "pipe slot is not provisioned"
             })
         );
     }
