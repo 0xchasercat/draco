@@ -331,7 +331,7 @@ fn browser_supports_headless_new(browser: &DetectedBrowser) -> bool {
         .version
         .as_deref()
         .and_then(first_version_number)
-        .is_some_and(|major| major >= 109)
+        .is_none_or(|major| major >= 109)
 }
 
 fn first_version_number(value: &str) -> Option<u32> {
@@ -476,5 +476,15 @@ mod tests {
             version: Some("Chromium 108.0".into()),
         };
         assert!(!browser_supports_headless_new(&browser));
+    }
+
+    #[test]
+    fn unknown_version_optimistically_tries_new_headless() {
+        let browser = DetectedBrowser {
+            channel: BrowserChannel::Chrome,
+            path: PathBuf::from("chrome"),
+            version: None,
+        };
+        assert!(browser_supports_headless_new(&browser));
     }
 }
