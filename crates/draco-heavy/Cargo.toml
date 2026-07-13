@@ -1,0 +1,23 @@
+[package]
+name = "draco-heavy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Real-browser fallback daemon for Draco."
+
+[[bin]]
+name = "draco-heavy"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+clap = { workspace = true, features = ["env"] }
+draco-static = { workspace = true }
+draco-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["net", "signal"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
