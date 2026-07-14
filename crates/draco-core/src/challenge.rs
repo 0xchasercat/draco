@@ -306,11 +306,47 @@ mod tests {
     }
 
     #[test]
+    fn cloudflare_mitigated_header_is_status_independent() {
+        assert_eq!(
+            detect_challenge(
+                200,
+                &headers(&[("CF-Mitigated", "CHALLENGE")]),
+                "<html>empty shell</html>",
+            ),
+            Some(ChallengeKind::Cloudflare)
+        );
+    }
+
+    #[test]
+    fn cloudflare_instrumentation_on_200_is_not_flagged() {
+        let body = r#"<main>real content</main>
+            <script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>"#;
+        assert_eq!(
+            detect_challenge(
+                200,
+                &headers(&[("server", "cloudflare"), ("set-cookie", "__cf_bm=ok")]),
+                body,
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn datadome_fixture_is_detected() {
         let body = r#"<script src="https://geo.captcha-delivery.com/captcha/"></script>"#;
         assert_eq!(
             detect_challenge(403, &[], body),
             Some(ChallengeKind::DataDome)
+        );
+    }
+
+    #[test]
+    fn akamai_fixture_is_detected() {
+        let body = r#"<h1>Access Denied</h1><script>bm-verify</script>
+            errors.edgesuite.net reference #18.abc"#;
+        assert_eq!(
+            detect_challenge(403, &[], body),
+            Some(ChallengeKind::Akamai)
         );
     }
 
@@ -348,6 +384,18 @@ mod tests {
             <script src="https://js.datadome.co/tags.js"></script>"#;
         assert_eq!(
             detect_challenge(200, &headers(&[("set-cookie", "datadome=ok")]), body),
+            None
+        );
+    }
+
+    #[test]
+    fn perimeterx_cookie_on_200_is_not_flagged() {
+        assert_eq!(
+            detect_challenge(
+                200,
+                &headers(&[("set-cookie", "_px3=token; path=/")]),
+                "<main>real content</main>",
+            ),
             None
         );
     }
