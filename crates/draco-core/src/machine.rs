@@ -35,7 +35,9 @@ use draco_types::{
     DracoError, ExtractionResult, SourceTier, Status, StepOutcome, Timing, TraceStep,
 };
 
-use crate::challenge::{detect_challenge, detect_network_challenge, hydration_collapse_detail};
+use crate::challenge::detect_challenge;
+#[cfg(feature = "tier2")]
+use crate::challenge::{detect_network_challenge, hydration_collapse_detail};
 use crate::fetcher::{NetFetcher, PageFetcher};
 use crate::tier2::Tier2Capture;
 // `CaptureMode` is only referenced from the tier2-gated capture call sites
