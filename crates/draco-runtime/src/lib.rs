@@ -2356,6 +2356,7 @@ mod tests {
         // and evict the one distinct error that explains a failure.
         let mut cs = CaptureState {
             requests: Vec::new(),
+            seen_intercepts: 0,
             max_intercepts: 8,
             stub_body: "{}".to_string(),
             fetcher: null_fetcher(),
