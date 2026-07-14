@@ -36,6 +36,8 @@ use draco_types::{
 };
 
 use crate::challenge::detect_challenge;
+#[cfg(feature = "tier2")]
+use crate::challenge::{detect_network_challenge, hydration_collapse_detail};
 use crate::fetcher::{NetFetcher, PageFetcher};
 use crate::tier2::Tier2Capture;
 // `CaptureMode` is only referenced from the tier2-gated capture call sites
@@ -524,7 +526,7 @@ where
         // place and records `runtime.render`; leaves them untouched if it can't do
         // better.
         if render {
-            try_render_markdown(
+            if let Some(outcome) = try_render_markdown(
                 &mut run,
                 url,
                 &resp.meta.final_url,
@@ -536,7 +538,10 @@ where
                 &opts,
                 capture,
             )
-            .await;
+            .await
+            {
+                return outcome;
+            }
         }
 
         if config.formats.is_static_terminal() {
@@ -657,11 +662,34 @@ where
     run.finish(Status::Unsupported, None, None, None)
 }
 
+#[cfg(feature = "tier2")]
+fn runtime_challenge_detail(capture: &crate::tier2::CaptureResult) -> Option<String> {
+    capture
+        .candidates
+        .iter()
+        .find_map(|candidate| detect_network_challenge(&candidate.url))
+        .map(|kind| format!("network:{}", kind.as_str()))
+}
+
+#[cfg(feature = "tier2")]
+fn finish_runtime_challenge(run: &mut Run, detail: String) -> ExtractionResult {
+    run.record(
+        SourceTier::RuntimeInterception,
+        "core.challenge",
+        StepOutcome::Matched,
+        0,
+        Bucket::None,
+        Some(detail),
+    );
+    run.take_for_finish()
+        .finish(Status::NeedsBrowser, None, None, None)
+}
+
 /// Run the in-process Tier 2 capture and record the `runtime.spawn` /
 /// `runtime.sandbox` / `runtime.capture` trace steps. Shared by the JSON-replay
 /// path ([`try_tier2`]) and the discovery path ([`try_discover`]). On a capture
-/// failure returns `Err(terminal Error result)` for the caller to return as-is;
-/// otherwise the [`CaptureResult`].
+/// failure returns a terminal `Error`; a high-confidence runtime challenge
+/// returns terminal `NeedsBrowser`; otherwise the [`CaptureResult`].
 ///
 /// There is no prefetch phase: the isolate pulls its own scripts, modules, and
 /// chunks — concurrently — through its async net+cache fetcher, so the
@@ -741,6 +769,9 @@ where
         )),
     );
     record_runtime_logs(run, &capture_result.logs, config);
+    if let Some(detail) = runtime_challenge_detail(&capture_result) {
+        return Err(finish_runtime_challenge(run, detail));
+    }
     Ok(capture_result)
 }
 
@@ -1030,8 +1061,8 @@ fn nonws_len(s: &str) -> usize {
 /// upgrades `run.markdown`/`run.metadata` and marks `run.md_tier` as
 /// [`SourceTier::RuntimeInterception`]; otherwise it leaves the static Markdown
 /// untouched. Always records a `runtime.render` trace step (and `runtime.sandbox`
-/// when the child reported a posture). Never returns a result — the Markdown path
-/// finalizes at its call site.
+/// when the child reported a posture). Returns a terminal `NeedsBrowser` only
+/// when Tier 2 emits a high-confidence challenge signal.
 #[cfg(feature = "tier2")]
 #[allow(clippy::too_many_arguments)]
 async fn try_render_markdown<T>(
@@ -1045,7 +1076,8 @@ async fn try_render_markdown<T>(
     config: &Config,
     opts: &SessionOpts,
     capture: &T,
-) where
+) -> Option<ExtractionResult>
+where
     T: Tier2Capture + ?Sized,
 {
     let t_cap = Instant::now();
@@ -1065,7 +1097,7 @@ async fn try_render_markdown<T>(
                 Bucket::Runtime,
                 Some(error_summary(&e)),
             );
-            return;
+            return None;
         }
     };
     let cap_ms = t_cap.elapsed().as_millis() as u64;
@@ -1084,6 +1116,9 @@ async fn try_render_markdown<T>(
     // Page-side diagnostics (opt-in) — recorded before the render decision so
     // they surface even when hydration produced no usable DOM.
     record_runtime_logs(run, &capture_result.logs, config);
+    if let Some(detail) = runtime_challenge_detail(&capture_result) {
+        return Some(finish_runtime_challenge(run, detail));
+    }
 
     let Some(rendered) = capture_result.rendered_html.as_deref() else {
         run.record(
@@ -1094,7 +1129,7 @@ async fn try_render_markdown<T>(
             Bucket::Runtime,
             Some(format!("{:?}, no DOM serialized", capture_result.outcome)),
         );
-        return;
+        return None;
     };
 
     // Merge the shell's real <head> (title, OG, canonical, <base>) with the
@@ -1113,6 +1148,9 @@ async fn try_render_markdown<T>(
 
     let prev_len = run.markdown.as_deref().map(nonws_len).unwrap_or(0);
     let new_len = nonws_len(&rescraped.markdown);
+    if let Some(detail) = hydration_collapse_detail(prev_len, new_len) {
+        return Some(finish_runtime_challenge(run, detail));
+    }
 
     // Decide whether the rendered pass is an improvement. Two ways to win:
     //   1. It resolved a skeleton: the shell was an incomplete render and the
@@ -1169,7 +1207,9 @@ async fn try_render_markdown<T>(
         let detail = if rescraped.incomplete {
             format!("hydration still a skeleton ({new_len} chars); kept static shell")
         } else {
-            format!("hydration added no usable content ({new_len} vs {prev_len} chars); kept static shell")
+            format!(
+                "hydration added no usable content ({new_len} vs {prev_len} chars); kept static shell"
+            )
         };
         run.record(
             SourceTier::RuntimeInterception,
@@ -1180,6 +1220,7 @@ async fn try_render_markdown<T>(
             Some(detail),
         );
     }
+    None
 }
 
 /// Render-then-Markdown escalation (lean build, no `tier2` feature): there is no
@@ -1199,7 +1240,8 @@ async fn try_render_markdown<T>(
     _config: &Config,
     _opts: &SessionOpts,
     _capture: &T,
-) where
+) -> Option<ExtractionResult>
+where
     T: Tier2Capture + ?Sized,
 {
     run.record(
@@ -1210,6 +1252,7 @@ async fn try_render_markdown<T>(
         Bucket::None,
         Some("built without tier2: render-then-markdown not compiled in".to_string()),
     );
+    None
 }
 
 /// Tier 1 sub-flow. Returns `Some(result)` if the ladder should terminate here
@@ -1632,6 +1675,149 @@ mod tests {
         let actions: Vec<&str> = r.trace.iter().map(|t| t.action.as_str()).collect();
         assert_eq!(actions, vec!["net.fetch", "core.challenge"]);
         assert_eq!(r.trace[1].detail.as_deref(), Some("cloudflare"));
+    }
+
+    #[tokio::test]
+    async fn static_challenge_fixture_matrix_returns_needs_browser() {
+        let fixtures = [
+            (
+                "perimeterx",
+                200,
+                r#"<h1>Pardon the interruption</h1><div id="px-captcha"></div>"#,
+            ),
+            (
+                "cloudflare",
+                403,
+                r#"<h1>Attention Required!</h1><script src="/cdn-cgi/challenge-platform/x"></script>"#,
+            ),
+            (
+                "datadome",
+                403,
+                r#"<script src="https://geo.captcha-delivery.com/captcha/"></script>"#,
+            ),
+            (
+                "kasada",
+                429,
+                r#"<script src="/149e9513-01fa-4fb0-aad4-566afd725d1b/ips.js"></script>"#,
+            ),
+            (
+                "imperva",
+                403,
+                r#"<p>Request unsuccessful. Incapsula incident 123</p><script src="/_Incapsula_Resource"></script>"#,
+            ),
+        ];
+
+        for (name, status, body) in fixtures {
+            let r = run_ladder(
+                "https://target.example/",
+                &cfg(2),
+                &MockFetcher::ok_html(status, body),
+                &MockStatic::hit_next_data(),
+                &noop_capture(),
+            )
+            .await;
+            assert_eq!(r.status, Status::NeedsBrowser, "fixture {name}");
+            let signal = r
+                .trace
+                .iter()
+                .find(|step| step.action == "core.challenge")
+                .expect("challenge trace");
+            assert_eq!(signal.detail.as_deref(), Some(name));
+        }
+    }
+
+    #[cfg(feature = "tier2")]
+    #[tokio::test]
+    async fn tier2_vendor_network_hit_short_circuits_to_needs_browser() {
+        let fetcher = MockFetcher::ok_html(200, "<html><body>SPA shell</body></html>");
+        let statics = MockStatic::miss_no_build_id();
+        let capture = MockCapture::with_candidates(vec![Candidate::get(
+            "https://collector.px-cloud.net/api/v2/collector",
+            InterceptVia::Fetch,
+        )]);
+
+        let r = run_ladder(
+            "https://shop.example.com/p",
+            &cfg(2),
+            &fetcher,
+            &statics,
+            &capture,
+        )
+        .await;
+
+        assert_eq!(r.status, Status::NeedsBrowser);
+        assert_eq!(fetcher.replay_calls(), 0);
+        let signal = r
+            .trace
+            .iter()
+            .find(|step| step.action == "core.challenge")
+            .expect("runtime challenge trace");
+        assert_eq!(signal.detail.as_deref(), Some("network:perimeterx"));
+    }
+
+    #[cfg(feature = "tier2")]
+    #[tokio::test]
+    async fn hydration_collapse_short_circuits_to_needs_browser() {
+        let shell_markdown = "s".repeat(5_867);
+        let hydrated = format!("<html><body><main>{}</main></body></html>", "h".repeat(445));
+        let fetcher = MockFetcher::ok_html(200, "<html><body>shell</body></html>");
+        let statics = MockStatic::miss_no_build_id().with_markdown(&shell_markdown);
+        let capture = MockCapture::rendered(hydrated);
+        let config = Config {
+            formats: FormatSet::markdown_only(),
+            force_render: true,
+            ..cfg(2)
+        };
+
+        let r = run_ladder(
+            "https://shop.example.com/p",
+            &config,
+            &fetcher,
+            &statics,
+            &capture,
+        )
+        .await;
+
+        assert_eq!(r.status, Status::NeedsBrowser);
+        let signal = r
+            .trace
+            .iter()
+            .find(|step| step.action == "core.challenge")
+            .expect("hydration collapse trace");
+        assert_eq!(
+            signal.detail.as_deref(),
+            Some("hydration-collapse: shell_chars=5867, hydrated_chars=445")
+        );
+    }
+
+    #[cfg(feature = "tier2")]
+    #[tokio::test]
+    async fn normal_spa_hydration_growth_is_not_a_challenge() {
+        let shell_markdown = "s".repeat(400);
+        let hydrated = format!(
+            "<html><body><main>{}</main></body></html>",
+            "h".repeat(2_000)
+        );
+        let fetcher = MockFetcher::ok_html(200, "<html><body>shell</body></html>");
+        let statics = MockStatic::miss_no_build_id().with_markdown(&shell_markdown);
+        let capture = MockCapture::rendered(hydrated);
+        let config = Config {
+            formats: FormatSet::markdown_only(),
+            force_render: true,
+            ..cfg(2)
+        };
+
+        let r = run_ladder(
+            "https://shop.example.com/p",
+            &config,
+            &fetcher,
+            &statics,
+            &capture,
+        )
+        .await;
+
+        assert_eq!(r.status, Status::Success);
+        assert!(r.trace.iter().all(|step| step.action != "core.challenge"));
     }
 
     #[tokio::test]
