@@ -562,10 +562,21 @@ pub(crate) mod prod {
     /// Map a [`draco_runtime::CaptureReport`] onto the ladder's [`CaptureResult`]
     /// (rank/replay's V8-free input). Header order is preserved verbatim (it is
     /// fingerprint-relevant to replay).
-    fn to_capture_result(report: draco_runtime::CaptureReport) -> CaptureResult {
-        let mut candidates = Vec::with_capacity(report.requests.len());
-        let mut bodies = Vec::with_capacity(report.requests.len());
-        for r in report.requests {
+    pub(super) fn to_capture_result(report: draco_runtime::CaptureReport) -> CaptureResult {
+        let draco_runtime::CaptureReport {
+            outcome,
+            requests,
+            rendered_html,
+            logs,
+        } = report;
+        let mut candidates = Vec::with_capacity(requests.len());
+        let mut bodies = Vec::with_capacity(requests.len());
+        for r in requests {
+            // Never rank or replay a request whose body was omitted. Replaying a
+            // truncated or empty GraphQL/JSON-RPC payload changes its semantics.
+            if r.body_omitted {
+                continue;
+            }
             candidates.push(Candidate {
                 method: r.method,
                 url: r.url,
@@ -577,12 +588,12 @@ pub(crate) mod prod {
         CaptureResult {
             candidates,
             bodies,
-            outcome: report.outcome,
+            outcome,
             // The containment story is now purely the isolate: page JS runs with no
             // host-capability bindings, in-process. Surfaced as `runtime.sandbox`.
             sandbox_level: Some("isolate: in-process v8 (no host bindings)".to_string()),
-            rendered_html: report.rendered_html,
-            logs: report.logs,
+            rendered_html,
+            logs,
         }
     }
 
@@ -874,6 +885,28 @@ mod tests {
             assert_eq!(default_quiesce_ms(1_800), 300); // 300
             assert_eq!(default_quiesce_ms(9_000), 500); // 1500 → ceiled at 500
         }
+    }
+
+    #[cfg(feature = "tier2")]
+    #[test]
+    fn omitted_request_body_is_not_ranked_or_replayed() {
+        let report = draco_runtime::CaptureReport {
+            outcome: RuntimeOutcome::Quiesced,
+            requests: vec![draco_runtime::CapturedRequest {
+                method: "POST".to_string(),
+                url: "https://api.example.com/graphql".to_string(),
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: None,
+                body_omitted: true,
+                via: InterceptVia::Fetch,
+            }],
+            rendered_html: None,
+            logs: Vec::new(),
+        };
+
+        let capture = prod::to_capture_result(report);
+        assert!(capture.candidates.is_empty());
+        assert!(capture.bodies.is_empty());
     }
 
     #[test]
