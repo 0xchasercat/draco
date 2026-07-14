@@ -1125,14 +1125,7 @@ async fn run_capture_inner(
     let (outcome, window_cpu) = if heap_limit_hit.load(Ordering::Relaxed) {
         (RuntimeOutcome::Terminated, Duration::ZERO)
     } else {
-        drive_capture_window(
-            &mut runtime,
-            &cap,
-            cfg,
-            threw_in_page,
-            &heap_limit_hit,
-        )
-        .await
+        drive_capture_window(&mut runtime, &cap, cfg, threw_in_page, &heap_limit_hit).await
     };
     let window_ms = t_window.elapsed().as_millis();
     let window_cpu_ms = window_cpu.as_millis();
