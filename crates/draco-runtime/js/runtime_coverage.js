@@ -14,41 +14,40 @@
     try { if (pageWindow) pageWindow[name] = value; } catch (_) {}
   };
 
-  // Preserve a constructible WHATWG URL and augment it in place. Replacing URL
-  // with a method-only object fixes createObjectURL while breaking every new URL().
+  // Patch the exact happy-dom URL constructor mirrored onto page scope. Its
+  // inherited createObjectURL() reaches URL$1.createObjectURL(), which delegates
+  // to the bundled base URL via super.createObjectURL() and throws because that
+  // base has no object-URL implementation. Define own statics on the page-visible
+  // constructor; never replace it, so new URL() and its prototype stay intact.
   try {
-    const NativeURL = g.__DRACO_NATIVE_URL__;
-    let URLCtor = g.URL;
-    let usable = false;
-    try {
-      usable = typeof URLCtor === "function" && new URLCtor("/probe", "https://example.test/").href === "https://example.test/probe";
-    } catch (_) {}
-    if (!usable && typeof NativeURL === "function") URLCtor = NativeURL;
-    if (typeof URLCtor === "function") {
-      let nextObjectURL = 1;
-      if (typeof URLCtor.createObjectURL !== "function") {
-        Object.defineProperty(URLCtor, "createObjectURL", {
-          value() {
-            let origin = "null";
-            try {
-              if (g.location && g.location.origin && g.location.origin !== "null") {
-                origin = g.location.origin;
-              }
-            } catch (_) {}
-            return "blob:" + origin + "/draco-" + nextObjectURL++;
-          },
-          writable: true,
-          configurable: true,
-        });
-      }
-      if (typeof URLCtor.revokeObjectURL !== "function") {
-        Object.defineProperty(URLCtor, "revokeObjectURL", {
-          value() {},
-          writable: true,
-          configurable: true,
-        });
-      }
-      expose("URL", URLCtor);
+    let nextObjectURL = 1;
+    const createObjectURL = function () {
+      let origin = "null";
+      try {
+        if (g.location && g.location.origin && g.location.origin !== "null") {
+          origin = g.location.origin;
+        }
+      } catch (_) {}
+      return "blob:" + origin + "/draco-" + nextObjectURL++;
+    };
+    const revokeObjectURL = function () {};
+    const installObjectURLStatics = (URLCtor) => {
+      if (typeof URLCtor !== "function") return;
+      Object.defineProperty(URLCtor, "createObjectURL", {
+        value: createObjectURL,
+        writable: true,
+        configurable: true,
+      });
+      Object.defineProperty(URLCtor, "revokeObjectURL", {
+        value: revokeObjectURL,
+        writable: true,
+        configurable: true,
+      });
+    };
+
+    installObjectURLStatics(g.URL);
+    if (pageWindow && pageWindow.URL !== g.URL) {
+      installObjectURLStatics(pageWindow.URL);
     }
   } catch (_) {}
 

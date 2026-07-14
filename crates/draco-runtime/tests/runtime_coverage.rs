@@ -16,7 +16,10 @@ fn cfg() -> CaptureConfig {
 }
 
 fn captured(report: &draco_runtime::CaptureReport, needle: &str) -> bool {
-    report.requests.iter().any(|request| request.url.contains(needle))
+    report
+        .requests
+        .iter()
+        .any(|request| request.url.contains(needle))
 }
 
 #[test]
@@ -30,11 +33,15 @@ fn happy_dom_internal_fetch_uses_the_broker() {
     assert!(
         captured(&report, "/api/preloaded"),
         "happy-dom internal fetch bypassed the broker: {:?}; logs: {:?}",
-        report.requests, report.logs
+        report.requests,
+        report.logs
     );
     assert!(captured(&report, "/api/page-fetch"));
     assert!(
-        report.logs.iter().all(|line| !line.contains("send is not a function")),
+        report
+            .logs
+            .iter()
+            .all(|line| !line.contains("send is not a function")),
         "internal fetch reached happy-dom's unavailable Node adapter: {:?}",
         report.logs
     );
@@ -61,13 +68,14 @@ fetch("/api/coverage?ok=" + ok);
     assert!(
         captured(&report, "/api/coverage?ok=true"),
         "URL/Worker compatibility path failed: {:?}; logs: {:?}",
-        report.requests, report.logs
+        report.requests,
+        report.logs
     );
 }
 
 #[test]
 fn canvas_2d_basics_are_non_null_and_stateful() {
-    let html = r#"<!doctype html><html><body><canvas id="c"></canvas><script>
+    let html = r##"<!doctype html><html><body><canvas id="c"></canvas><script>
 const canvas = document.getElementById("c");
 const a = canvas.getContext("2d");
 const b = canvas.getContext("2d");
@@ -84,14 +92,15 @@ const ok = a === b
   && metric.width > 0
   && image.data.length === 24;
 fetch("/api/canvas?ok=" + ok);
-</script></body></html>"#;
+</script></body></html>"##;
 
     let report = run_capture("https://canvas.example/", html, &cfg(), null_fetcher());
 
     assert!(
         captured(&report, "/api/canvas?ok=true"),
         "canvas shim did not preserve basic 2D behavior: {:?}; logs: {:?}",
-        report.requests, report.logs
+        report.requests,
+        report.logs
     );
 }
 
