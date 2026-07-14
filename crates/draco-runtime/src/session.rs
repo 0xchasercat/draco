@@ -585,6 +585,7 @@ async fn hydrate(
 
     let cap = Rc::new(RefCell::new(CaptureState {
         requests: Vec::new(),
+        seen_intercepts: 0,
         max_intercepts: config.capture.max_intercepts,
         stub_body: stub_body.clone(),
         fetcher: fetcher.clone(),

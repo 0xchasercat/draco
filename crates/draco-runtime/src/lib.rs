@@ -64,7 +64,10 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Once;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Once,
+};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -125,6 +128,10 @@ pub struct CapturedRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
+    /// True when the page supplied a body larger than the retention ceiling. The
+    /// endpoint remains observable, but callers must not issue it live or replay
+    /// it without the omitted bytes.
+    pub body_omitted: bool,
     pub via: InterceptVia,
 }
 
@@ -174,6 +181,9 @@ pub struct ApiRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
+    /// The original body exceeded the capture ceiling and was omitted. A live
+    /// responder must decline this request rather than send altered semantics.
+    pub body_omitted: bool,
 }
 
 /// The response handed back to the page for an [`ApiRequest`] — the *real* status,
@@ -285,12 +295,12 @@ pub fn run_runtime() -> ! {
 // Capture buffer (shared Rust <-> op state)
 // ===================================================================
 
-/// The op-side capture buffer, stored in `OpState`. `op_raze_fetch` pushes into
-/// `requests`; the driver drains it after the run. The intercept count is simply
-/// `requests.len()` (that is also how the `max_intercepts` cap is measured), so
-/// no separate counter is kept.
+/// The op-side capture buffer, stored in `OpState`. `op_raze_fetch` pushes bounded
+/// requests into `requests`; `seen_intercepts` enforces the count cap even when an
+/// oversized-body request is intentionally omitted from replayable output.
 struct CaptureState {
     requests: Vec<CapturedRequest>,
+    seen_intercepts: u32,
     max_intercepts: u32,
     /// Verbatim stub body (already normalized; never empty).
     stub_body: String,
@@ -338,6 +348,15 @@ struct CaptureState {
 /// that carry it.
 const MAX_RUNTIME_LOGS: usize = 96;
 const MAX_LOG_CHARS: usize = 1_024;
+/// Request bodies are useful for replay, but retaining 64 unbounded payloads can
+/// dominate the isolate's RSS. Oversized bodies are omitted from discovery and
+/// replay rather than truncated into a semantically different request.
+const MAX_CAPTURED_REQUEST_BODY_BYTES: usize = 256 * 1_024;
+/// Per-isolate managed-heap budget. The callback below adds a small unwind margin
+/// only after terminating execution, so a page-level OOM degrades to a partial
+/// report instead of taking down the process.
+const V8_MAX_HEAP_BYTES: usize = 160 * 1_024 * 1_024;
+const V8_TERMINATION_HEADROOM_BYTES: usize = 16 * 1_024 * 1_024;
 
 impl CaptureState {
     /// Append one diagnostic line, enforcing the count cap, truncating overlong
@@ -483,21 +502,35 @@ async fn op_raze_fetch(
         let cap = op_state.borrow::<Rc<RefCell<CaptureState>>>().clone();
         let mut cs = cap.borrow_mut();
 
-        if cs.requests.len() as u32 >= cs.max_intercepts {
+        if cs.seen_intercepts >= cs.max_intercepts {
             return Err(deno_error::JsErrorBox::generic("max_intercepts exceeded"));
         }
+        cs.seen_intercepts += 1;
 
         let via = match raw.via.as_str() {
             "xhr" => InterceptVia::Xhr,
             _ => InterceptVia::Fetch,
         };
         let tracker = is_tracker(&raw.url);
-        let body = raw.body.map(|b| b.into_bytes());
+        let (body, body_omitted) = match raw.body {
+            Some(body) if body.len() > MAX_CAPTURED_REQUEST_BODY_BYTES => {
+                let t = cs.started.elapsed().as_millis();
+                cs.push_log(&format!(
+                    "[+{t}ms] [raze.fetch] request body omitted: {}b exceeds {}b limit",
+                    body.len(),
+                    MAX_CAPTURED_REQUEST_BODY_BYTES
+                ));
+                (None, true)
+            }
+            Some(body) => (Some(body.into_bytes()), false),
+            None => (None, false),
+        };
         cs.requests.push(CapturedRequest {
             method: raw.method.clone(),
             url: raw.url.clone(),
             headers: raw.headers.clone(),
             body: body.clone(),
+            body_omitted,
             via,
         });
         // A non-tracker request is content progress → advance the quiesce clock.
@@ -510,9 +543,14 @@ async fn op_raze_fetch(
             url: raw.url,
             headers: raw.headers,
             body,
+            body_omitted,
         };
         (
-            cs.api_fetcher.clone(),
+            if body_omitted {
+                None
+            } else {
+                cs.api_fetcher.clone()
+            },
             cs.inflight.clone(),
             cs.stub_body.clone(),
             api_req,
@@ -889,6 +927,7 @@ async fn run_capture_inner(
 
     let cap = Rc::new(RefCell::new(CaptureState {
         requests: Vec::new(),
+        seen_intercepts: 0,
         max_intercepts: cfg.max_intercepts,
         stub_body: stub_body.clone(),
         fetcher: fetcher.clone(),
@@ -901,7 +940,11 @@ async fn run_capture_inner(
         started: Instant::now(),
     }));
 
-    // Restore the DOM-engine snapshot and register the ops for this isolate.
+    // Restore the DOM-engine snapshot under a per-isolate managed-heap ceiling.
+    // The near-limit callback terminates only this isolate and grants a small
+    // emergency margin so V8 can unwind without a process-fatal OOM.
+    let heap_limit_hit = Rc::new(AtomicBool::new(false));
+    let create_params = deno_core::v8::Isolate::create_params().heap_limits(0, V8_MAX_HEAP_BYTES);
     let mut runtime = JsRuntime::new(RuntimeOptions {
         startup_snapshot: Some(SNAPSHOT),
         extensions: vec![draco_runtime_ext::init(cap.clone())],
@@ -911,7 +954,15 @@ async fn run_capture_inner(
             inflight: inflight.clone(),
             cap: cap.clone(),
         })),
+        create_params: Some(create_params),
         ..Default::default()
+    });
+    let isolate_handle = runtime.v8_isolate().thread_safe_handle();
+    let heap_limit_signal = heap_limit_hit.clone();
+    runtime.add_near_heap_limit_callback(move |current_limit, _initial_limit| {
+        heap_limit_signal.store(true, Ordering::Relaxed);
+        isolate_handle.terminate_execution();
+        current_limit.saturating_add(V8_TERMINATION_HEADROOM_BYTES)
     });
 
     // 1. Install hooks that must precede Window construction, inject page inputs,
@@ -931,6 +982,10 @@ async fn run_capture_inner(
     ) {
         return finish(cap, RuntimeOutcome::Threw, Some(e.to_string()));
     }
+    drop(url_lit);
+    drop(html_lit);
+    drop(stub_lit);
+    drop(stub_body);
     if let Err(e) = runtime.execute_script("draco:glue", GLUE_JS) {
         return finish(cap, RuntimeOutcome::Threw, Some(e.to_string()));
     }
@@ -967,6 +1022,7 @@ async fn run_capture_inner(
             ext_bytes.insert(*i, b);
         }
     }
+    drop(external);
 
     let mut threw_in_page = false;
     for (i, script) in scripts.into_iter().enumerate() {
@@ -1043,34 +1099,48 @@ async fn run_capture_inner(
                 cap.borrow_mut().push_log(&line);
             }
         }
+        if heap_limit_hit.load(Ordering::Relaxed) {
+            break;
+        }
     }
-    let _ = runtime.execute_script(
-        "draco:currentScript:clear",
-        "try { globalThis.__dracoClearCurrentScript(); } catch (_) {}",
-    );
+    if !heap_limit_hit.load(Ordering::Relaxed) {
+        let _ = runtime.execute_script(
+            "draco:currentScript:clear",
+            "try { globalThis.__dracoClearCurrentScript(); } catch (_) {}",
+        );
 
-    // Parsing-finished moment: the document-order scripts have all evaluated.
-    // Fire the document lifecycle (readyState transitions, DOMContentLoaded,
-    // window load) so boot code gated on those signals proceeds — a real browser
-    // fires both events here, BEFORE dynamic import()s settle, and late-running
-    // chunk code then observes readyState === "complete" (see glue §7).
-    let _ = runtime.execute_script(
-        "draco:lifecycle",
-        "try { globalThis.__dracoFireLifecycle(); } catch (_) {}",
-    );
+        // Parsing-finished moment: fire lifecycle events before dynamic imports
+        // settle, matching a browser's readyState progression.
+        let _ = runtime.execute_script(
+            "draco:lifecycle",
+            "try { globalThis.__dracoFireLifecycle(); } catch (_) {}",
+        );
+    }
 
     let scripts_ms = t_scripts.elapsed().as_millis();
 
-    // 3. Capture window: pump the event loop until quiescence or the hard cap.
+    // 3. Capture window: pump until quiescence or the hard cap, unless the heap
+    // callback already terminated page execution.
     let t_window = Instant::now();
-    let (outcome, window_cpu) = drive_capture_window(&mut runtime, &cap, cfg, threw_in_page).await;
+    let (outcome, window_cpu) = if heap_limit_hit.load(Ordering::Relaxed) {
+        (RuntimeOutcome::Terminated, Duration::ZERO)
+    } else {
+        drive_capture_window(&mut runtime, &cap, cfg, threw_in_page, &heap_limit_hit).await
+    };
     let window_ms = t_window.elapsed().as_millis();
     let window_cpu_ms = window_cpu.as_millis();
 
-    // 4. Serialize the hydrated DOM for the render-then-Markdown escalation, after
-    //    the window so any content the framework mounted is present.
+    // 4. Serialize only while the isolate is healthy. A memory-limited run keeps
+    // whatever requests were captured before termination and skips another large
+    // DOM allocation.
     let t_serialize = Instant::now();
-    serialize_dom(&mut runtime);
+    if !heap_limit_hit.load(Ordering::Relaxed) {
+        serialize_dom(&mut runtime);
+    } else {
+        cap.borrow_mut().push_log(&format!(
+            "[raze.memory] V8 heap reached {V8_MAX_HEAP_BYTES}b; capture terminated"
+        ));
+    }
     let serialize_ms = t_serialize.elapsed().as_millis();
 
     // Phase breakdown (surfaced under `--runtime-log`): the raw material for the
@@ -1086,13 +1156,12 @@ async fn run_capture_inner(
         ));
     }
 
-    let cs = cap.borrow();
-    CaptureReport {
-        outcome,
-        requests: cs.requests.clone(),
-        rendered_html: cs.rendered_html.clone(),
-        logs: cs.logs.clone(),
-    }
+    // Release V8 and compiled/module source state before handing the report to the
+    // caller. The report is moved out of CaptureState below, so no second DOM or
+    // request-body copy overlaps the isolate's peak.
+    drop(runtime);
+    modules.borrow_mut().clear();
+    finish(cap, outcome, None)
 }
 
 /// Serialize the live hydrated DOM (`document.documentElement.outerHTML`, via the
@@ -1148,6 +1217,7 @@ async fn drive_capture_window(
     cap: &Rc<RefCell<CaptureState>>,
     cfg: &CaptureConfig,
     threw_in_page: bool,
+    heap_limit_hit: &AtomicBool,
 ) -> (RuntimeOutcome, Duration) {
     let start = Instant::now();
     let hard_cap = Duration::from_millis(cfg.capture_window_ms);
@@ -1185,6 +1255,10 @@ async fn drive_capture_window(
         let t_poll = Instant::now();
         let poll_res = poll_once(runtime);
         poll_busy += t_poll.elapsed();
+        if heap_limit_hit.load(Ordering::Relaxed) {
+            close_reason = "heap-limit";
+            break;
+        }
 
         match poll_res {
             Poll::Ready(Ok(())) => {
@@ -1263,7 +1337,11 @@ async fn drive_capture_window(
         cs.push_log(&line);
     }
 
-    let outcome = classify_window_close(cap, threw_in_page, loop_threw, close_reason == "hard-cap");
+    let outcome = if heap_limit_hit.load(Ordering::Relaxed) {
+        RuntimeOutcome::Terminated
+    } else {
+        classify_window_close(cap, threw_in_page, loop_threw, close_reason == "hard-cap")
+    };
     (outcome, poll_busy)
 }
 
@@ -1314,15 +1392,12 @@ fn finish(
         eprintln!("draco-runtime: {outcome:?}: {d}");
         cap.borrow_mut().push_log(&format!("boot: {d}"));
     }
-    let cs = cap.borrow();
-    // `finish` is only reached on a pre-hydration boot failure (URL inject /
-    // polyfill / interceptor threw), so there is no meaningful hydrated DOM to
-    // serialize.
+    let mut cs = cap.borrow_mut();
     CaptureReport {
         outcome,
-        requests: cs.requests.clone(),
-        rendered_html: None,
-        logs: cs.logs.clone(),
+        requests: std::mem::take(&mut cs.requests),
+        rendered_html: std::mem::take(&mut cs.rendered_html),
+        logs: std::mem::take(&mut cs.logs),
     }
 }
 
@@ -2281,6 +2356,7 @@ mod tests {
         // and evict the one distinct error that explains a failure.
         let mut cs = CaptureState {
             requests: Vec::new(),
+            seen_intercepts: 0,
             max_intercepts: 8,
             stub_body: "{}".to_string(),
             fetcher: null_fetcher(),
