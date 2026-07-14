@@ -723,11 +723,18 @@ deno_core::extension!(
 /// resolved lazily by the baked JS (`Deno.core.ops.op_*`) after restore.
 static SNAPSHOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/DRACO_SNAPSHOT.bin"));
 
+/// Pre-window hooks: preserve V8's URL constructor and inject happy-dom's
+/// supported internal-fetch interceptor before the page Window is constructed.
+const PRELUDE_JS: &str = include_str!("../js/prelude.js");
+
 /// Per-isolate runtime glue (runs after snapshot restore): constructs a fresh
 /// happy-dom `Window` for the target URL, mirrors its DOM globals onto
 /// `globalThis`, installs the `op_raze_fetch` fetch/XHR interceptor, and loads the
 /// fetched HTML so the framework's mount container exists.
 const GLUE_JS: &str = include_str!("../js/glue.js");
+
+/// Compatibility shims that depend on the freshly mirrored DOM globals.
+const RUNTIME_COVERAGE_JS: &str = include_str!("../js/runtime_coverage.js");
 
 // ===================================================================
 // ES-module support: in-isolate module loader + script model
@@ -907,9 +914,11 @@ async fn run_capture_inner(
         ..Default::default()
     });
 
-    // 1. Inject page inputs, then run the glue: it builds the happy-dom Window,
-    //    mirrors DOM globals onto globalThis, installs the fetch/XHR interceptor,
-    //    and loads the HTML into the document.
+    // 1. Install hooks that must precede Window construction, inject page inputs,
+    //    then run the glue and its post-mirror compatibility layer.
+    if let Err(e) = runtime.execute_script("draco:prelude", PRELUDE_JS) {
+        return finish(cap, RuntimeOutcome::Threw, Some(e.to_string()));
+    }
     let url_lit = json_string_literal(url);
     let html_lit = json_string_literal(html);
     let stub_lit = json_string_literal(&stub_body);
@@ -923,6 +932,9 @@ async fn run_capture_inner(
         return finish(cap, RuntimeOutcome::Threw, Some(e.to_string()));
     }
     if let Err(e) = runtime.execute_script("draco:glue", GLUE_JS) {
+        return finish(cap, RuntimeOutcome::Threw, Some(e.to_string()));
+    }
+    if let Err(e) = runtime.execute_script("draco:runtime-coverage", RUNTIME_COVERAGE_JS) {
         return finish(cap, RuntimeOutcome::Threw, Some(e.to_string()));
     }
 
