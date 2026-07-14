@@ -29,8 +29,8 @@
 use std::time::Instant;
 
 use draco_net::SessionOpts;
-use draco_static::StaticOutcome;
 use draco_static::content::ScrapeResult;
+use draco_static::StaticOutcome;
 use draco_types::{
     DracoError, ExtractionResult, SourceTier, Status, StepOutcome, Timing, TraceStep,
 };
@@ -43,9 +43,9 @@ use crate::tier2::Tier2Capture;
 // `CaptureMode` is only referenced from the tier2-gated capture call sites
 // (`run_tier2_capture` / `try_render_markdown`); gate the import so the lean
 // `--no-default-features` build doesn't flag it as unused.
-use crate::Config;
 #[cfg(feature = "tier2")]
 use crate::tier2::CaptureMode;
+use crate::Config;
 
 // ---------------------------------------------------------------------------
 // Tier ceilings (spec §11 `tier_max`)
@@ -1492,9 +1492,9 @@ fn split_path_query(url: &str) -> (String, Vec<(String, String)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FormatSet;
     use crate::ranking::Candidate;
-    use crate::testutil::{MockCapture, MockFetcher, MockStatic, err_fetcher, noop_capture};
+    use crate::testutil::{err_fetcher, noop_capture, MockCapture, MockFetcher, MockStatic};
+    use crate::FormatSet;
     use draco_types::{ExtractOrigin, ExtractedData, InterceptVia, NetKind};
     use serde_json::json;
 
@@ -1854,13 +1854,11 @@ mod tests {
         assert_eq!(warning.outcome, StepOutcome::Matched);
         assert_eq!(warning.elapsed_ms, 0);
         assert_eq!(warning.tier, SourceTier::Static);
-        assert!(
-            warning
-                .detail
-                .as_deref()
-                .unwrap()
-                .contains("invalid CSS selector")
-        );
+        assert!(warning
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("invalid CSS selector"));
     }
 
     #[tokio::test]
