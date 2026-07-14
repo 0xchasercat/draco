@@ -17,7 +17,9 @@ pipe = ["dep:axum", "tokio/net", "tokio/signal"]
 
 [dependencies]
 axum = { version = "0.8", optional = true }
+chaser-oxide = "0.2.4"
 clap = { workspace = true, features = ["env"] }
+futures = "0.3"
 draco-static = { workspace = true }
 draco-types = { workspace = true }
 serde = { workspace = true }

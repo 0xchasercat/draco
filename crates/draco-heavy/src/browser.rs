@@ -1,14 +1,35 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::process::Command;
+use chaser_oxide::cdp::browser_protocol::browser::{
+    Bounds, GetWindowForTargetParams, SetWindowBoundsParams, WindowState,
+};
+use chaser_oxide::handler::viewport::Viewport;
+use chaser_oxide::{Browser, BrowserConfig, ChaserPage};
+use futures::StreamExt;
 
 use crate::discovery::DetectedBrowser;
 
 pub type DriverFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+const VIEWPORT_WIDTH: u32 = 1365;
+const VIEWPORT_HEIGHT: u32 = 768;
+const MINIMAL_TELL_REMOVAL: &str = r#"
+(() => {
+  const proto = Object.getPrototypeOf(navigator);
+  const descriptor = Object.getOwnPropertyDescriptor(proto, 'webdriver');
+  if (!descriptor || descriptor.configurable) {
+    Object.defineProperty(proto, 'webdriver', { get: () => false, configurable: true });
+  }
+  for (const key of Object.getOwnPropertyNames(globalThis)) {
+    if (/^(cdc_|\$cdc_|__webdriver|__selenium|__driver|\$chrome_)/.test(key)) {
+      try { delete globalThis[key]; } catch (_) {}
+    }
+  }
+})();
+"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchMode {
@@ -26,8 +47,6 @@ pub enum WaitStrategy {
 
 impl Default for WaitStrategy {
     fn default() -> Self {
-        // Patched challenge solvers still need enough page time to execute and
-        // replace the interstitial before --dump-dom captures the live DOM.
         Self::ChallengeSettle(Duration::from_secs(5))
     }
 }
@@ -60,9 +79,6 @@ impl std::fmt::Display for BrowserError {
 
 impl std::error::Error for BrowserError {}
 
-/// Browser-driving seam. The local ladder owns detection and escalation policy;
-/// implementations own process/CDP details and can be replaced without changing
-/// the open-core orchestration.
 pub trait BrowserDriver: Send + Sync {
     fn launch(
         &self,
@@ -79,12 +95,11 @@ pub trait BrowserSession: Send {
     ) -> DriverFuture<'a, Result<DriveOutput, BrowserError>>;
 }
 
-/// Portable minimum driver: Chrome's own `--headless=new --dump-dom` path.
+/// Pure-Rust CDP driver backed by chaser-oxide.
 ///
-/// TODO(owner seam): replace or extend this with the selected CDP implementation
-/// for headed navigation, cookie extraction, persistent profiles, and exact
-/// Chrome flag/profile tuning. The trait intentionally does not choose a Rust,
-/// Node, or Python CDP stack.
+/// It relies on chaser-oxide's protocol-level execution behavior and installs
+/// only tell-removal. It deliberately never applies ChaserProfile or native
+/// profile scripts because those fabricate OS, plugin, and WebGL identity.
 #[derive(Debug, Clone)]
 pub struct CommandBrowserDriver {
     timeout: Duration,
@@ -98,7 +113,7 @@ impl CommandBrowserDriver {
 
 impl Default for CommandBrowserDriver {
     fn default() -> Self {
-        Self::new(Duration::from_secs(30))
+        Self::new(Duration::from_secs(45))
     }
 }
 
@@ -108,84 +123,201 @@ impl BrowserDriver for CommandBrowserDriver {
         browser: &DetectedBrowser,
         mode: LaunchMode,
     ) -> Result<Box<dyn BrowserSession>, BrowserError> {
-        Ok(Box::new(CommandBrowserSession {
-            browser: browser.clone(),
+        let viewport = Viewport {
+            width: VIEWPORT_WIDTH,
+            height: VIEWPORT_HEIGHT,
+            device_scale_factor: None,
+            emulating_mobile: false,
+            is_landscape: true,
+            has_touch: false,
+        };
+        let builder = BrowserConfig::builder()
+            .chrome_executable(&browser.path)
+            .window_size(VIEWPORT_WIDTH, VIEWPORT_HEIGHT)
+            .viewport(viewport)
+            .launch_timeout(self.timeout)
+            .request_timeout(self.timeout);
+        let builder = match mode {
+            LaunchMode::HeadlessNew => builder.new_headless_mode(),
+            LaunchMode::HeadedMinimized | LaunchMode::Headed => builder.with_head(),
+        };
+        let config = builder.build().map_err(BrowserError::Launch)?;
+        Ok(Box::new(ChaserSession {
+            config: Some(config),
             mode,
             timeout: self.timeout,
         }))
     }
 }
 
-struct CommandBrowserSession {
-    browser: DetectedBrowser,
+struct ChaserSession {
+    config: Option<BrowserConfig>,
     mode: LaunchMode,
     timeout: Duration,
 }
 
-impl BrowserSession for CommandBrowserSession {
+impl BrowserSession for ChaserSession {
     fn drive<'a>(
         &'a mut self,
         url: &'a str,
         wait_strategy: &'a WaitStrategy,
     ) -> DriverFuture<'a, Result<DriveOutput, BrowserError>> {
         Box::pin(async move {
-            if self.mode != LaunchMode::HeadlessNew {
-                return Err(BrowserError::Unsupported(
-                    "headed driving awaits the owner-selected CDP implementation".into(),
-                ));
-            }
-
-            let mut command = Command::new(&self.browser.path);
-            command
-                .arg("--headless=new")
-                .arg("--dump-dom")
-                .arg("--no-first-run")
-                .arg("--no-default-browser-check")
-                .arg("--disable-background-networking")
-                .arg("--disable-component-update")
-                .arg("--disable-sync")
-                .arg("--hide-scrollbars")
-                .arg(virtual_time_budget(wait_strategy))
-                .arg(url)
-                .stdin(Stdio::null())
-                .stderr(Stdio::piped())
-                .stdout(Stdio::piped());
-
-            let output = tokio::time::timeout(self.timeout, command.output())
-                .await
-                .map_err(|_| BrowserError::Timeout)?
-                .map_err(|error| BrowserError::Launch(error.to_string()))?;
-            if !output.status.success() {
-                let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                return Err(BrowserError::Drive(if detail.is_empty() {
-                    format!("browser exited with {}", output.status)
-                } else {
-                    detail
-                }));
-            }
-            let html = String::from_utf8(output.stdout)
-                .map_err(|error| BrowserError::Drive(format!("DOM was not UTF-8: {error}")))?;
-            if html.trim().is_empty() {
-                return Err(BrowserError::Drive("browser returned an empty DOM".into()));
-            }
-
-            Ok(DriveOutput {
-                final_url: url.to_owned(),
-                html,
-                // `--dump-dom` has no cookie API. The CDP implementation at the
-                // owner seam will return the real cookie jar.
-                cookies: HashMap::new(),
-            })
+            let config = self
+                .config
+                .take()
+                .ok_or_else(|| BrowserError::Drive("browser session already consumed".into()))?;
+            tokio::time::timeout(
+                self.timeout,
+                drive_once(config, self.mode, url, wait_strategy),
+            )
+            .await
+            .map_err(|_| BrowserError::Timeout)?
         })
     }
 }
 
-fn virtual_time_budget(wait_strategy: &WaitStrategy) -> String {
-    let duration = match wait_strategy {
-        WaitStrategy::NetworkIdle => Duration::from_millis(500),
-        WaitStrategy::ChallengeSettle(duration) | WaitStrategy::Delay(duration) => *duration,
-    };
-    format!("--virtual-time-budget={}", duration.as_millis())
+async fn drive_once(
+    config: BrowserConfig,
+    mode: LaunchMode,
+    url: &str,
+    wait_strategy: &WaitStrategy,
+) -> Result<DriveOutput, BrowserError> {
+    let (mut browser, mut handler) = Browser::launch(config)
+        .await
+        .map_err(|error| BrowserError::Launch(error.to_string()))?;
+    let handler_task = tokio::spawn(async move {
+        while let Some(event) = handler.next().await {
+            if event.is_err() {
+                break;
+            }
+        }
+    });
+
+    let result = drive_page(&browser, mode, url, wait_strategy).await;
+    let _ = browser.close().await;
+    let _ = browser.wait().await;
+    handler_task.abort();
+    result
+}
+
+async fn drive_page(
+    browser: &Browser,
+    mode: LaunchMode,
+    url: &str,
+    wait_strategy: &WaitStrategy,
+) -> Result<DriveOutput, BrowserError> {
+    let page = browser
+        .new_page("about:blank")
+        .await
+        .map_err(|error| BrowserError::Drive(error.to_string()))?;
+    install_minimal_tell_removal(&page).await?;
+    if mode == LaunchMode::HeadedMinimized {
+        minimize_window(browser, &page).await?;
+    }
+
+    let chaser = ChaserPage::new(page);
+    chaser
+        .goto(url)
+        .await
+        .map_err(|error| BrowserError::Drive(error.to_string()))?;
+    let html = settled_content(&chaser, wait_strategy).await?;
+    let final_url = chaser
+        .url()
+        .await
+        .map_err(|error| BrowserError::Drive(error.to_string()))?
+        .unwrap_or_else(|| url.to_owned());
+    let cookies = browser
+        .get_cookies()
+        .await
+        .map_err(|error| BrowserError::Drive(error.to_string()))?
+        .into_iter()
+        .map(|cookie| (cookie.name, cookie.value))
+        .collect();
+
+    Ok(DriveOutput {
+        final_url,
+        html,
+        cookies,
+    })
+}
+
+async fn install_minimal_tell_removal(page: &chaser_oxide::Page) -> Result<(), BrowserError> {
+    page.evaluate_on_new_document(MINIMAL_TELL_REMOVAL)
+        .await
+        .map_err(|error| BrowserError::Drive(error.to_string()))?;
+    let user_agent = page
+        .user_agent()
+        .await
+        .map_err(|error| BrowserError::Drive(error.to_string()))?;
+    if user_agent.contains("HeadlessChrome") {
+        page.set_user_agent(user_agent.replace("HeadlessChrome", "Chrome").as_str())
+            .await
+            .map_err(|error| BrowserError::Drive(error.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn minimize_window(browser: &Browser, page: &chaser_oxide::Page) -> Result<(), BrowserError> {
+    let window = browser
+        .execute(
+            GetWindowForTargetParams::builder()
+                .target_id(page.target_id().clone())
+                .build(),
+        )
+        .await
+        .map_err(|error| BrowserError::Drive(error.to_string()))?
+        .result;
+    browser
+        .execute(SetWindowBoundsParams::new(
+            window.window_id,
+            Bounds::builder()
+                .window_state(WindowState::Minimized)
+                .build(),
+        ))
+        .await
+        .map_err(|error| BrowserError::Drive(error.to_string()))?;
+    Ok(())
+}
+
+async fn settled_content(
+    chaser: &ChaserPage,
+    wait_strategy: &WaitStrategy,
+) -> Result<String, BrowserError> {
+    match wait_strategy {
+        WaitStrategy::Delay(duration) => {
+            tokio::time::sleep(*duration).await;
+            chaser
+                .content()
+                .await
+                .map_err(|error| BrowserError::Drive(error.to_string()))
+        }
+        WaitStrategy::NetworkIdle => {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            chaser
+                .content()
+                .await
+                .map_err(|error| BrowserError::Drive(error.to_string()))
+        }
+        WaitStrategy::ChallengeSettle(duration) => {
+            let deadline = tokio::time::Instant::now() + *duration;
+            loop {
+                // Isolated-world evaluation: does not trigger Runtime.enable.
+                let _ = chaser.evaluate("document.readyState").await;
+                let html = chaser
+                    .content()
+                    .await
+                    .map_err(|error| BrowserError::Drive(error.to_string()))?;
+                if !html.trim().is_empty() && !crate::local::looks_like_wall(&html) {
+                    return Ok(html);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok(html);
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -199,18 +331,19 @@ mod tests {
     }
 
     #[test]
-    fn wait_strategy_maps_to_virtual_time() {
+    fn default_challenge_settle_budget_is_five_seconds() {
         assert_eq!(
-            virtual_time_budget(&WaitStrategy::Delay(Duration::from_millis(750))),
-            "--virtual-time-budget=750"
+            WaitStrategy::default(),
+            WaitStrategy::ChallengeSettle(Duration::from_secs(5))
         );
     }
 
     #[test]
-    fn default_challenge_settle_budget_is_five_seconds() {
-        assert_eq!(
-            virtual_time_budget(&WaitStrategy::default()),
-            "--virtual-time-budget=5000"
-        );
+    fn minimal_tell_removal_does_not_spoof_fingerprints() {
+        assert!(MINIMAL_TELL_REMOVAL.contains("webdriver"));
+        assert!(MINIMAL_TELL_REMOVAL.contains("cdc_"));
+        for forbidden in ["WebGL", "plugins", "deviceMemory", "hardwareConcurrency"] {
+            assert!(!MINIMAL_TELL_REMOVAL.contains(forbidden));
+        }
     }
 }
