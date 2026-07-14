@@ -37,7 +37,9 @@ use draco_types::{
 
 use crate::challenge::detect_challenge;
 #[cfg(feature = "tier2")]
-use crate::challenge::{detect_network_challenge, hydration_collapse_detail};
+use crate::challenge::{
+    detect_network_challenge, hydration_collapse_detail, runtime_challenge_dominates,
+};
 use crate::fetcher::{NetFetcher, PageFetcher};
 use crate::tier2::Tier2Capture;
 // `CaptureMode` is only referenced from the tier2-gated capture call sites
@@ -58,6 +60,11 @@ pub const TIER_CEILING: u8 = 2;
 /// treated as a thin client-rendered SPA shell and the `static.markdown` trace
 /// step notes that an SPA render pass would help.
 const THIN_CONTENT_CHARS: usize = 200;
+
+/// A hydration collapse can justify browser fallback only when the static
+/// result was itself content-poor. Above this bar, the proven static extraction
+/// is retained instead of letting a worse happy-dom render erase it.
+const CHALLENGE_FALLBACK_CONTENT_CHARS: usize = 1_000;
 
 /// Clamp a caller-supplied `tier_max` into the implemented range `0..=2`.
 ///
@@ -664,11 +671,12 @@ where
 
 #[cfg(feature = "tier2")]
 fn runtime_challenge_detail(capture: &crate::tier2::CaptureResult) -> Option<String> {
-    capture
+    let kind = capture
         .candidates
         .iter()
-        .find_map(|candidate| detect_network_challenge(&candidate.url))
-        .map(|kind| format!("network:{}", kind.as_str()))
+        .find_map(|candidate| detect_network_challenge(&candidate.url))?;
+    runtime_challenge_dominates(capture.rendered_html.as_deref())
+        .then(|| format!("network:{}", kind.as_str()))
 }
 
 #[cfg(feature = "tier2")]
@@ -1149,7 +1157,18 @@ where
     let prev_len = run.markdown.as_deref().map(nonws_len).unwrap_or(0);
     let new_len = nonws_len(&rescraped.markdown);
     if let Some(detail) = hydration_collapse_detail(prev_len, new_len) {
-        return Some(finish_runtime_challenge(run, detail));
+        if prev_len < CHALLENGE_FALLBACK_CONTENT_CHARS {
+            return Some(finish_runtime_challenge(run, detail));
+        }
+        run.record(
+            SourceTier::RuntimeInterception,
+            "runtime.render",
+            StepOutcome::Missed,
+            cap_ms,
+            Bucket::Runtime,
+            Some(format!("{detail}; kept content-rich static shell")),
+        );
+        return None;
     }
 
     // Decide whether the rendered pass is an improvement. Two ways to win:
@@ -1728,13 +1747,19 @@ mod tests {
 
     #[cfg(feature = "tier2")]
     #[tokio::test]
-    async fn tier2_vendor_network_hit_short_circuits_to_needs_browser() {
+    async fn tier2_perimeterx_wall_with_telemetry_still_needs_browser() {
         let fetcher = MockFetcher::ok_html(200, "<html><body>SPA shell</body></html>");
         let statics = MockStatic::miss_no_build_id();
-        let capture = MockCapture::with_candidates(vec![Candidate::get(
-            "https://collector.px-cloud.net/api/v2/collector",
-            InterceptVia::Fetch,
-        )]);
+        let wall = "<html><body><main><h1>Pardon the interruption</h1>\
+                    <p>Press and hold to confirm you are a human.</p>\
+                    <div id=\"px-captcha\"></div></main></body></html>";
+        let capture = MockCapture::rendered_with_candidates(
+            wall,
+            vec![Candidate::get(
+                "https://ift.px-cloud.net/ns?appId=PXtest",
+                InterceptVia::Fetch,
+            )],
+        );
 
         let r = run_ladder(
             "https://shop.example.com/p",
@@ -1756,21 +1781,74 @@ mod tests {
     }
 
     #[cfg(feature = "tier2")]
+    #[test]
+    fn tier2_vendor_telemetry_does_not_override_content_rich_render() {
+        let rendered_html = format!(
+            "<html><body><main><h1>Store homepage</h1>{}</main>\
+             <iframe src=\"https://captcha.example/challenge\"></iframe></body></html>",
+            "<p>Real products, promotions, categories, and store information.</p>".repeat(40)
+        );
+        let capture = crate::tier2::CaptureResult {
+            candidates: vec![Candidate::get(
+                "https://collector.px-cloud.net/api/v2/collector",
+                InterceptVia::Fetch,
+            )],
+            bodies: vec![None],
+            outcome: draco_types::RuntimeOutcome::Quiesced,
+            sandbox_level: None,
+            rendered_html: Some(rendered_html),
+            logs: Vec::new(),
+        };
+
+        assert_eq!(runtime_challenge_detail(&capture), None);
+    }
+
+    #[cfg(feature = "tier2")]
     #[tokio::test]
-    async fn hydration_collapse_short_circuits_to_needs_browser() {
-        let shell_markdown = "s".repeat(5_867);
-        let hydrated = format!("<html><body><main>{}</main></body></html>", "h".repeat(445));
+    async fn target_static_markdown_survives_telemetry_and_main_content_collapse() {
+        let shell_markdown = "Target product catalogue and store details. ".repeat(80);
+        let hydrated = format!(
+            "<html><body><nav>{}</nav><main>{}</main></body></html>",
+            "global-navigation-content".repeat(50),
+            "h".repeat(445)
+        );
+        let global = draco_static::content::scrape(
+            &hydrated,
+            "https://www.target.com/",
+            200,
+            "text/html; charset=utf-8",
+            false,
+        );
+        let main = draco_static::content::scrape(
+            &hydrated,
+            "https://www.target.com/",
+            200,
+            "text/html; charset=utf-8",
+            true,
+        );
+        assert!(nonws_len(&global.markdown) > 1_000);
+        assert_eq!(nonws_len(&main.markdown), 445);
+
         let fetcher = MockFetcher::ok_html(200, "<html><body>shell</body></html>");
-        let statics = MockStatic::miss_no_build_id().with_markdown(&shell_markdown);
-        let capture = MockCapture::rendered(hydrated);
+        let statics = MockStatic::miss_no_build_id()
+            .with_markdown(&shell_markdown)
+            .with_incomplete(true);
+        let capture = MockCapture::rendered_with_candidates(
+            hydrated,
+            vec![Candidate::get(
+                "https://ift.px-cloud.net/ns?appId=PXtest",
+                InterceptVia::Fetch,
+            )],
+        );
         let config = Config {
             formats: FormatSet::markdown_only(),
             force_render: true,
+            only_main_content: true,
             ..cfg(2)
         };
 
         let r = run_ladder(
-            "https://shop.example.com/p",
+            "https://www.target.com/",
             &config,
             &fetcher,
             &statics,
@@ -1778,16 +1856,72 @@ mod tests {
         )
         .await;
 
-        assert_eq!(r.status, Status::NeedsBrowser);
-        let signal = r
+        assert_eq!(r.status, Status::Success);
+        assert_eq!(r.source_tier, Some(SourceTier::Static));
+        assert_eq!(r.markdown.as_deref(), Some(shell_markdown.as_str()));
+        assert!(r.trace.iter().all(|step| step.action != "core.challenge"));
+        let render = r
             .trace
             .iter()
-            .find(|step| step.action == "core.challenge")
-            .expect("hydration collapse trace");
-        assert_eq!(
-            signal.detail.as_deref(),
-            Some("hydration-collapse: shell_chars=5867, hydrated_chars=445")
-        );
+            .find(|step| step.action == "runtime.render")
+            .expect("render decision");
+        assert_eq!(render.outcome, StepOutcome::Missed);
+        assert!(render
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("kept content-rich static shell")));
+    }
+
+    #[cfg(feature = "tier2")]
+    #[tokio::test]
+    async fn hydration_collapse_static_content_boundary_is_1000_nonwhitespace_chars() {
+        let hydrated = format!("<html><body><main>{}</main></body></html>", "h".repeat(100));
+        let fetcher = MockFetcher::ok_html(200, "<html><body>shell</body></html>");
+        let config = Config {
+            formats: FormatSet::markdown_only(),
+            force_render: true,
+            ..cfg(2)
+        };
+
+        for (shell_len, expected_status) in [(999, Status::NeedsBrowser), (1_000, Status::Success)]
+        {
+            let shell_markdown = "s".repeat(shell_len);
+            let statics = MockStatic::miss_no_build_id().with_markdown(&shell_markdown);
+            let capture = MockCapture::rendered(&hydrated);
+            let r = run_ladder(
+                "https://shop.example.com/p",
+                &config,
+                &fetcher,
+                &statics,
+                &capture,
+            )
+            .await;
+
+            assert_eq!(r.status, expected_status, "shell length {shell_len}");
+            if shell_len == 999 {
+                let signal = r
+                    .trace
+                    .iter()
+                    .find(|step| step.action == "core.challenge")
+                    .expect("hydration collapse trace");
+                assert_eq!(
+                    signal.detail.as_deref(),
+                    Some("hydration-collapse: shell_chars=999, hydrated_chars=100")
+                );
+            } else {
+                assert_eq!(r.source_tier, Some(SourceTier::Static));
+                assert_eq!(r.markdown.as_deref(), Some(shell_markdown.as_str()));
+                let render = r
+                    .trace
+                    .iter()
+                    .find(|step| step.action == "runtime.render")
+                    .expect("retained static render trace");
+                assert!(render
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("kept content-rich static shell")));
+            }
+        }
     }
 
     #[cfg(feature = "tier2")]

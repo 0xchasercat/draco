@@ -61,8 +61,11 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     draco_runtime_ext, eval_module, extract_scripts, json_string_literal, normalize_stub_body,
-    poll_once, quiesce_tick_ms, resolve_script_url, serialize_dom, ApiFetcher, CaptureConfig,
-    CaptureState, MapModuleLoader, ScriptFetcher, GLUE_JS, SNAPSHOT,
+    poll_once, quiesce_tick_ms, resolve_script_url, run_with_execution_deadline, serialize_dom,
+    ApiFetcher, CaptureConfig, CaptureState, ExecutionBoundaryError, ExecutionWatchdog,
+    ExternalScriptPrefetch, HeapLimitExceeded, HeapLimitGuard, MapModuleLoader, ScriptFetcher,
+    SharedSource, TrackedJsRuntime, EXECUTION_DEADLINE_DIAGNOSTIC, EXTERNAL_SCRIPT_PREFETCH_BYTES,
+    GLUE_JS, HEAP_LIMIT_DIAGNOSTIC, RELEASE_INPUTS_JS, SNAPSHOT,
 };
 
 /// Fetch a top-level document for an in-session navigation, cookie-aware.
@@ -301,6 +304,29 @@ pub struct Session {
     join: Option<std::thread::JoinHandle<()>>,
 }
 
+struct ActiveRuntime {
+    // Declared first so its worker is shut down and joined before the V8 runtime
+    // field is dropped.
+    execution_watchdog: ExecutionWatchdog,
+    runtime: TrackedJsRuntime,
+    cap: Rc<RefCell<CaptureState>>,
+    heap_guard: HeapLimitGuard,
+}
+
+fn session_must_close(heap_guard: &HeapLimitGuard) -> bool {
+    heap_guard.is_tripped()
+}
+
+fn execution_boundary_message(error: ExecutionBoundaryError) -> String {
+    match error {
+        ExecutionBoundaryError::HeapLimit => HEAP_LIMIT_DIAGNOSTIC.to_string(),
+        ExecutionBoundaryError::Deadline => EXECUTION_DEADLINE_DIAGNOSTIC.to_string(),
+        ExecutionBoundaryError::WatchdogUnavailable => {
+            "V8 execution watchdog stopped unexpectedly".to_string()
+        }
+    }
+}
+
 impl Session {
     /// Open a session: spawn the isolate thread, hydrate `config.html` under
     /// `config.url` (Observe or Render per the factory), settle once, and return a
@@ -437,8 +463,8 @@ async fn actor_main(
     // persists across pages).
     let fetchers = fetchers_factory();
 
-    let (mut runtime, mut cap) = match hydrate(&config, &fetchers).await {
-        Ok(parts) => (Some(parts.0), Some(parts.1)),
+    let mut active = match hydrate(&config, &fetchers).await {
+        Ok(active) => Some(active),
         Err(e) => {
             let _ = ready_tx.send(Err(e));
             return;
@@ -447,12 +473,24 @@ async fn actor_main(
 
     // Initial settle: let the freshly-hydrated page's scheduled work land, exactly
     // as the one-shot path's capture window does, before we report ready.
-    pump_to_quiesce(
-        runtime.as_mut().unwrap(),
-        cap.as_ref().unwrap(),
-        &config.capture,
-    )
-    .await;
+    {
+        let current = active.as_mut().unwrap();
+        match pump_to_quiesce(
+            &mut current.runtime,
+            &current.cap,
+            &config.capture,
+            &current.heap_guard,
+            &mut current.execution_watchdog,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(error) => {
+                let _ = ready_tx.send(Err(execution_boundary_message(error)));
+                return;
+            }
+        }
+    }
     if ready_tx.send(Ok(())).is_err() {
         // Opener gave up; nothing to serve.
         return;
@@ -469,13 +507,31 @@ async fn actor_main(
                 match maybe_cmd {
                     None => break, // all handles dropped -> tear down
                     Some(Command::Exec { js, opts, reply }) => {
-                        let report = do_exec(runtime.as_mut().unwrap(), cap.as_ref().unwrap(), &config.capture, &js, &opts).await;
+                        let current = active.as_mut().unwrap();
+                        let (report, watchdog_terminated) = do_exec(
+                            &mut current.runtime,
+                            &current.cap,
+                            &config.capture,
+                            &js,
+                            &opts,
+                            &current.heap_guard,
+                            &mut current.execution_watchdog,
+                        ).await;
+                        let close = watchdog_terminated || session_must_close(&current.heap_guard);
                         let _ = reply.send(report);
+                        if close { break; }
                     }
                     Some(Command::Serialize { reply }) => {
-                        serialize_dom(runtime.as_mut().unwrap());
-                        let html = cap.as_ref().unwrap().borrow().rendered_html.clone();
+                        let current = active.as_mut().unwrap();
+                        let guarded = current.heap_guard.run(|| serialize_dom(&mut current.runtime));
+                        let close = guarded.is_err();
+                        let html = if close {
+                            None
+                        } else {
+                            current.cap.borrow_mut().rendered_html.take()
+                        };
                         let _ = reply.send(html);
+                        if close { break; }
                     }
                     Some(Command::Navigate { url, reply }) => {
                         let mut old_dropped = false;
@@ -499,8 +555,7 @@ async fn actor_main(
                                     // a V8 HandleScope CHECK failure during the old
                                     // isolate's realm teardown (SetAlignedPointerIn-
                                     // EmbedderData creates a handle without a scope).
-                                    drop(runtime.take());
-                                    drop(cap.take());
+                                    drop(active.take());
                                     old_dropped = true;
 
                                     let nav_cfg = SessionConfig {
@@ -509,15 +564,12 @@ async fn actor_main(
                                         capture: config.capture.clone(),
                                     };
                                     match hydrate(&nav_cfg, &fetchers).await {
-                                        Ok((new_rt, new_cap)) => {
-                                            runtime = Some(new_rt);
-                                            cap = Some(new_cap);
-                                            pump_to_quiesce(runtime.as_mut().unwrap(), cap.as_ref().unwrap(), &config.capture)
-                                                .await;
-                                            NavReport {
-                                                ok: true,
-                                                url: Some(final_url),
-                                                error: None,
+                                        Ok(new_active) => {
+                                            active = Some(new_active);
+                                            let current = active.as_mut().unwrap();
+                                            match pump_to_quiesce(&mut current.runtime, &current.cap, &config.capture, &current.heap_guard, &mut current.execution_watchdog).await {
+                                                Ok(()) => NavReport { ok: true, url: Some(final_url), error: None },
+                                                Err(error) => NavReport { ok: false, url: None, error: Some(execution_boundary_message(error)) },
                                             }
                                         }
                                         Err(e) => NavReport {
@@ -536,14 +588,18 @@ async fn actor_main(
                         }
                     }
                     Some(Command::Act { actions, reply }) => {
+                        let current = active.as_mut().unwrap();
                         let report = do_act(
-                            runtime.as_mut().unwrap(),
-                            cap.as_ref().unwrap(),
+                            &mut current.runtime,
+                            &current.cap,
                             &config.capture,
                             &actions,
+                            &current.heap_guard,
                         )
                         .await;
+                        let close = session_must_close(&current.heap_guard);
                         let _ = reply.send(report);
+                        if close { break; }
                     }
                     Some(Command::Close { reply }) => {
                         let _ = reply.send(());
@@ -555,8 +611,29 @@ async fn actor_main(
                 // Keep background work (timers, in-flight fetches) progressing while
                 // idle-waiting for the next command. A drained loop returns fast, so
                 // this is not a busy-spin.
-                if let Some(rt) = runtime.as_mut() {
-                    let _ = poll_once(rt);
+                if let Some(current) = active.as_mut() {
+                    match run_with_execution_deadline(
+                        &mut current.runtime,
+                        &current.heap_guard,
+                        &mut current.execution_watchdog,
+                        Duration::from_millis(config.capture.capture_window_ms.max(1)),
+                        poll_once,
+                    ) {
+                        Ok(_) => {}
+                        Err(ExecutionBoundaryError::HeapLimit) => {
+                            current.cap.borrow_mut().push_log(&format!(
+                                "[raze.heap] {HEAP_LIMIT_DIAGNOSTIC}"
+                            ));
+                            break;
+                        }
+                        Err(ExecutionBoundaryError::Deadline) => {
+                            current.cap.borrow_mut().push_log(&format!(
+                                "[raze.watchdog] {EXECUTION_DEADLINE_DIAGNOSTIC}"
+                            ));
+                            break;
+                        }
+                        Err(ExecutionBoundaryError::WatchdogUnavailable) => break,
+                    }
                 }
             }
         }
@@ -571,7 +648,7 @@ async fn actor_main(
 async fn hydrate(
     config: &SessionConfig,
     fetchers: &SessionFetchers,
-) -> Result<(JsRuntime, Rc<RefCell<CaptureState>>), String> {
+) -> Result<ActiveRuntime, String> {
     crate::ensure_v8_flags();
 
     // The `!Send` fetchers were built on this thread at open and are reused for
@@ -580,7 +657,8 @@ async fn hydrate(
     let api_fetcher = fetchers.api.clone();
 
     let stub_body = normalize_stub_body(&config.capture.stub_response_json);
-    let modules: Rc<RefCell<HashMap<String, Vec<u8>>>> = Rc::new(RefCell::new(HashMap::new()));
+    let modules: Rc<RefCell<HashMap<String, SharedSource>>> = Rc::new(RefCell::new(HashMap::new()));
+    let inflight_module_fetches = Rc::new(RefCell::new(HashMap::new()));
     let inflight: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
     let cap = Rc::new(RefCell::new(CaptureState {
@@ -597,38 +675,67 @@ async fn hydrate(
         started: Instant::now(),
     }));
 
-    let mut runtime = JsRuntime::new(RuntimeOptions {
+    let mut runtime = TrackedJsRuntime::new(RuntimeOptions {
         startup_snapshot: Some(SNAPSHOT),
+        create_params: Some(crate::capture_create_params()),
         extensions: vec![draco_runtime_ext::init(cap.clone())],
         module_loader: Some(Rc::new(MapModuleLoader {
             modules: modules.clone(),
+            inflight_module_fetches,
             fetcher: fetcher.clone(),
             inflight: inflight.clone(),
             cap: cap.clone(),
         })),
         ..Default::default()
     });
+    let heap_guard = crate::install_near_heap_limit_guard(&mut runtime);
+    let mut execution_watchdog = ExecutionWatchdog::start(&mut runtime)
+        .map_err(|_| "failed to start V8 execution watchdog".to_string())?;
+    let execution_deadline = Duration::from_millis(config.capture.capture_window_ms.max(1));
 
     // Inputs + glue (build the happy-dom Window, install the fetch/XHR interceptor,
     // load the HTML).
     let url_lit = json_string_literal(&config.url);
     let html_lit = json_string_literal(&config.html);
     let stub_lit = json_string_literal(&stub_body);
-    runtime
-        .execute_script(
-            "draco:inputs",
-            format!(
-                "globalThis.__DRACO_URL__={url_lit}; globalThis.__DRACO_HTML__={html_lit}; \
+    run_with_execution_deadline(
+        &mut runtime,
+        &heap_guard,
+        &mut execution_watchdog,
+        execution_deadline,
+        |runtime| {
+            runtime.execute_script(
+                "draco:inputs",
+                format!(
+                    "globalThis.__DRACO_URL__={url_lit}; globalThis.__DRACO_HTML__={html_lit}; \
                  globalThis.__DRACO_STUB__={stub_lit};"
-            ),
-        )
-        .map_err(|e| format!("inputs: {e}"))?;
-    runtime
-        .execute_script("draco:glue", GLUE_JS)
-        .map_err(|e| format!("glue: {e}"))?;
+                ),
+            )
+        },
+    )
+    .map_err(execution_boundary_message)?
+    .map_err(|e| format!("inputs: {e}"))?;
+    run_with_execution_deadline(
+        &mut runtime,
+        &heap_guard,
+        &mut execution_watchdog,
+        execution_deadline,
+        |runtime| runtime.execute_script("draco:glue", GLUE_JS),
+    )
+    .map_err(execution_boundary_message)?
+    .map_err(|e| format!("glue: {e}"))?;
+    run_with_execution_deadline(
+        &mut runtime,
+        &heap_guard,
+        &mut execution_watchdog,
+        execution_deadline,
+        |runtime| runtime.execute_script("draco:release-inputs", RELEASE_INPUTS_JS),
+    )
+    .map_err(execution_boundary_message)?
+    .map_err(|e| format!("release-inputs: {e}"))?;
 
-    // Evaluate the page's scripts in document order (external fetched concurrently),
-    // pointing document.currentScript at the real parsed node per block.
+    // Evaluate in document order while the shared bounded helper overlaps each
+    // external fetch with at most its immediate successor.
     let scripts = extract_scripts(&config.html);
     let external: Vec<(usize, String)> = scripts
         .iter()
@@ -636,22 +743,28 @@ async fn hydrate(
         .filter(|(_, s)| !s.inline)
         .map(|(i, s)| (i, resolve_script_url(&config.url, &s.payload)))
         .collect();
-    let fetched = futures::future::join_all(external.iter().map(|(_, u)| fetcher.fetch(u))).await;
-    let mut ext_bytes: HashMap<usize, Vec<u8>> = HashMap::new();
-    for ((i, _), bytes) in external.iter().zip(fetched) {
-        if let Some(b) = bytes {
-            ext_bytes.insert(*i, b);
-        }
-    }
+    let mut external_prefetch = ExternalScriptPrefetch::new(
+        fetcher.as_ref(),
+        external.iter().map(|(index, url)| (*index, url.as_str())),
+        EXTERNAL_SCRIPT_PREFETCH_BYTES,
+    );
 
     for (i, script) in scripts.into_iter().enumerate() {
-        let (source, spec_str) = if script.inline {
+        let (source, spec_str, fetched_source) = if script.inline {
             let base = config.url.split('#').next().unwrap_or(&config.url);
-            (script.payload.clone(), format!("{base}#draco-inline-{i}"))
+            (
+                script.payload.clone(),
+                format!("{base}#draco-inline-{i}"),
+                None,
+            )
         } else {
             let resolved = resolve_script_url(&config.url, &script.payload);
-            match ext_bytes.remove(&i) {
-                Some(bytes) => (String::from_utf8_lossy(&bytes).into_owned(), resolved),
+            match external_prefetch.take(i).await {
+                Some(bytes) => (
+                    String::from_utf8_lossy(&bytes).into_owned(),
+                    resolved,
+                    Some(bytes),
+                ),
                 None => continue,
             }
         };
@@ -667,15 +780,33 @@ async fn hydrate(
                 json_string_literal(&spec_str)
             )
         };
-        let _ = runtime.execute_script("draco:currentScript", set_cs);
+        let _ = run_with_execution_deadline(
+            &mut runtime,
+            &heap_guard,
+            &mut execution_watchdog,
+            execution_deadline,
+            |runtime| runtime.execute_script("draco:currentScript", set_cs),
+        )
+        .map_err(execution_boundary_message)?;
 
         if script.module {
             match deno_core::url::Url::parse(&spec_str) {
                 Ok(spec_url) => {
-                    modules
-                        .borrow_mut()
-                        .insert(spec_url.as_str().to_string(), source.into_bytes());
-                    if let Err(e) = eval_module(&mut runtime, &spec_url).await {
+                    modules.borrow_mut().insert(
+                        spec_url.as_str().to_string(),
+                        fetched_source.unwrap_or_else(|| source.into_bytes().into()),
+                    );
+                    let evaluated = eval_module(
+                        &mut runtime,
+                        &spec_url,
+                        &modules,
+                        &heap_guard,
+                        &mut execution_watchdog,
+                        execution_deadline,
+                    )
+                    .await
+                    .map_err(execution_boundary_message)?;
+                    if let Err(e) = evaluated {
                         cap.borrow_mut()
                             .push_log(&format!("module script {i} threw: {e}"));
                     }
@@ -691,23 +822,54 @@ async fn hydrate(
             } else {
                 format!("draco:page[{i}]")
             };
-            if let Err(e) = runtime.execute_script(name, source) {
+            let executed = run_with_execution_deadline(
+                &mut runtime,
+                &heap_guard,
+                &mut execution_watchdog,
+                execution_deadline,
+                |runtime| runtime.execute_script(name, source),
+            )
+            .map_err(execution_boundary_message)?;
+            if let Err(e) = executed {
                 cap.borrow_mut()
                     .push_log(&format!("page script {i} threw: {e}"));
             }
         }
     }
-    let _ = runtime.execute_script(
-        "draco:currentScript:clear",
-        "try { globalThis.__dracoClearCurrentScript(); } catch (_) {}",
-    );
+    let _ = run_with_execution_deadline(
+        &mut runtime,
+        &heap_guard,
+        &mut execution_watchdog,
+        execution_deadline,
+        |runtime| {
+            runtime.execute_script(
+                "draco:currentScript:clear",
+                "try { globalThis.__dracoClearCurrentScript(); } catch (_) {}",
+            )
+        },
+    )
+    .map_err(execution_boundary_message)?;
     // Parsing-finished: fire readyState/DOMContentLoaded/load so gated boot code runs.
-    let _ = runtime.execute_script(
-        "draco:lifecycle",
-        "try { globalThis.__dracoFireLifecycle(); } catch (_) {}",
-    );
+    let _ = run_with_execution_deadline(
+        &mut runtime,
+        &heap_guard,
+        &mut execution_watchdog,
+        execution_deadline,
+        |runtime| {
+            runtime.execute_script(
+                "draco:lifecycle",
+                "try { globalThis.__dracoFireLifecycle(); } catch (_) {}",
+            )
+        },
+    )
+    .map_err(execution_boundary_message)?;
 
-    Ok((runtime, cap))
+    Ok(ActiveRuntime {
+        runtime,
+        cap,
+        heap_guard,
+        execution_watchdog,
+    })
 }
 
 /// Evaluate one turn's JS in page global scope, capture its completion value, then
@@ -726,7 +888,9 @@ async fn do_exec(
     cfg: &CaptureConfig,
     js: &str,
     opts: &ExecOptions,
-) -> ExecReport {
+    heap_guard: &HeapLimitGuard,
+    execution_watchdog: &mut ExecutionWatchdog,
+) -> (ExecReport, bool) {
     let log_start = cap.borrow().logs.len();
     // Clear any stale result so a turn that returns `undefined` reads back `None`.
     cap.borrow_mut().exec_result = None;
@@ -740,16 +904,76 @@ async fn do_exec(
     };
     let wrapped = build_exec_wrapper(js, budget);
     let mut error = None;
-    if let Err(e) = runtime.execute_script("draco:interact:exec", wrapped) {
-        error = Some(e.to_string());
-        cap.borrow_mut().push_log(&format!("exec threw: {e}"));
+    let mut close_session = false;
+    match run_with_execution_deadline(
+        runtime,
+        heap_guard,
+        execution_watchdog,
+        Duration::from_millis(cfg.capture_window_ms.max(1)),
+        |runtime| runtime.execute_script("draco:interact:exec", wrapped),
+    ) {
+        Err(ExecutionBoundaryError::HeapLimit) => {
+            error = Some(HEAP_LIMIT_DIAGNOSTIC.to_string());
+            cap.borrow_mut()
+                .push_log(&format!("[raze.heap] {HEAP_LIMIT_DIAGNOSTIC}"));
+        }
+        Err(ExecutionBoundaryError::Deadline) => {
+            error = Some(EXECUTION_DEADLINE_DIAGNOSTIC.to_string());
+            cap.borrow_mut()
+                .push_log(&format!("[raze.watchdog] {EXECUTION_DEADLINE_DIAGNOSTIC}"));
+            close_session = true;
+        }
+        Err(ExecutionBoundaryError::WatchdogUnavailable) => {
+            error = Some("V8 execution watchdog stopped unexpectedly".to_string());
+            close_session = true;
+        }
+        Ok(Err(e)) => {
+            error = Some(e.to_string());
+            cap.borrow_mut().push_log(&format!("exec threw: {e}"));
+        }
+        Ok(Ok(_)) => {}
     }
 
     // Always drain microtasks at least once so a purely-synchronous turn's value
     // (and DOM effects) are captured immediately; settle drives async turns.
-    let _ = poll_once(runtime);
-    if opts.settle {
-        pump_to_quiesce(runtime, cap, cfg).await;
+    if !close_session && !heap_guard.is_tripped() {
+        match run_with_execution_deadline(
+            runtime,
+            heap_guard,
+            execution_watchdog,
+            Duration::from_millis(cfg.capture_window_ms.max(1)),
+            poll_once,
+        ) {
+            Ok(_) => {}
+            Err(ExecutionBoundaryError::HeapLimit) => {
+                error = Some(HEAP_LIMIT_DIAGNOSTIC.to_string());
+                cap.borrow_mut()
+                    .push_log(&format!("[raze.heap] {HEAP_LIMIT_DIAGNOSTIC}"));
+            }
+            Err(ExecutionBoundaryError::Deadline) => {
+                error = Some(EXECUTION_DEADLINE_DIAGNOSTIC.to_string());
+                cap.borrow_mut()
+                    .push_log(&format!("[raze.watchdog] {EXECUTION_DEADLINE_DIAGNOSTIC}"));
+                close_session = true;
+            }
+            Err(ExecutionBoundaryError::WatchdogUnavailable) => {
+                error = Some("V8 execution watchdog stopped unexpectedly".to_string());
+                close_session = true;
+            }
+        }
+    }
+    if opts.settle && !close_session && !heap_guard.is_tripped() {
+        if let Err(boundary_error) =
+            pump_to_quiesce(runtime, cap, cfg, heap_guard, execution_watchdog).await
+        {
+            error = Some(execution_boundary_message(boundary_error));
+            close_session = true;
+        }
+    }
+    if heap_guard.is_tripped() && error.is_none() {
+        error = Some(HEAP_LIMIT_DIAGNOSTIC.to_string());
+        cap.borrow_mut()
+            .push_log(&format!("[raze.heap] {HEAP_LIMIT_DIAGNOSTIC}"));
     }
 
     let (logs, result) = {
@@ -786,12 +1010,15 @@ async fn do_exec(
         None if error.is_none() => Some(serde_json::json!({ "__undefined": true })),
         None => None,
     };
-    ExecReport {
-        ok: error.is_none(),
-        error,
-        result,
-        logs,
-    }
+    (
+        ExecReport {
+            ok: error.is_none(),
+            error,
+            result,
+            logs,
+        },
+        close_session,
+    )
 }
 
 /// Build the page-side exec wrapper: run the turn as an async body, then serialize
@@ -896,6 +1123,7 @@ async fn do_act(
     cap: &Rc<RefCell<CaptureState>>,
     cfg: &CaptureConfig,
     actions: &[Action],
+    heap_guard: &HeapLimitGuard,
 ) -> ActReport {
     let log_start = cap.borrow().logs.len();
     let mut steps: Vec<ActStep> = Vec::with_capacity(actions.len());
@@ -910,8 +1138,18 @@ async fn do_act(
             Action::Wait {
                 selector,
                 milliseconds,
-            } => wait_action(runtime, cap, cfg, selector.as_deref(), *milliseconds).await,
-            _ => run_action_snippet(runtime, cap, &build_action_js(action)),
+            } => {
+                wait_action(
+                    runtime,
+                    cap,
+                    cfg,
+                    selector.as_deref(),
+                    *milliseconds,
+                    heap_guard,
+                )
+                .await
+            }
+            _ => run_action_snippet(runtime, cap, &build_action_js(action), heap_guard),
         };
         let ok = outcome.is_ok();
         steps.push(ActStep {
@@ -924,7 +1162,13 @@ async fn do_act(
             break;
         }
         // Let the SPA react (modal mount, route render) before the next action.
-        pump_to_dom_settled(runtime, cap, cfg).await;
+        if pump_to_dom_settled(runtime, cap, cfg, heap_guard)
+            .await
+            .is_err()
+        {
+            all_ok = false;
+            break;
+        }
     }
 
     let logs = {
@@ -977,12 +1221,17 @@ fn run_action_snippet(
     runtime: &mut JsRuntime,
     cap: &Rc<RefCell<CaptureState>>,
     js: &str,
+    heap_guard: &HeapLimitGuard,
 ) -> Result<(), String> {
     cap.borrow_mut().exec_result = None;
-    if let Err(e) = runtime.execute_script("draco:interact:act", js.to_string()) {
-        return Err(format!("act snippet threw: {e}"));
+    match heap_guard.run(|| runtime.execute_script("draco:interact:act", js.to_string())) {
+        Err(_) => return Err(HEAP_LIMIT_DIAGNOSTIC.to_string()),
+        Ok(Err(e)) => return Err(format!("act snippet threw: {e}")),
+        Ok(Ok(_)) => {}
     }
-    let _ = poll_once(runtime);
+    let _ = heap_guard
+        .run(|| poll_once(runtime))
+        .map_err(|_| HEAP_LIMIT_DIAGNOSTIC.to_string())?;
     let raw = cap.borrow_mut().exec_result.take();
     match raw {
         Some(s) => {
@@ -1009,13 +1258,16 @@ async fn wait_action(
     cfg: &CaptureConfig,
     selector: Option<&str>,
     milliseconds: Option<u64>,
+    heap_guard: &HeapLimitGuard,
 ) -> Result<(), String> {
     let tick = Duration::from_millis(30);
     if let Some(ms) = milliseconds {
         let ms = ms.min(cfg.capture_window_ms.max(1));
         let start = Instant::now();
         while start.elapsed() < Duration::from_millis(ms) {
-            let _ = poll_once(runtime);
+            let _ = heap_guard
+                .run(|| poll_once(runtime))
+                .map_err(|_| HEAP_LIMIT_DIAGNOSTIC.to_string())?;
             tokio::time::sleep(tick).await;
         }
         return Ok(());
@@ -1028,10 +1280,16 @@ async fn wait_action(
     let ceiling = Duration::from_millis(cfg.capture_window_ms);
     let start = Instant::now();
     loop {
-        let _ = poll_once(runtime);
+        let _ = heap_guard
+            .run(|| poll_once(runtime))
+            .map_err(|_| HEAP_LIMIT_DIAGNOSTIC.to_string())?;
         cap.borrow_mut().exec_result = None;
-        let _ = runtime.execute_script("draco:interact:wait", check_js.clone());
-        let _ = poll_once(runtime);
+        let _ = heap_guard
+            .run(|| runtime.execute_script("draco:interact:wait", check_js.clone()))
+            .map_err(|_| HEAP_LIMIT_DIAGNOSTIC.to_string())?;
+        let _ = heap_guard
+            .run(|| poll_once(runtime))
+            .map_err(|_| HEAP_LIMIT_DIAGNOSTIC.to_string())?;
         if cap.borrow().exec_result.as_deref() == Some("1") {
             return Ok(());
         }
@@ -1138,7 +1396,8 @@ async fn pump_to_dom_settled(
     runtime: &mut JsRuntime,
     cap: &Rc<RefCell<CaptureState>>,
     cfg: &CaptureConfig,
-) {
+    heap_guard: &HeapLimitGuard,
+) -> Result<(), HeapLimitExceeded> {
     let start = Instant::now();
     let hard_cap = Duration::from_millis(cfg.capture_window_ms);
     let stability = Duration::from_millis(cfg.quiesce_ms.max(120));
@@ -1151,8 +1410,11 @@ async fn pump_to_dom_settled(
         // DOM further — microtasks are already flushed — so stop immediately once
         // any in-flight loads are done. Pages with a live interval stay `Pending`
         // and fall through to the stability-window / hard-cap checks below.
-        let drained = matches!(poll_once(runtime), std::task::Poll::Ready(_));
-        let size = probe_dom_size(runtime, cap);
+        let drained = matches!(
+            heap_guard.run(|| poll_once(runtime))?,
+            std::task::Poll::Ready(_)
+        );
+        let size = probe_dom_size(runtime, cap, heap_guard)?;
         if size != last_size {
             last_size = size;
             stable_since = Instant::now();
@@ -1168,18 +1430,23 @@ async fn pump_to_dom_settled(
         }
         tokio::time::sleep(tick).await;
     }
+    Ok(())
 }
 
 /// Cheap DOM-size probe (element count) via a one-shot page-scope script that
 /// hands the number back through `op_raze_exec_result`; `-1` if unavailable.
-fn probe_dom_size(runtime: &mut JsRuntime, cap: &Rc<RefCell<CaptureState>>) -> i64 {
+fn probe_dom_size(
+    runtime: &mut JsRuntime,
+    cap: &Rc<RefCell<CaptureState>>,
+    heap_guard: &HeapLimitGuard,
+) -> Result<i64, HeapLimitExceeded> {
     cap.borrow_mut().exec_result = None;
-    let _ = runtime.execute_script(
+    let _ = heap_guard.run(|| runtime.execute_script(
         "draco:interact:probe",
         r#"try { Deno.core.ops.op_raze_exec_result(String((document.getElementsByTagName("*") || []).length)); } catch (_e) {}"#
             .to_string(),
-    );
-    let _ = poll_once(runtime);
+    ))?;
+    let _ = heap_guard.run(|| poll_once(runtime))?;
     let n = cap
         .borrow()
         .exec_result
@@ -1187,7 +1454,7 @@ fn probe_dom_size(runtime: &mut JsRuntime, cap: &Rc<RefCell<CaptureState>>) -> i
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(-1);
     cap.borrow_mut().exec_result = None;
-    n
+    Ok(n)
 }
 
 /// Pump the event loop until it quiesces (no new content activity for `quiesce_ms`
@@ -1198,7 +1465,9 @@ async fn pump_to_quiesce(
     runtime: &mut JsRuntime,
     cap: &Rc<RefCell<CaptureState>>,
     cfg: &CaptureConfig,
-) {
+    heap_guard: &HeapLimitGuard,
+    execution_watchdog: &mut ExecutionWatchdog,
+) -> Result<(), ExecutionBoundaryError> {
     let start = Instant::now();
     let hard_cap = Duration::from_millis(cfg.capture_window_ms);
     let quiesce = Duration::from_millis(cfg.quiesce_ms);
@@ -1210,7 +1479,13 @@ async fn pump_to_quiesce(
     let mut last_activity = Instant::now();
 
     loop {
-        match poll_once(runtime) {
+        match run_with_execution_deadline(
+            runtime,
+            heap_guard,
+            execution_watchdog,
+            Duration::from_millis(cfg.capture_window_ms.max(1)),
+            poll_once,
+        )? {
             std::task::Poll::Ready(_) => break, // drained (or loop error) — done
             std::task::Poll::Pending => {}
         }
@@ -1231,5 +1506,30 @@ async fn pump_to_quiesce(
             break;
         }
         tokio::time::sleep(tick).await;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_heap_limit_policy_closes_before_second_turn() {
+        let guard = crate::HeapLimitGuard::new_for_test();
+        let mut accepted_turns = 0;
+
+        for turn in 0..2 {
+            if session_must_close(&guard) {
+                break;
+            }
+            accepted_turns += 1;
+            if turn == 0 {
+                guard.trip_for_test();
+            }
+        }
+
+        assert_eq!(accepted_turns, 1);
+        assert!(session_must_close(&guard));
     }
 }

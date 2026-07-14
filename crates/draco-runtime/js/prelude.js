@@ -55,8 +55,17 @@
             });
             let response;
             try {
-              response = JSON.parse(await Deno.core.ops.op_raze_fetch(payload));
+              response = await Deno.core.ops.op_raze_fetch(payload);
             } catch (_) {
+              response = null;
+            }
+            if (
+              !response ||
+              typeof response !== "object" ||
+              typeof response.status !== "number" ||
+              !Array.isArray(response.headers) ||
+              typeof response.body !== "string"
+            ) {
               response = {
                 status: 200,
                 headers: [["content-type", "application/json"]],
@@ -65,10 +74,10 @@
             }
 
             return new window.Response(
-              response && typeof response.body === "string" ? response.body : "{}",
+              response.body,
               {
-                status: (response && response.status) || 200,
-                headers: (response && response.headers) || [],
+                status: response.status,
+                headers: response.headers,
               },
             );
           },

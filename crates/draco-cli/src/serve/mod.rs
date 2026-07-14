@@ -43,7 +43,7 @@ use draco_core::{extract_with_pool, Config, FormatSet, Tier2Pool};
 use draco_types::{DracoError, ExtractionResult, Status};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::Semaphore;
+use tokio::sync::{oneshot, Semaphore};
 
 /// `POST /v1/batch/scrape` + `GET|DELETE /v1/batch/scrape/{id}` — async
 /// scrape-a-list-of-URLs jobs.
@@ -85,6 +85,7 @@ pub struct ServeOptions {
 pub(crate) struct AppState {
     pub(crate) defaults: Config,
     pub(crate) gate: Semaphore,
+    pub(crate) max_concurrency: usize,
     /// Warm Tier 2 isolate pool: reused across requests so each scrape skips the
     /// jail spawn + snapshot cost. Its sandbox posture is fixed from `defaults`
     /// at startup; a request overriding the posture falls back to a one-shot
@@ -114,12 +115,15 @@ pub async fn serve(opts: ServeOptions) -> Result<(), String> {
         opts.defaults.no_jail,
         opts.defaults.strict_sandbox,
     );
+    let max_concurrency = opts.max_concurrency.max(1);
+    let (crawl, batch) = jobs::JobStore::shared_pair();
     let state = Arc::new(AppState {
         defaults: opts.defaults,
-        gate: Semaphore::new(opts.max_concurrency.max(1)),
+        gate: Semaphore::new(max_concurrency),
+        max_concurrency,
         tier2_pool,
-        crawl: jobs::JobStore::default(),
-        batch: jobs::JobStore::default(),
+        crawl,
+        batch,
         #[cfg(feature = "tier2")]
         sessions: interact::SessionStore::new(opts.isolate_pool_size),
     });
@@ -133,15 +137,39 @@ pub async fn serve(opts: ServeOptions) -> Result<(), String> {
          warm isolate pool: {} workers",
         opts.isolate_pool_size
     );
+    let (maintenance_stop, maintenance_task) = spawn_job_maintenance(state.clone());
     let result = axum::serve(listener, router(state.clone()))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| format!("server error: {e}"));
+    let _ = maintenance_stop.send(());
+    let _ = maintenance_task.await;
     // Close live session actors before retiring the shared capture pool.
     #[cfg(feature = "tier2")]
     state.sessions.close_all().await;
     state.tier2_pool.shutdown();
     result
+}
+
+fn spawn_job_maintenance(
+    state: Arc<AppState>,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (stop_tx, mut stop_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let start = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut interval = tokio::time::interval_at(start, std::time::Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                _ = interval.tick() => {
+                    let now = std::time::SystemTime::now();
+                    state.crawl.reap_expired(now);
+                    state.batch.reap_expired(now);
+                }
+            }
+        }
+    });
+    (stop_tx, task)
 }
 
 fn router(state: Arc<AppState>) -> Router {
@@ -207,10 +235,40 @@ async fn shutdown_signal() {
 async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
     // `availableSlots` is the live free-concurrency count — a fleet gateway uses
     // it to steer away from a node that's near saturation before even trying it.
+    let available = state.gate.available_permits();
+    let crawl = state.crawl.stats();
+    let batch = state.batch.stats();
+    let total = state.crawl.global_stats();
+    let cache = draco_core::chunk_cache_stats();
+    let isolates = draco_core::isolate_stats();
+    #[cfg(feature = "tier2")]
+    let active_sessions = state.sessions.active_count();
+    #[cfg(not(feature = "tier2"))]
+    let active_sessions = 0usize;
     Json(json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
-        "availableSlots": state.gate.available_permits(),
+        "availableSlots": available,
+        "activeCaptures": state.max_concurrency.saturating_sub(available),
+        "jobs": {
+            "crawl": crawl,
+            "batch": batch,
+            "total": total,
+        },
+        "cache": {
+            "entries": cache.entries,
+            "payloadBytes": cache.payload_bytes,
+            "keyBytes": cache.key_bytes,
+            "capacity": cache.capacity,
+        },
+        "isolates": {
+            "created": isolates.created,
+            "dropped": isolates.dropped,
+            "active": isolates.active,
+        },
+        "sessions": {
+            "active": active_sessions,
+        },
     }))
 }
 
@@ -634,12 +692,14 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_state(defaults: Config) -> Arc<AppState> {
+        let (crawl, batch) = jobs::JobStore::shared_pair();
         Arc::new(AppState {
             defaults,
             gate: Semaphore::new(2),
+            max_concurrency: 2,
             tier2_pool: Tier2Pool::new(1, 100, true, false),
-            crawl: jobs::JobStore::default(),
-            batch: jobs::JobStore::default(),
+            crawl,
+            batch,
             #[cfg(feature = "tier2")]
             sessions: interact::SessionStore::new(1),
         })
@@ -980,6 +1040,40 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["status"], "ok");
         assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["activeCaptures"], 0);
+        assert_eq!(body["jobs"]["total"]["jobs"], 0);
+        assert_eq!(body["jobs"]["total"]["running"], 0);
+        assert_eq!(body["jobs"]["total"]["retainedBytes"], 0);
+        assert!(body["cache"]["entries"].is_u64());
+        assert!(body["cache"]["payloadBytes"].is_u64());
+        assert!(body["cache"]["keyBytes"].is_u64());
+        assert!(body["cache"]["capacity"].is_u64());
+        assert!(body["isolates"]["created"].is_u64());
+        assert!(body["isolates"]["dropped"].is_u64());
+        assert!(body["isolates"]["active"].is_u64());
+        assert_eq!(body["sessions"]["active"], 0);
+    }
+
+    #[tokio::test]
+    async fn health_job_total_does_not_double_count_shared_namespaces() {
+        let state = test_state(Config::default());
+        state.crawl.create_seeded().unwrap();
+        state.batch.create_with_total(1).unwrap();
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["jobs"]["crawl"]["jobs"], 1);
+        assert_eq!(body["jobs"]["batch"]["jobs"], 1);
+        assert_eq!(body["jobs"]["total"]["jobs"], 2);
+        assert_eq!(body["jobs"]["total"]["running"], 2);
     }
 
     #[tokio::test]

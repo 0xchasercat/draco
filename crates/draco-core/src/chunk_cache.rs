@@ -13,9 +13,9 @@
 //! # Layering
 //!
 //! * **RAM layer** — a least-recently-used map bounded by total payload bytes
-//!   (`RAM_BUDGET_BYTES`, 512 MiB). Keys are exact URL strings, values are
-//!   `Arc<Vec<u8>>`. A hit marks the entry most-recently-used; an insert
-//!   evicts least-recently-used entries until the budget is respected again.
+//!   (`RAM_BUDGET_BYTES`, 32 MiB). Keys are exact URL strings, values are
+//!   `Arc<[u8]>`. A hit marks the entry most-recently-used; an insert evicts
+//!   least-recently-used entries until the byte and entry caps are respected.
 //! * **Disk layer** — one file per chunk in `$HOME/.cache/draco/chunks`
 //!   (falling back to `<system temp>/draco/chunks` when `HOME` is unset),
 //!   each named with the hex of a 64-bit hash of the URL. Usage is capped at
@@ -62,14 +62,17 @@ use std::time::SystemTime;
 const MAGIC: &[u8] = b"DCC1";
 
 /// RAM layer budget: total cached payload bytes kept in memory.
-const RAM_BUDGET_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
+const RAM_BUDGET_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+
+/// Maximum number of RAM-resident keys, independent of payload size.
+const MAX_RAM_ENTRIES: usize = 4096;
 
 /// Disk layer cap (approximate, best-effort).
 const DISK_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 /// A single RAM-cached chunk plus its LRU bookkeeping.
 struct RamEntry {
-    bytes: Arc<Vec<u8>>,
+    bytes: Arc<[u8]>,
     /// Value of `LruInner::tick` when this entry was last touched.
     /// Larger means more recently used.
     last_used: u64,
@@ -88,6 +91,15 @@ struct LruInner {
     total_bytes: usize,
     /// Monotonic usage clock.
     tick: u64,
+}
+
+/// Logical ownership counters for the in-process RAM chunk cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RamCacheStats {
+    pub entries: usize,
+    pub payload_bytes: usize,
+    pub key_bytes: usize,
+    pub capacity: usize,
 }
 
 /// Two-tier (RAM + disk) cache for immutable, content-addressed web chunks.
@@ -112,6 +124,8 @@ pub(crate) struct ChunkCache {
     tmp_counter: AtomicU64,
 }
 
+static SHARED: OnceLock<Arc<ChunkCache>> = OnceLock::new();
+
 impl ChunkCache {
     /// Process-global singleton, lazily opened on first use.
     ///
@@ -119,7 +133,6 @@ impl ChunkCache {
     /// best-effort, and if the disk is unusable the cache simply degrades to
     /// its RAM layer (and ultimately to a pass-through miss).
     pub(crate) fn shared() -> Arc<ChunkCache> {
-        static SHARED: OnceLock<Arc<ChunkCache>> = OnceLock::new();
         Arc::clone(SHARED.get_or_init(|| {
             Arc::new(ChunkCache::open(
                 ChunkCache::default_dir(),
@@ -133,19 +146,19 @@ impl ChunkCache {
     ///
     /// A disk hit is promoted into the RAM layer so the next lookup is a
     /// memory hit.
-    pub(crate) fn get(&self, url: &str) -> Option<Vec<u8>> {
+    pub(crate) fn get(&self, url: &str) -> Option<Arc<[u8]>> {
         if let Some(bytes) = self.ram_get(url) {
-            return Some(bytes.as_ref().clone());
+            return Some(bytes);
         }
-        let chunk = self.disk_get(url)?;
-        self.ram_put(url, Arc::new(chunk.clone()));
+        let chunk: Arc<[u8]> = self.disk_get(url)?.into();
+        self.ram_put(url, Arc::clone(&chunk));
         Some(chunk)
     }
 
     /// Write-through to RAM + disk. Never panics; all errors are swallowed.
-    pub(crate) fn put(&self, url: &str, bytes: &[u8]) {
-        self.ram_put(url, Arc::new(bytes.to_vec()));
-        self.disk_put(url, bytes);
+    pub(crate) fn put(&self, url: &str, bytes: Arc<[u8]>) {
+        self.ram_put(url, Arc::clone(&bytes));
+        self.disk_put(url, &bytes);
     }
 
     // ------------------------------------------------------------------
@@ -207,8 +220,19 @@ impl ChunkCache {
         self.ram.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Snapshot RAM ownership counters while holding the cache lock once.
+    pub(crate) fn ram_stats(&self) -> RamCacheStats {
+        let inner = self.lock_ram();
+        RamCacheStats {
+            entries: inner.map.len(),
+            payload_bytes: inner.total_bytes,
+            key_bytes: inner.map.keys().map(String::len).sum(),
+            capacity: inner.map.capacity(),
+        }
+    }
+
     /// RAM lookup; marks the entry most-recently-used on hit.
-    fn ram_get(&self, url: &str) -> Option<Arc<Vec<u8>>> {
+    fn ram_get(&self, url: &str) -> Option<Arc<[u8]>> {
         let mut inner = self.lock_ram();
         inner.tick = inner.tick.wrapping_add(1);
         let now = inner.tick;
@@ -219,11 +243,12 @@ impl ChunkCache {
 
     /// RAM insert; evicts least-recently-used entries until the total payload
     /// size is back under budget.
-    fn ram_put(&self, url: &str, bytes: Arc<Vec<u8>>) {
+    fn ram_put(&self, url: &str, bytes: Arc<[u8]>) {
         let len = bytes.len();
-        if len > self.ram_budget {
+        if len == 0 || len > self.ram_budget {
             // Larger than the entire budget: admitting it would evict
-            // everything and still not fit, so skip the RAM layer entirely.
+            // everything and still not fit. Empty values consume metadata but
+            // no payload budget. Neither belongs in the RAM layer.
             return;
         }
         let mut inner = self.lock_ram();
@@ -244,7 +269,8 @@ impl ChunkCache {
         // The entry just inserted carries the highest tick, so it is always
         // the last candidate; because `len <= ram_budget` the loop stops
         // before ever reaching it.
-        while inner.total_bytes > self.ram_budget {
+        let mut evicted_count = 0usize;
+        while inner.total_bytes > self.ram_budget || inner.map.len() > MAX_RAM_ENTRIES {
             let victim = inner
                 .map
                 .iter()
@@ -254,9 +280,18 @@ impl ChunkCache {
             match inner.map.remove(&victim) {
                 Some(evicted) => {
                     inner.total_bytes = inner.total_bytes.saturating_sub(evicted.bytes.len());
+                    evicted_count += 1;
                 }
                 None => break,
             }
+        }
+
+        // HashMap never releases buckets on remove. Reclaim them only after a
+        // substantial eviction and only when capacity is far above live keys,
+        // avoiding resize churn near either steady-state cap.
+        let shrink_target = inner.map.len().saturating_mul(4).max(64);
+        if evicted_count >= 64 && inner.map.capacity() > shrink_target {
+            inner.map.shrink_to(shrink_target);
         }
     }
 
@@ -418,6 +453,23 @@ impl Drop for ResetOnDrop<'_> {
     }
 }
 
+pub(crate) fn shared_stats() -> crate::ChunkCacheStats {
+    shared_stats_from(&SHARED)
+}
+
+fn shared_stats_from(shared: &OnceLock<Arc<ChunkCache>>) -> crate::ChunkCacheStats {
+    let Some(cache) = shared.get() else {
+        return crate::ChunkCacheStats::default();
+    };
+    let stats = cache.ram_stats();
+    crate::ChunkCacheStats {
+        entries: stats.entries,
+        payload_bytes: stats.payload_bytes,
+        key_bytes: stats.key_bytes,
+        capacity: stats.capacity,
+    }
+}
+
 /// Parses an on-disk record and returns the chunk bytes, but only if the
 /// record is well formed *and* was stored for exactly `expected_url`.
 ///
@@ -456,6 +508,151 @@ fn scan_dir_bytes(dir: &Path) -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn stats_on_uninitialized_shared_cache_do_not_initialize_or_touch_disk() {
+        let shared = OnceLock::new();
+        let dir = unique_test_dir("uninitialized-shared-stats");
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(!dir.exists());
+
+        let stats = shared_stats_from(&shared);
+
+        assert_eq!(stats, crate::ChunkCacheStats::default());
+        assert!(shared.get().is_none());
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn shared_ram_cache_budget_stays_compact() {
+        assert!(ChunkCache::shared().ram_budget <= 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn ram_stats_reports_entries_bytes_and_capacity() {
+        let base = unique_test_dir("ram-stats");
+        let cache = ChunkCache::with_dir_for_test(blocked_disk_dir(&base), 100, u64::MAX);
+        assert_eq!(cache.ram_stats().capacity, 0);
+
+        cache.put("a", Arc::from([1u8; 20]));
+        cache.put("beta", Arc::from([2u8; 30]));
+
+        let stats = cache.ram_stats();
+        assert_eq!(stats.entries, 2);
+        assert_eq!(stats.payload_bytes, 50);
+        assert_eq!(stats.key_bytes, 5);
+        assert!(stats.capacity >= stats.entries);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ram_stats_tracks_replacement_and_eviction() {
+        let base = unique_test_dir("ram-stats-eviction");
+        let cache = ChunkCache::with_dir_for_test(blocked_disk_dir(&base), 60, u64::MAX);
+
+        cache.put("first", Arc::from([1u8; 30]));
+        cache.put("second", Arc::from([2u8; 30]));
+        cache.put("second", Arc::from([3u8; 20]));
+        cache.put("third", Arc::from([4u8; 30]));
+
+        let stats = cache.ram_stats();
+        assert_eq!(stats.entries, 2);
+        assert_eq!(stats.payload_bytes, 50);
+        assert_eq!(stats.key_bytes, "second".len() + "third".len());
+        assert!(stats.capacity >= stats.entries);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ram_hit_returns_the_same_shared_payload() {
+        let base = unique_test_dir("ram-shared-payload");
+        let cache = ChunkCache::with_dir_for_test(blocked_disk_dir(&base), 100, u64::MAX);
+
+        cache.put("shared", Arc::from(&b"payload"[..]));
+        let first = cache.get("shared").expect("first RAM hit");
+        let second = cache.get("shared").expect("second RAM hit");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ram_rejects_empty_payloads_and_caps_tiny_unique_entries() {
+        let base = unique_test_dir("ram-entry-cap");
+        let cache = ChunkCache::with_dir_for_test(blocked_disk_dir(&base), usize::MAX, u64::MAX);
+
+        cache.put("empty", Arc::from(&b""[..]));
+        for i in 0..(MAX_RAM_ENTRIES + 500) {
+            cache.put(&format!("tiny-{i}"), Arc::from([i as u8]));
+        }
+
+        let stats = cache.ram_stats();
+        assert_eq!(cache.get("empty"), None);
+        assert_eq!(stats.entries, MAX_RAM_ENTRIES);
+        assert_eq!(stats.payload_bytes, MAX_RAM_ENTRIES);
+        assert!(stats.capacity <= stats.entries.saturating_mul(4).max(64));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ten_thousand_unique_empty_and_tiny_urls_plateau_ram_metadata() {
+        let base = unique_test_dir("ram-10k-plateau");
+        let cache = ChunkCache::with_dir_for_test(blocked_disk_dir(&base), usize::MAX, u64::MAX);
+
+        for i in 0..10_000 {
+            cache.put(
+                &format!("https://cdn.example.test/empty/{i}"),
+                Arc::from(&b""[..]),
+            );
+            cache.put(
+                &format!("https://cdn.example.test/tiny/{i}"),
+                Arc::from([i as u8]),
+            );
+        }
+
+        let stats = cache.ram_stats();
+        assert_eq!(stats.entries, MAX_RAM_ENTRIES);
+        assert_eq!(stats.payload_bytes, MAX_RAM_ENTRIES);
+        assert!(stats.key_bytes <= MAX_RAM_ENTRIES * 40);
+        assert!(stats.capacity <= stats.entries.saturating_mul(4).max(64));
+        assert_eq!(cache.get("https://cdn.example.test/empty/9999"), None);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn empty_payload_remains_a_valid_disk_record() {
+        let dir = unique_test_dir("disk-empty");
+        let url = "https://cdn.example.test/empty.js";
+        let writer = ChunkCache::with_dir_for_test(dir.clone(), 64, u64::MAX);
+        writer.put(url, Arc::from(&b""[..]));
+
+        let reader = ChunkCache::with_dir_for_test(dir.clone(), 64, u64::MAX);
+        assert_eq!(reader.get(url).as_deref(), Some(&b""[..]));
+        assert_eq!(reader.ram_stats().entries, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ram_plateaus_at_both_byte_and_entry_caps() {
+        let base = unique_test_dir("ram-byte-entry-plateau");
+        let cache = ChunkCache::with_dir_for_test(blocked_disk_dir(&base), 64, u64::MAX);
+
+        for i in 0..(MAX_RAM_ENTRIES + 500) {
+            cache.put(&format!("entry-{i}"), Arc::from([i as u8; 2]));
+        }
+
+        let stats = cache.ram_stats();
+        assert!(stats.entries <= MAX_RAM_ENTRIES);
+        assert!(stats.payload_bytes <= 64);
+        assert_eq!(stats.entries, 32);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
     /// Fresh, uniquely named directory under the system temp dir. Never the
     /// real `$HOME` cache location.
     fn unique_test_dir(tag: &str) -> PathBuf {
@@ -491,13 +688,13 @@ mod tests {
         // RAM budget of 100 bytes; disk disabled via an uncreatable dir.
         let cache = ChunkCache::with_dir_for_test(blocked_disk_dir(&base), 100, u64::MAX);
 
-        cache.put("a", &[1u8; 40]);
-        cache.put("b", &[2u8; 40]);
+        cache.put("a", Arc::from([1u8; 40]));
+        cache.put("b", Arc::from([2u8; 40]));
         // Touch "a" so "b" becomes the least-recently-used entry.
         assert_eq!(cache.get("a").as_deref(), Some(&[1u8; 40][..]));
 
         // 120 bytes > 100 budget: the LRU entry ("b") must be evicted.
-        cache.put("c", &[3u8; 40]);
+        cache.put("c", Arc::from([3u8; 40]));
         assert_eq!(cache.get("b"), None, "oldest (LRU) entry should be evicted");
         assert_eq!(
             cache.get("a").as_deref(),
@@ -518,10 +715,10 @@ mod tests {
         let base = unique_test_dir("ram-oversize");
         let cache = ChunkCache::with_dir_for_test(blocked_disk_dir(&base), 100, u64::MAX);
 
-        cache.put("small", &[1u8; 30]);
+        cache.put("small", Arc::from([1u8; 30]));
         // 200 bytes > 100-byte budget: never admitted to RAM (and the disk
         // layer is disabled here), so it simply cannot be cached.
-        cache.put("huge", &[9u8; 200]);
+        cache.put("huge", Arc::from([9u8; 200]));
         assert_eq!(cache.get("huge"), None);
         // The oversized put must not have nuked existing entries.
         assert_eq!(cache.get("small").as_deref(), Some(&[1u8; 30][..]));
@@ -538,12 +735,12 @@ mod tests {
 
         {
             let writer = ChunkCache::with_dir_for_test(dir.clone(), 1024 * 1024, u64::MAX);
-            writer.put(url_a, &payload);
+            writer.put(url_a, Arc::from(payload.clone()));
         }
 
         // Fresh instance: RAM is empty, so this hit must come from disk.
         let cache = ChunkCache::with_dir_for_test(dir.clone(), 1024 * 1024, u64::MAX);
-        assert_eq!(cache.get(url_a), Some(payload.clone()));
+        assert_eq!(cache.get(url_a).as_deref(), Some(payload.as_slice()));
 
         // Simulate a filename hash collision: url_b's slot holds a record
         // that was written for url_a. The embedded-URL check must miss.
@@ -559,9 +756,9 @@ mod tests {
         // A disk hit promotes into RAM: remove the file and the chunk must
         // still be served (from memory) by the instance that read it.
         let promoted = ChunkCache::with_dir_for_test(dir.clone(), 1024 * 1024, u64::MAX);
-        assert_eq!(promoted.get(url_a), Some(payload.clone())); // disk hit + promote
+        assert_eq!(promoted.get(url_a).as_deref(), Some(payload.as_slice())); // disk hit + promote
         let _ = fs::remove_file(&path_a);
-        assert_eq!(promoted.get(url_a), Some(payload.clone())); // RAM hit
+        assert_eq!(promoted.get(url_a).as_deref(), Some(payload.as_slice())); // RAM hit
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -601,7 +798,7 @@ mod tests {
         let cache = ChunkCache::with_dir_for_test(dir.clone(), 64, 10_000);
         let chunk = vec![7u8; 3000];
         for i in 0..5 {
-            cache.put(&format!("u{i}"), &chunk);
+            cache.put(&format!("u{i}"), Arc::from(chunk.clone()));
             // Distinct mtimes so "oldest first" is deterministic (any
             // filesystem with sub-50ms mtime granularity).
             std::thread::sleep(std::time::Duration::from_millis(50));

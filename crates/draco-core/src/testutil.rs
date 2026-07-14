@@ -334,6 +334,23 @@ impl MockCapture {
         }
     }
 
+    /// Capture yields interceptable requests alongside a serialized hydrated
+    /// DOM. Request bodies stay positionally aligned with the candidates.
+    pub fn rendered_with_candidates(dom: impl Into<String>, candidates: Vec<Candidate>) -> Self {
+        let bodies = vec![None; candidates.len()];
+        Self {
+            result: Ok(CaptureResult {
+                candidates,
+                bodies,
+                outcome: RuntimeOutcome::Quiesced,
+                sandbox_level: Some(Self::MOCK_LEVEL.to_string()),
+                rendered_html: Some(dom.into()),
+                logs: Vec::new(),
+            }),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
     /// Capture fails with the given error (spawn/protocol/killed).
     pub fn failing(e: DracoError) -> Self {
         Self {

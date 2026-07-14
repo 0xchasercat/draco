@@ -213,7 +213,14 @@ pub(crate) async fn start_handler(
         config,
     };
 
-    let id = state.crawl.create_seeded();
+    let id = match state.crawl.create_seeded() {
+        Ok(id) => id,
+        Err(_) => {
+            let mut body = error_body("async job capacity exhausted");
+            body["status"] = json!("saturated");
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(body));
+        }
+    };
     let sink = super::webhook::WebhookSink::new(req.webhook, id.clone(), "crawl");
     tokio::spawn(run_crawl(state.clone(), id.clone(), plan, sink));
 
@@ -595,6 +602,7 @@ mod tests {
     // ---- handlers -----------------------------------------------------------
 
     fn test_state() -> Arc<AppState> {
+        let (crawl, batch) = crate::serve::jobs::JobStore::shared_pair();
         Arc::new(AppState {
             defaults: Config {
                 force_render: false,
@@ -603,9 +611,10 @@ mod tests {
                 ..Config::default()
             },
             gate: Semaphore::new(2),
+            max_concurrency: 2,
             tier2_pool: draco_core::Tier2Pool::new(1, 100, true, false),
-            crawl: Default::default(),
-            batch: Default::default(),
+            crawl,
+            batch,
             #[cfg(feature = "tier2")]
             sessions: Default::default(),
         })
@@ -798,7 +807,7 @@ mod tests {
         let state = test_state();
         // Create a job directly (no worker) — cancellation is a store-level
         // contract; the worker only ever observes the flag.
-        let id = state.crawl.create_seeded();
+        let id = state.crawl.create_seeded().unwrap();
         let app = crawl_router(state.clone());
         let resp = app
             .clone()

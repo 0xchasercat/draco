@@ -8,7 +8,14 @@
 //! and V8 flags are process-global. Running these in one process is fine, but we
 //! keep each test self-contained and tolerant of the shared platform.
 
-use draco_runtime::{run_capture, CaptureConfig};
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use draco_runtime::{run_capture, CaptureConfig, ScriptFetcher, SharedSource};
 use draco_types::{InterceptVia, RuntimeOutcome};
 
 mod common;
@@ -28,6 +35,82 @@ fn find<'a>(
     needle: &str,
 ) -> Option<&'a draco_runtime::CapturedRequest> {
     reqs.iter().find(|r| r.url.contains(needle))
+}
+
+#[test]
+fn synchronous_page_loop_is_terminated() {
+    let mut config = cfg();
+    config.capture_window_ms = 100;
+    config.quiesce_ms = 20;
+    let started = Instant::now();
+
+    let report = run_capture(
+        "https://loop.example.com/",
+        "<!doctype html><html><body><script>while (true) {}</script></body></html>",
+        &config,
+        null_fetcher(),
+    );
+
+    assert_eq!(report.outcome, RuntimeOutcome::Terminated);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "busy loop exceeded watchdog budget: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        report
+            .logs
+            .iter()
+            .any(|line| line.contains("execution deadline")),
+        "missing watchdog diagnostic: {:?}",
+        report.logs
+    );
+}
+
+#[test]
+fn synchronous_module_page_loop_is_terminated() {
+    let mut config = cfg();
+    config.capture_window_ms = 100;
+    config.quiesce_ms = 20;
+    let started = Instant::now();
+
+    let report = run_capture(
+        "https://module-loop.example.com/",
+        "<!doctype html><html><body><script type=\"module\">while (true) {}</script></body></html>",
+        &config,
+        null_fetcher(),
+    );
+
+    assert_eq!(report.outcome, RuntimeOutcome::Terminated);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(
+        report
+            .logs
+            .iter()
+            .any(|line| line.contains("execution deadline")),
+        "missing module watchdog diagnostic: {:?}",
+        report.logs
+    );
+}
+
+#[test]
+fn normal_capture_does_not_wait_for_watchdog_deadline() {
+    let mut config = cfg();
+    config.capture_window_ms = 5_000;
+    let started = Instant::now();
+    let report = run_capture(
+        "https://fast.example.com/",
+        "<!doctype html><html><body><script>document.title = 'done';</script></body></html>",
+        &config,
+        null_fetcher(),
+    );
+
+    assert_ne!(report.outcome, RuntimeOutcome::Terminated);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "normal completion waited for sleeping watchdog: {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
@@ -505,11 +588,20 @@ fn hydrated_dom_is_serialized_for_render_then_markdown() {
 
 #[test]
 fn static_body_content_survives_to_serialized_dom() {
-    // Even with no JS mutation, the serialized DOM reflects the materialized body
-    // (the polyfill builds a real node tree from the injected body markup), so the
-    // render path degrades gracefully to the static body.
+    // The glue has already materialized the static body by the time page scripts
+    // run, so the raw HTML/stub bootstrap strings can be released without losing
+    // the DOM. The URL remains available to page/runtime code.
     let html = r#"<html><head></head><body>
         <article><h1>Static Heading</h1><p>Plain server body text.</p></article>
+        <script>
+          document.body.setAttribute(
+            'data-bootstrap-inputs',
+            typeof globalThis.__DRACO_HTML__ === 'undefined' &&
+            typeof globalThis.__DRACO_STUB__ === 'undefined' &&
+            globalThis.__DRACO_URL__ === 'https://static.example.com/'
+              ? 'released' : 'retained'
+          );
+        </script>
       </body></html>"#;
     let report = run_capture("https://static.example.com/", html, &cfg(), null_fetcher());
 
@@ -522,10 +614,31 @@ fn static_body_content_survives_to_serialized_dom() {
         dom.contains("Plain server body text."),
         "missing static body: {dom}"
     );
+    assert!(
+        dom.contains(r#"data-bootstrap-inputs="released""#),
+        "bootstrap inputs were retained or the URL was cleared: {dom}"
+    );
 }
 
 // ---- ES-module + external-script support (map-backed fetcher) --------
-use std::collections::HashMap;
+
+struct OutOfOrderFetcher(HashMap<String, SharedSource>);
+
+impl ScriptFetcher for OutOfOrderFetcher {
+    fn fetch<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Option<SharedSource>> + 'a>> {
+        let source = self.0.get(url).map(Arc::clone);
+        let delay_first = url.ends_with("/s0.js");
+        Box::pin(async move {
+            if delay_first {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            source
+        })
+    }
+}
 
 #[test]
 fn external_classic_script_from_resources_executes() {
@@ -544,6 +657,57 @@ fn external_classic_script_from_resources_executes() {
     let req =
         find(&report.requests, "/api/products").expect("no /api/products from external script");
     assert_eq!(req.via, InterceptVia::Fetch);
+}
+
+#[test]
+fn external_scripts_execute_in_order_with_bounded_prefetch_retention() {
+    const SCRIPT_BYTES: usize = 6 * 1024 * 1024;
+    const MAX_EXPECTED_PEAK: usize = 18 * 1024 * 1024;
+    let html = r#"<!doctype html><html><body>
+        <script src="/s0.js"></script>
+        <script src="/s1.js"></script>
+        <script src="/s2.js"></script>
+        <script src="/s3.js"></script>
+        <script>document.body.setAttribute('data-order', globalThis.__order.join(','));</script>
+      </body></html>"#;
+    let mut resources: HashMap<String, SharedSource> = HashMap::new();
+    for i in 0..4 {
+        let mut source =
+            format!("globalThis.__order ||= []; globalThis.__order.push({i});\n").into_bytes();
+        source.resize(SCRIPT_BYTES, b' ');
+        resources.insert(
+            format!("https://prefetch.example.com/s{i}.js"),
+            source.into(),
+        );
+    }
+
+    let report = run_capture(
+        "https://prefetch.example.com/",
+        html,
+        &cfg(),
+        Rc::new(OutOfOrderFetcher(resources)),
+    );
+    let dom = report.rendered_html.expect("serialized DOM");
+    assert!(
+        dom.contains(r#"data-order="0,1,2,3""#),
+        "external scripts ran out of document order: {dom}"
+    );
+    let retained_peak = report
+        .logs
+        .iter()
+        .filter(|line| line.starts_with("[raze.memory] "))
+        .filter_map(|line| {
+            line.split_whitespace()
+                .find_map(|field| field.strip_prefix("retained_external_script_bytes="))
+                .and_then(|value| value.parse::<usize>().ok())
+        })
+        .max()
+        .expect("external retention telemetry");
+    assert!(
+        retained_peak <= MAX_EXPECTED_PEAK,
+        "retained external source peak {retained_peak} exceeded {MAX_EXPECTED_PEAK}: {:?}",
+        report.logs
+    );
 }
 
 #[test]

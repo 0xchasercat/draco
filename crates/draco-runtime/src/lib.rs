@@ -63,9 +63,11 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
-use std::sync::Once;
-use std::task::Poll;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, Once, OnceLock};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use deno_core::{
@@ -76,13 +78,307 @@ use deno_core::{
 use deno_error::JsErrorBox;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use draco_types::{InterceptVia, RuntimeOutcome};
 
 /// Interact sessions — a resumable isolate driven turn-by-turn (v0.17.0).
 /// Reuses this module's capture primitives; see `session` for the actor model.
 pub mod session;
+
+/// Bound the per-page V8 heap so allocation-heavy SPAs trigger collection
+/// instead of growing toward V8's device-derived multi-gigabyte default.
+const MIB: usize = 1024 * 1024;
+const CAPTURE_MAX_HEAP_BYTES: usize = 192 * MIB;
+
+/// Process-lifetime V8 isolate ownership counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IsolateStats {
+    pub created: u64,
+    pub dropped: u64,
+    pub active: u64,
+}
+
+#[derive(Default)]
+struct IsolateCounters {
+    stats: Mutex<IsolateStats>,
+}
+
+impl IsolateCounters {
+    fn track(&'static self) -> IsolateLifecycleGuard {
+        let mut stats = self.stats.lock().unwrap_or_else(|p| p.into_inner());
+        stats.created = stats.created.saturating_add(1);
+        stats.active = stats.active.saturating_add(1);
+        IsolateLifecycleGuard { counters: self }
+    }
+
+    fn snapshot(&self) -> IsolateStats {
+        *self.stats.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+fn isolate_counters() -> &'static IsolateCounters {
+    static COUNTERS: OnceLock<IsolateCounters> = OnceLock::new();
+    COUNTERS.get_or_init(IsolateCounters::default)
+}
+
+/// Snapshot the process-lifetime isolate lifecycle counters.
+pub fn isolate_stats() -> IsolateStats {
+    isolate_counters().snapshot()
+}
+
+struct IsolateLifecycleGuard {
+    counters: &'static IsolateCounters,
+}
+
+impl Drop for IsolateLifecycleGuard {
+    fn drop(&mut self) {
+        let mut stats = self
+            .counters
+            .stats
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        stats.dropped = stats.dropped.saturating_add(1);
+        stats.active = stats.active.saturating_sub(1);
+    }
+}
+
+/// Owns a production isolate and its lifecycle guard. Rust drops struct fields
+/// in declaration order, so `runtime` tears down before `_lifecycle` decrements
+/// the active counter.
+pub(crate) struct TrackedJsRuntime {
+    runtime: JsRuntime,
+    _lifecycle: IsolateLifecycleGuard,
+}
+
+impl TrackedJsRuntime {
+    fn new(options: RuntimeOptions) -> Self {
+        let runtime = JsRuntime::new(options);
+        Self {
+            runtime,
+            _lifecycle: isolate_counters().track(),
+        }
+    }
+}
+
+impl Deref for TrackedJsRuntime {
+    type Target = JsRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        &self.runtime
+    }
+}
+
+impl DerefMut for TrackedJsRuntime {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.runtime
+    }
+}
+
+fn capture_create_params() -> deno_core::v8::CreateParams {
+    deno_core::v8::CreateParams::default().heap_limits(0, CAPTURE_MAX_HEAP_BYTES)
+}
+
+/// Turn a near-heap-limit condition into a catchable execution termination.
+/// Doubling the current limit gives V8 enough headroom to unwind cleanly; the
+/// configured starting limit remains [`CAPTURE_MAX_HEAP_BYTES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeapLimitExceeded;
+
+#[derive(Clone)]
+pub(crate) struct HeapLimitGuard {
+    tripped: Rc<Cell<bool>>,
+}
+
+impl HeapLimitGuard {
+    fn new() -> Self {
+        Self {
+            tripped: Rc::new(Cell::new(false)),
+        }
+    }
+
+    fn is_tripped(&self) -> bool {
+        self.tripped.get()
+    }
+
+    fn check(&self) -> Result<(), HeapLimitExceeded> {
+        if self.is_tripped() {
+            Err(HeapLimitExceeded)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn run<T>(&self, operation: impl FnOnce() -> T) -> Result<T, HeapLimitExceeded> {
+        self.check()?;
+        let value = operation();
+        self.check()?;
+        Ok(value)
+    }
+
+    #[cfg(test)]
+    fn new_for_test() -> Self {
+        Self::new()
+    }
+
+    #[cfg(test)]
+    fn trip_for_test(&self) {
+        self.tripped.set(true);
+    }
+}
+
+fn install_near_heap_limit_guard(runtime: &mut JsRuntime) -> HeapLimitGuard {
+    let guard = HeapLimitGuard::new();
+    let callback_guard = guard.clone();
+    let handle = runtime.v8_isolate().thread_safe_handle();
+    runtime.add_near_heap_limit_callback(move |current_limit, _initial_limit| {
+        callback_guard.tripped.set(true);
+        handle.terminate_execution();
+        current_limit.saturating_mul(2)
+    });
+    guard
+}
+
+const HEAP_LIMIT_DIAGNOSTIC: &str = "V8 heap limit reached; isolate terminated and abandoned";
+pub(crate) const EXECUTION_DEADLINE_DIAGNOSTIC: &str =
+    "V8 execution deadline reached; isolate terminated and abandoned";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionBoundaryError {
+    HeapLimit,
+    Deadline,
+    WatchdogUnavailable,
+}
+
+pub(crate) struct ExecutionWatchdog {
+    commands: Option<mpsc::SyncSender<WatchdogCommand>>,
+    join: Option<std::thread::JoinHandle<()>>,
+    tripped_generation: Arc<AtomicU64>,
+    next_generation: u64,
+}
+
+enum WatchdogCommand {
+    Arm {
+        generation: u64,
+        deadline: Duration,
+    },
+    Disarm {
+        generation: u64,
+        acknowledged: mpsc::SyncSender<()>,
+    },
+    Shutdown,
+}
+
+impl ExecutionWatchdog {
+    pub(crate) fn start(runtime: &mut JsRuntime) -> Result<Self, ExecutionBoundaryError> {
+        let handle = runtime.v8_isolate().thread_safe_handle();
+        let (commands, command_rx) = mpsc::sync_channel(1);
+        let tripped_generation = Arc::new(AtomicU64::new(0));
+        let thread_tripped = Arc::clone(&tripped_generation);
+        let join = std::thread::Builder::new()
+            .name("draco-v8-watchdog".to_string())
+            .spawn(move || loop {
+                match command_rx.recv() {
+                    Ok(WatchdogCommand::Arm {
+                        generation,
+                        deadline,
+                    }) => match command_rx.recv_timeout(deadline) {
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            thread_tripped.store(generation, Ordering::Release);
+                            handle.terminate_execution();
+                        }
+                        Ok(WatchdogCommand::Disarm {
+                            generation: disarmed_generation,
+                            acknowledged,
+                        }) if disarmed_generation == generation => {
+                            let _ = acknowledged.send(());
+                        }
+                        Ok(WatchdogCommand::Disarm { acknowledged, .. }) => {
+                            let _ = acknowledged.send(());
+                        }
+                        Ok(WatchdogCommand::Shutdown)
+                        | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Ok(WatchdogCommand::Arm { .. }) => {
+                            // Arms are serialized by synchronous disarm acknowledgements.
+                            break;
+                        }
+                    },
+                    Ok(WatchdogCommand::Disarm { acknowledged, .. }) => {
+                        // The deadline won the race; acknowledge the late disarm.
+                        let _ = acknowledged.send(());
+                    }
+                    Ok(WatchdogCommand::Shutdown) | Err(_) => break,
+                }
+            })
+            .map_err(|_| ExecutionBoundaryError::WatchdogUnavailable)?;
+        Ok(Self {
+            commands: Some(commands),
+            join: Some(join),
+            tripped_generation,
+            next_generation: 0,
+        })
+    }
+
+    fn arm(&mut self, deadline: Duration) -> Result<u64, ExecutionBoundaryError> {
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        let generation = self.next_generation;
+        self.commands
+            .as_ref()
+            .ok_or(ExecutionBoundaryError::WatchdogUnavailable)?
+            .send(WatchdogCommand::Arm {
+                generation,
+                deadline,
+            })
+            .map_err(|_| ExecutionBoundaryError::WatchdogUnavailable)?;
+        Ok(generation)
+    }
+
+    fn disarm(&mut self, generation: u64) -> Result<bool, ExecutionBoundaryError> {
+        let (acknowledged, ack_rx) = mpsc::sync_channel(1);
+        self.commands
+            .as_ref()
+            .ok_or(ExecutionBoundaryError::WatchdogUnavailable)?
+            .send(WatchdogCommand::Disarm {
+                generation,
+                acknowledged,
+            })
+            .map_err(|_| ExecutionBoundaryError::WatchdogUnavailable)?;
+        ack_rx
+            .recv()
+            .map_err(|_| ExecutionBoundaryError::WatchdogUnavailable)?;
+        Ok(self.tripped_generation.load(Ordering::Acquire) == generation)
+    }
+
+    fn stop(&mut self) {
+        if let Some(commands) = self.commands.take() {
+            let _ = commands.send(WatchdogCommand::Shutdown);
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for ExecutionWatchdog {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+pub(crate) fn run_with_execution_deadline<T>(
+    runtime: &mut JsRuntime,
+    heap_guard: &HeapLimitGuard,
+    watchdog: &mut ExecutionWatchdog,
+    deadline: Duration,
+    operation: impl FnOnce(&mut JsRuntime) -> T,
+) -> Result<T, ExecutionBoundaryError> {
+    let generation = watchdog.arm(deadline)?;
+    let result = heap_guard.run(|| operation(runtime));
+    if watchdog.disarm(generation)? {
+        return Err(ExecutionBoundaryError::Deadline);
+    }
+    result.map_err(|_| ExecutionBoundaryError::HeapLimit)
+}
 
 // ===================================================================
 // Public API (Slice 4 wires this into the jail child)
@@ -149,20 +445,24 @@ pub struct CaptureReport {
     pub logs: Vec<String>,
 }
 
+/// Immutable script/module bytes shared across caches, registries, and fetchers.
+pub type SharedSource = Arc<[u8]>;
+
 /// Async, in-process source of script / module / chunk bytes for the isolate.
 ///
 /// The runtime itself stays network-agnostic: `draco-core` implements this over
 /// its pooled `draco-net` client (plus the immutable chunk cache), and the isolate
-/// `.await`s it directly on the event loop. Because the module loader *and* the
-/// dynamic-`<script>` op both await this, V8 fans out concurrent chunk loads
-/// natively — no prefetch, no IPC, no blocking round-trip. `None` rejects exactly
-/// that one load, the way a browser treats a 404'd chunk.
+/// `.await`s it directly on the event loop. The module loader and
+/// dynamic-`<script>` op await this directly; parser-inserted external scripts use
+/// a bounded two-script lookahead while preserving document order. There is no IPC
+/// or blocking round-trip. `None` rejects exactly that one load, the way a browser
+/// treats a 404'd chunk.
 ///
 /// The future is `!Send` on purpose: the whole capture is single-threaded (V8 is
 /// thread-bound), so loads are driven on the isolate's own event loop as a
 /// [`LocalBoxFuture`], matching deno_core's `boxed_local` module-loader idiom.
 pub trait ScriptFetcher {
-    fn fetch<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, Option<Vec<u8>>>;
+    fn fetch<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, Option<SharedSource>>;
 }
 
 /// A page-side network request the isolate wants to make (`window.fetch` /
@@ -340,16 +640,23 @@ const MAX_RUNTIME_LOGS: usize = 96;
 const MAX_LOG_CHARS: usize = 1_024;
 
 impl CaptureState {
+    fn take_output_buffers(&mut self) -> (Vec<CapturedRequest>, Option<String>, Vec<String>) {
+        (
+            std::mem::take(&mut self.requests),
+            self.rendered_html.take(),
+            std::mem::take(&mut self.logs),
+        )
+    }
+
     /// Append one diagnostic line, enforcing the count cap, truncating overlong
     /// lines on a char boundary, and **deduplicating exact repeats**. A framework
     /// warning emitted once per component (e.g. a CSS-variable warn ×25) would
     /// otherwise exhaust the line budget and evict the one error that explains the
     /// failure; each distinct line carries all the diagnostic signal its repeats
-    /// would. Silently drops lines past the cap.
+    /// would. At the cap, structured `[raze.memory]` records may evict the oldest
+    /// ordinary record so phase telemetry survives page-log saturation; ordinary
+    /// records are still silently dropped.
     fn push_log(&mut self, line: &str) {
-        if self.logs.len() >= MAX_RUNTIME_LOGS {
-            return;
-        }
         let mut s: String = line.chars().take(MAX_LOG_CHARS).collect();
         if s.len() < line.len() {
             s.push('…');
@@ -357,6 +664,19 @@ impl CaptureState {
         // Bounded scan (≤ MAX_RUNTIME_LOGS entries): an exact repeat adds nothing.
         if self.logs.contains(&s) {
             return;
+        }
+        if self.logs.len() >= MAX_RUNTIME_LOGS {
+            if !s.starts_with("[raze.memory] ") {
+                return;
+            }
+            let Some(ordinary_index) = self
+                .logs
+                .iter()
+                .position(|existing| !existing.starts_with("[raze.memory] "))
+            else {
+                return;
+            };
+            self.logs.remove(ordinary_index);
         }
         self.logs.push(s);
     }
@@ -372,6 +692,18 @@ struct RawRequest {
     headers: Vec<(String, String)>,
     #[serde(default)]
     body: Option<String>,
+}
+
+/// Structured response crossing the Rust/V8 op boundary. Keeping the body as a
+/// string is intentional: page API responses have historically been decoded
+/// with `String::from_utf8_lossy`, and changing that policy would alter SPA
+/// behavior. `serde_v8` serializes this value directly into a JS object, avoiding
+/// the former JSON string envelope around an already-JSON-shaped response.
+#[derive(Serialize)]
+struct ApiResponseWire {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: String,
 }
 
 /// Known third-party analytics / session-replay / ad / tag-manager / bot-detection
@@ -450,8 +782,8 @@ fn is_tracker(url: &str) -> bool {
 // Ops
 // ===================================================================
 
-/// Record an intercepted request, then return the response JSON the page should
-/// see: `{"status":u16,"headers":[[k,v]],"body":"..."}`.
+/// Record an intercepted request, then return the structured response the page
+/// should see: `{status:u16, headers:[[k,v]], body:"..."}`.
 ///
 /// **Async.** Recording (and the `max_intercepts` cap) happens synchronously up
 /// front — so `discover` sees every endpoint regardless of the response — then the
@@ -468,11 +800,11 @@ fn is_tracker(url: &str) -> bool {
 /// `op_sleep`); state is taken as `Rc<RefCell<OpState>>` and every borrow is
 /// dropped before the `.await`.
 #[deno_core::op2]
-#[string]
+#[serde]
 async fn op_raze_fetch(
     state: Rc<RefCell<OpState>>,
     #[string] request_json: String,
-) -> Result<String, deno_error::JsErrorBox> {
+) -> Result<ApiResponseWire, deno_error::JsErrorBox> {
     let raw: RawRequest = serde_json::from_str(&request_json)
         .map_err(|e| deno_error::JsErrorBox::generic(format!("op_raze_fetch bad payload: {e}")))?;
 
@@ -540,6 +872,47 @@ async fn op_raze_fetch(
         None => None,
     };
 
+    // Decode the real byte body exactly as before: invalid UTF-8 is replaced via
+    // `from_utf8_lossy`. Constructing the serde wire value here lets the bounded
+    // runtime log compare bytes received from the API with the Rust decoded UTF-8
+    // string's byte length, without adding public report fields.
+    let (resp, log_kind, raw_body_len, decoded_utf8_len) = match live {
+        Some(r) => {
+            let raw_body_len = r.body.len();
+            let body = String::from_utf8_lossy(&r.body).into_owned();
+            let decoded_utf8_len = body.len();
+            (
+                ApiResponseWire {
+                    status: r.status,
+                    headers: r.headers,
+                    body,
+                },
+                "live",
+                raw_body_len,
+                decoded_utf8_len,
+            )
+        }
+        // Synthetic stub: always 200 + the configured body + a JSON content-type
+        // so `res.json()` works page-side and hydration keeps moving.
+        None => {
+            let body_len = stub_body.len();
+            (
+                ApiResponseWire {
+                    status: 200,
+                    headers: vec![("content-type".to_string(), "application/json".to_string())],
+                    body: stub_body,
+                },
+                if render_mode {
+                    "stub(declined/failed)"
+                } else {
+                    "stub(observe)"
+                },
+                body_len,
+                body_len,
+            )
+        }
+    };
+
     // Observability (surfaced under `--runtime-log`): record what the broker did
     // with THIS request — the one signal that says whether a data-driven page's
     // fetch actually fired and what came back. `live` = a real draco-net response
@@ -547,44 +920,18 @@ async fn op_raze_fetch(
     // mode but the policy withheld it or the live fetch failed; `stub(observe)` =
     // Observe mode's built-in synthetic stub. Logged in a short borrow that opens
     // and closes after every `.await` above.
-    let (log_status, log_len, log_kind) = match &live {
-        Some(r) => (r.status, r.body.len(), "live"),
-        None if render_mode => (200u16, stub_body.len(), "stub(declined/failed)"),
-        None => (200u16, stub_body.len(), "stub(observe)"),
-    };
     {
         let op_state = state.borrow();
         let cap = op_state.borrow::<Rc<RefCell<CaptureState>>>().clone();
         let mut cs = cap.borrow_mut();
         let t = cs.started.elapsed().as_millis();
         let line = format!(
-            "[+{t}ms] [raze.fetch] {} {} → {log_status} ({log_len}b, {log_kind})",
-            api_req.method, api_req.url
+            "[+{t}ms] [raze.fetch] {} {} → {} (raw={}b, decoded_utf8={}b, {log_kind})",
+            api_req.method, api_req.url, resp.status, raw_body_len, decoded_utf8_len
         );
         cs.push_log(&line);
     }
-
-    let resp = match live {
-        Some(r) => {
-            // Real response bytes are lossy-decoded to a JS string (API data is
-            // text/JSON). Headers → a JSON array of [k,v] pairs `makeResponse` reads.
-            let headers =
-                serde_json::to_value(&r.headers).unwrap_or_else(|_| serde_json::json!([]));
-            serde_json::json!({
-                "status": r.status,
-                "headers": headers,
-                "body": String::from_utf8_lossy(&r.body).into_owned(),
-            })
-        }
-        // Synthetic stub: always 200 + the configured body + a JSON content-type
-        // so `res.json()` works page-side and hydration keeps moving.
-        None => serde_json::json!({
-            "status": 200,
-            "headers": [["content-type", "application/json"]],
-            "body": stub_body,
-        }),
-    };
-    Ok(resp.to_string())
+    Ok(resp)
 }
 
 /// Load a dynamic script chunk on demand — in-process and asynchronously — through
@@ -733,6 +1080,11 @@ const PRELUDE_JS: &str = include_str!("../js/prelude.js");
 /// fetched HTML so the framework's mount container exists.
 const GLUE_JS: &str = include_str!("../js/glue.js");
 
+/// Release large bootstrap payloads after the glue has materialized the live DOM.
+/// The page URL remains available for resolution and runtime compatibility.
+const RELEASE_INPUTS_JS: &str =
+    "delete globalThis.__DRACO_HTML__; delete globalThis.__DRACO_STUB__;";
+
 /// Compatibility shims that depend on the freshly mirrored DOM globals.
 const RUNTIME_COVERAGE_JS: &str = include_str!("../js/runtime_coverage.js");
 
@@ -744,11 +1096,12 @@ const RUNTIME_COVERAGE_JS: &str = include_str!("../js/runtime_coverage.js");
 /// in-process async [`ScriptFetcher`] (pooled `draco-net` + immutable chunk cache).
 ///
 /// Resolution order:
-///   1. **In-capture registry** — an entry source registered before evaluation, or
-///      a module already fetched earlier this capture (dedup).
-///   2. **Async fetch** — otherwise pulled via `fetcher`, concurrently with any
-///      sibling imports the event loop is driving, then cached back into the
-///      registry so a later `import` of the same URL is a hit.
+///   1. **Pending entry registry** — concurrent loader calls may clone the same
+///      shared Arc while deno_core loads a parser entry graph.
+///   2. **Async fetch** — dependencies are otherwise pulled via `fetcher`,
+///      concurrently with sibling imports. Duplicate loader calls share one
+///      in-flight future; after they finish, V8's module map owns later import
+///      deduplication and the coalescer releases its source.
 ///   3. **Honest failure** — a module that cannot be fetched rejects the import
 ///      with a real *load* error.
 ///
@@ -763,22 +1116,75 @@ const RUNTIME_COVERAGE_JS: &str = include_str!("../js/runtime_coverage.js");
 ///
 /// `load` returns [`ModuleLoadResponse::Async`] so module fetching is driven on
 /// the event loop rather than compiled synchronously inside V8's dynamic-import
-/// host callback: the whole graph is pulled concurrently and registered before
-/// evaluation, so a re-entrant `import()` during evaluation resolves against an
-/// already-loaded module (deno_core's fast path) instead of forcing a fresh
-/// recursive load from inside the callback. THIS is the concurrency that makes
-/// code-split SPAs load their chunks in parallel instead of one blocking IPC round
-/// trip at a time.
+/// host callback: the whole graph is pulled concurrently and accepted into the
+/// module map before evaluation, so a re-entrant `import()` resolves against an
+/// already-loaded module instead of forcing a fresh recursive loader call. This
+/// concurrency lets code-split SPAs load chunks in parallel instead of paying one
+/// blocking IPC round trip at a time.
 struct MapModuleLoader {
-    /// In-capture module registry + dedup cache: entry sources registered before
-    /// evaluation, plus the bytes of modules already fetched this capture.
-    modules: Rc<RefCell<HashMap<String, Vec<u8>>>>,
+    /// Parser entry sources retained only while deno_core loads their graph.
+    modules: Rc<RefCell<HashMap<String, SharedSource>>>,
+    /// One shared network future per dependency URL, retained only while loader
+    /// waiters exist for that URL.
+    inflight_module_fetches: Rc<RefCell<HashMap<String, SharedModuleFetch>>>,
     /// In-process async source for `import` / `import()` chunk bytes (net + cache).
     fetcher: Rc<dyn ScriptFetcher>,
     /// Shared in-flight-load counter (see [`CaptureState::inflight`]).
     inflight: Rc<Cell<u32>>,
     /// Capture state, for surfacing module-load misses as diagnostics.
     cap: Rc<RefCell<CaptureState>>,
+}
+
+type SharedModuleFetchFuture =
+    futures::future::Shared<LocalBoxFuture<'static, Option<SharedSource>>>;
+
+struct SharedModuleFetch {
+    future: SharedModuleFetchFuture,
+    waiters: usize,
+    retained_bytes: Rc<Cell<usize>>,
+}
+
+struct InflightLoadGuard {
+    inflight: Rc<Cell<u32>>,
+}
+
+impl InflightLoadGuard {
+    fn new(inflight: Rc<Cell<u32>>) -> Self {
+        inflight.set(inflight.get() + 1);
+        Self { inflight }
+    }
+}
+
+impl Drop for InflightLoadGuard {
+    fn drop(&mut self) {
+        self.inflight.set(self.inflight.get().saturating_sub(1));
+    }
+}
+
+struct ModuleFetchWaiterGuard {
+    key: String,
+    fetches: Rc<RefCell<HashMap<String, SharedModuleFetch>>>,
+}
+
+impl Drop for ModuleFetchWaiterGuard {
+    fn drop(&mut self) {
+        let remove = {
+            let mut fetches = self.fetches.borrow_mut();
+            match fetches.get_mut(&self.key) {
+                Some(entry) => {
+                    entry.waiters = entry.waiters.saturating_sub(1);
+                    entry.waiters == 0
+                }
+                None => false,
+            }
+        };
+        if remove {
+            // Dropping the stored Shared future can cancel the underlying fetch.
+            // Keep that drop outside the RefCell borrow to avoid re-entrancy.
+            let removed = { self.fetches.borrow_mut().remove(&self.key) };
+            drop(removed);
+        }
+    }
 }
 
 impl ModuleLoader for MapModuleLoader {
@@ -798,32 +1204,72 @@ impl ModuleLoader for MapModuleLoader {
         _options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
         let modules = self.modules.clone();
+        let inflight_module_fetches = self.inflight_module_fetches.clone();
         let fetcher = self.fetcher.clone();
         let inflight = self.inflight.clone();
         let cap = self.cap.clone();
         let spec = module_specifier.clone();
 
+        // Parser entries are already available and may be requested concurrently
+        // while their graph is loading. Every response shares the same Arc bytes.
+        if let Some(bytes) = modules.borrow().get(spec.as_str()).map(Arc::clone) {
+            return ModuleLoadResponse::Async(
+                async move { Ok(js_module_source(&bytes, &spec)) }.boxed_local(),
+            );
+        }
+
+        // Acquire/create dependency work synchronously so concurrent load() calls
+        // cannot both start the same network request before either future polls.
+        let key = spec.as_str().to_string();
+        let shared_fetch = {
+            let mut fetches = inflight_module_fetches.borrow_mut();
+            if let Some(existing) = fetches.get_mut(&key) {
+                existing.waiters = existing.waiters.saturating_add(1);
+                existing.future.clone()
+            } else {
+                let fetcher = fetcher.clone();
+                let inflight = inflight.clone();
+                let fetch_url = key.clone();
+                let retained_bytes = Rc::new(Cell::new(0));
+                let retained_bytes_for_fetch = retained_bytes.clone();
+                let future = async move {
+                    let _inflight_guard = InflightLoadGuard::new(inflight);
+                    let fetched = fetcher.fetch(&fetch_url).await;
+                    retained_bytes_for_fetch.set(
+                        fetched
+                            .as_ref()
+                            .map(|source| source.len())
+                            .unwrap_or_default(),
+                    );
+                    fetched
+                }
+                .boxed_local()
+                .shared();
+                fetches.insert(
+                    key.clone(),
+                    SharedModuleFetch {
+                        future: future.clone(),
+                        waiters: 1,
+                        retained_bytes,
+                    },
+                );
+                future
+            }
+        };
+        let waiter_guard = ModuleFetchWaiterGuard {
+            key: key.clone(),
+            fetches: inflight_module_fetches.clone(),
+        };
+
         ModuleLoadResponse::Async(
             async move {
-                let key = spec.as_str();
-
-                // 1. Already registered or fetched earlier this capture.
-                if let Some(bytes) = modules.borrow().get(key).cloned() {
-                    return Ok(js_module_source(&bytes, &spec));
-                }
-
-                // 2. Fetch it in-process/async (net + chunk cache), concurrently
-                //    with any sibling imports the event loop is driving; cache the
-                //    result so a later import of the same URL is a registry hit.
-                inflight.set(inflight.get() + 1);
-                let fetched = fetcher.fetch(key).await;
-                inflight.set(inflight.get().saturating_sub(1));
+                let _waiter_guard = waiter_guard;
+                let fetched = shared_fetch.await;
                 if let Some(bytes) = fetched {
-                    modules.borrow_mut().insert(key.to_string(), bytes.clone());
                     return Ok(js_module_source(&bytes, &spec));
                 }
 
-                // 3. Genuinely unavailable: reject THIS import honestly instead of
+                // Genuinely unavailable: reject THIS import honestly instead of
                 //    poisoning the graph with a silent empty module. Surface the
                 //    miss — a route/entry chunk that fails to load stalls hydration
                 //    and would otherwise look like an unexplained empty render.
@@ -841,6 +1287,51 @@ impl ModuleLoader for MapModuleLoader {
             .boxed_local(),
         )
     }
+}
+
+/// Sum source payloads retained in a map without cloning any values.
+fn retained_source_bytes<K>(sources: &HashMap<K, SharedSource>) -> usize {
+    sources.values().map(|source| source.len()).sum()
+}
+
+fn log_module_fetches(
+    cap: &Rc<RefCell<CaptureState>>,
+    phase: &str,
+    fetches: &Rc<RefCell<HashMap<String, SharedModuleFetch>>>,
+    inflight: &Rc<Cell<u32>>,
+) {
+    let fetches = fetches.borrow();
+    let retained_bytes: usize = fetches
+        .values()
+        .map(|fetch| fetch.retained_bytes.get())
+        .sum();
+    cap.borrow_mut().push_log(&format!(
+        "[raze.module-fetches] phase={phase} entries={} retained_bytes={retained_bytes} inflight={}",
+        fetches.len(),
+        inflight.get(),
+    ));
+}
+
+/// Record one V8/source-retention sample through the existing bounded capture log.
+fn log_memory_phase(
+    runtime: &mut JsRuntime,
+    cap: &Rc<RefCell<CaptureState>>,
+    phase: &str,
+    module_registry_bytes: usize,
+    retained_external_script_bytes: usize,
+) {
+    let heap = runtime.v8_isolate().get_heap_statistics();
+    cap.borrow_mut().push_log(&format!(
+        "[raze.memory] phase={phase} used_heap_size={} total_heap_size={} \
+         total_physical_size={} external_memory={} heap_size_limit={} \
+         module_registry_bytes={module_registry_bytes} \
+         retained_external_script_bytes={retained_external_script_bytes}",
+        heap.used_heap_size(),
+        heap.total_heap_size(),
+        heap.total_physical_size(),
+        heap.external_memory(),
+        heap.heap_size_limit(),
+    ));
 }
 
 /// Build a JavaScript [`ModuleSource`] from raw chunk bytes (lossy-decoded — page
@@ -866,6 +1357,128 @@ struct PageScript {
     payload: String,
 }
 
+const EXTERNAL_SCRIPT_PREFETCH_BYTES: usize = 16 * 1024 * 1024;
+
+enum ExternalFetchState<'a> {
+    Pending(LocalBoxFuture<'a, Option<SharedSource>>),
+    Ready(Option<SharedSource>),
+    Taken,
+}
+
+struct ExternalFetchSlot<'a> {
+    script_index: usize,
+    state: ExternalFetchState<'a>,
+}
+
+/// External-script fetches with a two-script lookahead window and bounded
+/// completed-source retention. Only the current document-order target and its
+/// immediate external successor are polled; one result may cross the soft byte
+/// budget because its size is unknown until completion.
+struct ExternalScriptPrefetch<'a> {
+    slots: Vec<ExternalFetchSlot<'a>>,
+    budget: usize,
+    retained_bytes: usize,
+    peak_retained_bytes: usize,
+}
+
+impl<'a> ExternalScriptPrefetch<'a> {
+    fn new(
+        fetcher: &'a dyn ScriptFetcher,
+        external: impl IntoIterator<Item = (usize, &'a str)>,
+        budget: usize,
+    ) -> Self {
+        Self {
+            slots: external
+                .into_iter()
+                .map(|(script_index, url)| ExternalFetchSlot {
+                    script_index,
+                    state: ExternalFetchState::Pending(fetcher.fetch(url)),
+                })
+                .collect(),
+            budget,
+            retained_bytes: 0,
+            peak_retained_bytes: 0,
+        }
+    }
+
+    fn poll_slot(&mut self, position: usize, cx: &mut Context<'_>) -> bool {
+        let completed = match &mut self.slots[position].state {
+            ExternalFetchState::Pending(future) => match future.as_mut().poll(cx) {
+                Poll::Ready(source) => Some(source),
+                Poll::Pending => None,
+            },
+            ExternalFetchState::Ready(_) | ExternalFetchState::Taken => return false,
+        };
+        let Some(source) = completed else {
+            return false;
+        };
+        if let Some(bytes) = &source {
+            self.retained_bytes = self.retained_bytes.saturating_add(bytes.len());
+            self.peak_retained_bytes = self.peak_retained_bytes.max(self.retained_bytes);
+        }
+        self.slots[position].state = ExternalFetchState::Ready(source);
+        true
+    }
+
+    fn target_ready(&self, position: usize) -> bool {
+        matches!(self.slots[position].state, ExternalFetchState::Ready(_))
+    }
+
+    fn poll_ahead(&mut self, target: usize, cx: &mut Context<'_>) -> bool {
+        let mut completed = self.poll_slot(target, cx);
+        if self.retained_bytes < self.budget {
+            if let Some(next) = target
+                .checked_add(1)
+                .filter(|next| *next < self.slots.len())
+            {
+                completed |= self.poll_slot(next, cx);
+            }
+        }
+        completed
+    }
+
+    async fn take(&mut self, script_index: usize) -> Option<SharedSource> {
+        let position = self
+            .slots
+            .iter()
+            .position(|slot| slot.script_index == script_index)?;
+        loop {
+            if self.target_ready(position) {
+                // One non-blocking pass starts/harvests later fetches before this
+                // source is released for execution.
+                futures::future::poll_fn(|cx| {
+                    self.poll_ahead(position, cx);
+                    Poll::Ready(())
+                })
+                .await;
+                let state =
+                    std::mem::replace(&mut self.slots[position].state, ExternalFetchState::Taken);
+                if let ExternalFetchState::Ready(source) = state {
+                    if let Some(bytes) = &source {
+                        self.retained_bytes = self.retained_bytes.saturating_sub(bytes.len());
+                    }
+                    return source;
+                }
+                unreachable!("target readiness checked before take");
+            }
+
+            futures::future::poll_fn(|cx| {
+                let completed = self.poll_ahead(position, cx);
+                if self.target_ready(position) || completed {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
+    }
+
+    fn peak_retained_bytes(&self) -> usize {
+        self.peak_retained_bytes
+    }
+}
+
 async fn run_capture_inner(
     url: &str,
     html: &str,
@@ -878,11 +1491,10 @@ async fn run_capture_inner(
     // `--runtime-log` shows where a heavy render spends its wall + V8-CPU time.
     let t0 = Instant::now();
 
-    // In-capture module registry + dedup cache (starts empty — no prefetch). The
-    // module loader fills it on demand via `fetcher`; `<script type="module">`,
-    // `import()`, and webpack/Next dynamic `<script src>` chunks all resolve through
-    // the same in-process async fetch path.
-    let modules: Rc<RefCell<HashMap<String, Vec<u8>>>> = Rc::new(RefCell::new(HashMap::new()));
+    // One-time parser-entry handoff map. Dependency sources are fetched on demand
+    // and passed straight into deno_core; V8's module map owns later deduplication.
+    let modules: Rc<RefCell<HashMap<String, SharedSource>>> = Rc::new(RefCell::new(HashMap::new()));
+    let inflight_module_fetches = Rc::new(RefCell::new(HashMap::new()));
     // Shared in-flight-load counter: keeps the capture window open while chunks or
     // modules are still being pulled concurrently.
     let inflight: Rc<Cell<u32>> = Rc::new(Cell::new(0));
@@ -902,47 +1514,107 @@ async fn run_capture_inner(
     }));
 
     // Restore the DOM-engine snapshot and register the ops for this isolate.
-    let mut runtime = JsRuntime::new(RuntimeOptions {
+    let mut runtime = TrackedJsRuntime::new(RuntimeOptions {
         startup_snapshot: Some(SNAPSHOT),
+        create_params: Some(capture_create_params()),
         extensions: vec![draco_runtime_ext::init(cap.clone())],
         module_loader: Some(Rc::new(MapModuleLoader {
             modules: modules.clone(),
+            inflight_module_fetches: inflight_module_fetches.clone(),
             fetcher: fetcher.clone(),
             inflight: inflight.clone(),
             cap: cap.clone(),
         })),
         ..Default::default()
     });
+    let heap_guard = install_near_heap_limit_guard(&mut runtime);
+    let execution_deadline = Duration::from_millis(cfg.capture_window_ms.max(1));
+    let mut execution_watchdog = match ExecutionWatchdog::start(&mut runtime) {
+        Ok(watchdog) => watchdog,
+        Err(_) => {
+            return finish(
+                cap.clone(),
+                RuntimeOutcome::Terminated,
+                Some("failed to start V8 execution watchdog".to_string()),
+            )
+        }
+    };
+    macro_rules! v8_boundary {
+        ($operation:expr) => {{
+            let generation = match execution_watchdog.arm(execution_deadline) {
+                Ok(generation) => generation,
+                Err(_) => {
+                    return finish(
+                        cap.clone(),
+                        RuntimeOutcome::Terminated,
+                        Some("failed to start V8 execution watchdog".to_string()),
+                    )
+                }
+            };
+            let guarded = heap_guard.run(|| $operation);
+            let timed_out = match execution_watchdog.disarm(generation) {
+                Ok(timed_out) => timed_out,
+                Err(_) => {
+                    return finish(
+                        cap.clone(),
+                        RuntimeOutcome::Terminated,
+                        Some("V8 execution watchdog stopped unexpectedly".to_string()),
+                    )
+                }
+            };
+            if timed_out {
+                return execution_deadline_capture_report(cap.clone());
+            }
+            match guarded {
+                Ok(value) => value,
+                Err(_) => return heap_limit_capture_report(cap.clone()),
+            }
+        }};
+    }
+    log_memory_phase(&mut runtime, &cap, "snapshot", 0, 0);
 
     // 1. Install hooks that must precede Window construction, inject page inputs,
     //    then run the glue and its post-mirror compatibility layer.
-    if let Err(e) = runtime.execute_script("draco:prelude", PRELUDE_JS) {
+    if let Err(e) = v8_boundary!(runtime.execute_script("draco:prelude", PRELUDE_JS)) {
         return finish(cap, RuntimeOutcome::Threw, Some(e.to_string()));
     }
     let url_lit = json_string_literal(url);
     let html_lit = json_string_literal(html);
     let stub_lit = json_string_literal(&stub_body);
-    if let Err(e) = runtime.execute_script(
+    if let Err(e) = v8_boundary!(runtime.execute_script(
         "draco:inputs",
         format!(
             "globalThis.__DRACO_URL__={url_lit}; globalThis.__DRACO_HTML__={html_lit}; \
              globalThis.__DRACO_STUB__={stub_lit};"
         ),
-    ) {
+    )) {
         return finish(cap, RuntimeOutcome::Threw, Some(e.to_string()));
     }
-    if let Err(e) = runtime.execute_script("draco:glue", GLUE_JS) {
+    if let Err(e) = v8_boundary!(runtime.execute_script("draco:glue", GLUE_JS)) {
         return finish(cap, RuntimeOutcome::Threw, Some(e.to_string()));
     }
-    if let Err(e) = runtime.execute_script("draco:runtime-coverage", RUNTIME_COVERAGE_JS) {
+    if let Err(e) = v8_boundary!(runtime.execute_script("draco:release-inputs", RELEASE_INPUTS_JS))
+    {
         return finish(cap, RuntimeOutcome::Threw, Some(e.to_string()));
     }
+    if let Err(e) =
+        v8_boundary!(runtime.execute_script("draco:runtime-coverage", RUNTIME_COVERAGE_JS))
+    {
+        return finish(cap, RuntimeOutcome::Threw, Some(e.to_string()));
+    }
+    log_memory_phase(
+        &mut runtime,
+        &cap,
+        "dom",
+        retained_source_bytes(&modules.borrow()),
+        0,
+    );
 
     // 2. Evaluate the page's scripts in document order against the happy-dom
     //    document. Classic scripts (inline or fetched external) run via
     //    `execute_script`; ES modules (`type="module"`, inline or external) are
     //    loaded through the [`MapModuleLoader`] and evaluated, so `import` /
-    //    `import()` resolve from the prefetched module map. A throw in page script
+    //    `import()` resolve through V8's module map. A throw in page script
     //    is *not* fatal — later scripts and already-scheduled async work may still
     //    surface intercepts — but if it happens before anything is captured we
     //    remember it so the outcome is `Threw`.
@@ -950,37 +1622,42 @@ async fn run_capture_inner(
     let t_scripts = Instant::now();
     let scripts = extract_scripts(html);
 
-    // Kick off every external-script fetch CONCURRENTLY (resolved against the page
-    // URL) and collect the bytes by document index. A browser's preload scanner
-    // fetches parser-inserted scripts in parallel but runs them in order; we mirror
-    // that — fan the network out here, then execute in document order below.
+    // Resolve parser-inserted externals up front, then poll only the current script
+    // and its immediate external successor. This preserves document-order execution
+    // and useful network overlap without retaining the whole page's source set.
     let external: Vec<(usize, String)> = scripts
         .iter()
         .enumerate()
         .filter(|(_, s)| !s.inline)
         .map(|(i, s)| (i, resolve_script_url(url, &s.payload)))
         .collect();
-    let fetched = futures::future::join_all(external.iter().map(|(_, u)| fetcher.fetch(u))).await;
-    let mut ext_bytes: HashMap<usize, Vec<u8>> = HashMap::new();
-    for ((i, _), bytes) in external.iter().zip(fetched) {
-        if let Some(b) = bytes {
-            ext_bytes.insert(*i, b);
-        }
-    }
+    let mut external_prefetch = ExternalScriptPrefetch::new(
+        fetcher.as_ref(),
+        external.iter().map(|(index, url)| (*index, url.as_str())),
+        EXTERNAL_SCRIPT_PREFETCH_BYTES,
+    );
 
     let mut threw_in_page = false;
     for (i, script) in scripts.into_iter().enumerate() {
         // Resolve the source + its module specifier. Inline scripts use their body
         // verbatim and a synthetic per-index URL (based on the page URL, so
         // relative imports resolve against the page). External scripts use the
-        // bytes fetched concurrently above; one we couldn't fetch is skipped.
-        let (source, spec_str) = if script.inline {
+        // bytes supplied by the bounded lookahead; one we couldn't fetch is skipped.
+        let (source, spec_str, fetched_source) = if script.inline {
             let base = url.split('#').next().unwrap_or(url);
-            (script.payload.clone(), format!("{base}#draco-inline-{i}"))
+            (
+                script.payload.clone(),
+                format!("{base}#draco-inline-{i}"),
+                None,
+            )
         } else {
             let resolved = resolve_script_url(url, &script.payload);
-            match ext_bytes.remove(&i) {
-                Some(bytes) => (String::from_utf8_lossy(&bytes).into_owned(), resolved),
+            match external_prefetch.take(i).await {
+                Some(bytes) => (
+                    String::from_utf8_lossy(&bytes).into_owned(),
+                    resolved,
+                    Some(bytes),
+                ),
                 None => continue,
             }
         };
@@ -1002,7 +1679,7 @@ async fn run_capture_inner(
                 json_string_literal(&spec_str)
             )
         };
-        let _ = runtime.execute_script("draco:currentScript", set_cs);
+        let _ = v8_boundary!(runtime.execute_script("draco:currentScript", set_cs));
 
         if script.module {
             // ES module: register the entry source under its specifier (so its own
@@ -1010,10 +1687,36 @@ async fn run_capture_inner(
             // completion.
             match deno_core::url::Url::parse(&spec_str) {
                 Ok(spec_url) => {
-                    modules
-                        .borrow_mut()
-                        .insert(spec_url.as_str().to_string(), source.into_bytes());
-                    if let Err(e) = eval_module(&mut runtime, &spec_url).await {
+                    modules.borrow_mut().insert(
+                        spec_url.as_str().to_string(),
+                        fetched_source.unwrap_or_else(|| source.into_bytes().into()),
+                    );
+                    let eval = match eval_module(
+                        &mut runtime,
+                        &spec_url,
+                        &modules,
+                        &heap_guard,
+                        &mut execution_watchdog,
+                        execution_deadline,
+                    )
+                    .await
+                    {
+                        Ok(eval) => eval,
+                        Err(ExecutionBoundaryError::HeapLimit) => {
+                            return heap_limit_capture_report(cap.clone())
+                        }
+                        Err(ExecutionBoundaryError::Deadline) => {
+                            return execution_deadline_capture_report(cap.clone())
+                        }
+                        Err(ExecutionBoundaryError::WatchdogUnavailable) => {
+                            return finish(
+                                cap.clone(),
+                                RuntimeOutcome::Terminated,
+                                Some("V8 execution watchdog stopped unexpectedly".to_string()),
+                            )
+                        }
+                    };
+                    if let Err(e) = eval {
                         threw_in_page = true;
                         let line = format!("module script {i} threw: {e}");
                         eprintln!("draco-runtime: {line}");
@@ -1036,7 +1739,7 @@ async fn run_capture_inner(
             } else {
                 format!("draco:page[{i}]")
             };
-            if let Err(e) = runtime.execute_script(name, source) {
+            if let Err(e) = v8_boundary!(runtime.execute_script(name, source)) {
                 threw_in_page = true;
                 let line = format!("page script {i} threw: {e}");
                 eprintln!("draco-runtime: {line}");
@@ -1044,9 +1747,19 @@ async fn run_capture_inner(
             }
         }
     }
-    let _ = runtime.execute_script(
+    let _ = v8_boundary!(runtime.execute_script(
         "draco:currentScript:clear",
         "try { globalThis.__dracoClearCurrentScript(); } catch (_) {}",
+    ));
+
+    // Preserve the existing phase record while reporting the actual high-water
+    // mark of completed, not-yet-executed external sources.
+    log_memory_phase(
+        &mut runtime,
+        &cap,
+        "scripts-fetched",
+        retained_source_bytes(&modules.borrow()),
+        external_prefetch.peak_retained_bytes(),
     );
 
     // Parsing-finished moment: the document-order scripts have all evaluated.
@@ -1054,24 +1767,57 @@ async fn run_capture_inner(
     // window load) so boot code gated on those signals proceeds — a real browser
     // fires both events here, BEFORE dynamic import()s settle, and late-running
     // chunk code then observes readyState === "complete" (see glue §7).
-    let _ = runtime.execute_script(
+    let _ = v8_boundary!(runtime.execute_script(
         "draco:lifecycle",
         "try { globalThis.__dracoFireLifecycle(); } catch (_) {}",
+    ));
+    log_memory_phase(
+        &mut runtime,
+        &cap,
+        "scripts-run",
+        retained_source_bytes(&modules.borrow()),
+        0,
     );
 
     let scripts_ms = t_scripts.elapsed().as_millis();
 
     // 3. Capture window: pump the event loop until quiescence or the hard cap.
     let t_window = Instant::now();
-    let (outcome, window_cpu) = drive_capture_window(&mut runtime, &cap, cfg, threw_in_page).await;
+    let (outcome, window_cpu) = drive_capture_window(
+        &mut runtime,
+        &cap,
+        cfg,
+        threw_in_page,
+        &heap_guard,
+        &mut execution_watchdog,
+    )
+    .await;
+    if outcome == RuntimeOutcome::Terminated {
+        return finish(cap, RuntimeOutcome::Terminated, None);
+    }
     let window_ms = t_window.elapsed().as_millis();
     let window_cpu_ms = window_cpu.as_millis();
+    log_memory_phase(
+        &mut runtime,
+        &cap,
+        "settled",
+        retained_source_bytes(&modules.borrow()),
+        0,
+    );
+    log_module_fetches(&cap, "settled", &inflight_module_fetches, &inflight);
 
     // 4. Serialize the hydrated DOM for the render-then-Markdown escalation, after
     //    the window so any content the framework mounted is present.
     let t_serialize = Instant::now();
-    serialize_dom(&mut runtime);
+    v8_boundary!(serialize_dom(&mut runtime));
     let serialize_ms = t_serialize.elapsed().as_millis();
+    log_memory_phase(
+        &mut runtime,
+        &cap,
+        "serialized",
+        retained_source_bytes(&modules.borrow()),
+        0,
+    );
 
     // Phase breakdown (surfaced under `--runtime-log`): the raw material for the
     // render-tier CPU question — how much of runtime_ms is initial script eval vs
@@ -1086,12 +1832,15 @@ async fn run_capture_inner(
         ));
     }
 
-    let cs = cap.borrow();
+    let (requests, rendered_html, logs) = {
+        let mut cs = cap.borrow_mut();
+        cs.take_output_buffers()
+    };
     CaptureReport {
         outcome,
-        requests: cs.requests.clone(),
-        rendered_html: cs.rendered_html.clone(),
-        logs: cs.logs.clone(),
+        requests,
+        rendered_html,
+        logs,
     }
 }
 
@@ -1123,13 +1872,50 @@ fn serialize_dom(runtime: &mut JsRuntime) {
 async fn eval_module(
     runtime: &mut JsRuntime,
     spec: &ModuleSpecifier,
-) -> Result<(), deno_core::error::CoreError> {
-    let id = runtime.load_side_es_module(spec).await?;
-    let eval = runtime.mod_evaluate(id);
-    runtime
+    modules: &Rc<RefCell<HashMap<String, SharedSource>>>,
+    heap_guard: &HeapLimitGuard,
+    execution_watchdog: &mut ExecutionWatchdog,
+    execution_deadline: Duration,
+) -> Result<Result<(), deno_core::error::CoreError>, ExecutionBoundaryError> {
+    heap_guard
+        .check()
+        .map_err(|_| ExecutionBoundaryError::HeapLimit)?;
+    let loaded = runtime.load_side_es_module(spec).await;
+    // Concurrent load calls may clone the shared Arc while the graph is in
+    // flight. Success or failure ends that window, so release the raw entry now.
+    modules.borrow_mut().remove(spec.as_str());
+    heap_guard
+        .check()
+        .map_err(|_| ExecutionBoundaryError::HeapLimit)?;
+    let id = match loaded {
+        Ok(id) => id,
+        Err(error) => return Ok(Err(error)),
+    };
+    let eval = run_with_execution_deadline(
+        runtime,
+        heap_guard,
+        execution_watchdog,
+        execution_deadline,
+        |runtime| runtime.mod_evaluate(id),
+    )?;
+    let generation = execution_watchdog.arm(execution_deadline)?;
+    let event_loop = runtime
         .run_event_loop(PollEventLoopOptions::default())
-        .await?;
-    eval.await
+        .await;
+    if execution_watchdog.disarm(generation)? {
+        return Err(ExecutionBoundaryError::Deadline);
+    }
+    heap_guard
+        .check()
+        .map_err(|_| ExecutionBoundaryError::HeapLimit)?;
+    if let Err(error) = event_loop {
+        return Ok(Err(error));
+    }
+    let evaluated = eval.await;
+    heap_guard
+        .check()
+        .map_err(|_| ExecutionBoundaryError::HeapLimit)?;
+    Ok(evaluated)
 }
 
 /// Resolve a script `src` against the page URL (WHATWG join); passes `src`
@@ -1148,6 +1934,8 @@ async fn drive_capture_window(
     cap: &Rc<RefCell<CaptureState>>,
     cfg: &CaptureConfig,
     threw_in_page: bool,
+    heap_guard: &HeapLimitGuard,
+    execution_watchdog: &mut ExecutionWatchdog,
 ) -> (RuntimeOutcome, Duration) {
     let start = Instant::now();
     let hard_cap = Duration::from_millis(cfg.capture_window_ms);
@@ -1183,7 +1971,30 @@ async fn drive_capture_window(
     loop {
         // Poll one tick of the event loop with a self-contained waker.
         let t_poll = Instant::now();
-        let poll_res = poll_once(runtime);
+        let poll_res = match run_with_execution_deadline(
+            runtime,
+            heap_guard,
+            execution_watchdog,
+            Duration::from_millis(cfg.capture_window_ms.max(1)),
+            poll_once,
+        ) {
+            Ok(poll) => poll,
+            Err(ExecutionBoundaryError::HeapLimit) => {
+                cap.borrow_mut()
+                    .push_log(&format!("[raze.heap] {HEAP_LIMIT_DIAGNOSTIC}"));
+                return (RuntimeOutcome::Terminated, poll_busy);
+            }
+            Err(ExecutionBoundaryError::Deadline) => {
+                cap.borrow_mut()
+                    .push_log(&format!("[raze.watchdog] {EXECUTION_DEADLINE_DIAGNOSTIC}"));
+                return (RuntimeOutcome::Terminated, poll_busy);
+            }
+            Err(ExecutionBoundaryError::WatchdogUnavailable) => {
+                cap.borrow_mut()
+                    .push_log("[raze.watchdog] V8 execution watchdog stopped unexpectedly");
+                return (RuntimeOutcome::Terminated, poll_busy);
+            }
+        };
         poll_busy += t_poll.elapsed();
 
         match poll_res {
@@ -1314,16 +2125,31 @@ fn finish(
         eprintln!("draco-runtime: {outcome:?}: {d}");
         cap.borrow_mut().push_log(&format!("boot: {d}"));
     }
-    let cs = cap.borrow();
+    let (requests, _rendered_html, logs) = {
+        let mut cs = cap.borrow_mut();
+        cs.take_output_buffers()
+    };
     // `finish` is only reached on a pre-hydration boot failure (URL inject /
     // polyfill / interceptor threw), so there is no meaningful hydrated DOM to
     // serialize.
     CaptureReport {
         outcome,
-        requests: cs.requests.clone(),
+        requests,
         rendered_html: None,
-        logs: cs.logs.clone(),
+        logs,
     }
+}
+
+fn heap_limit_capture_report(cap: Rc<RefCell<CaptureState>>) -> CaptureReport {
+    cap.borrow_mut()
+        .push_log(&format!("[raze.heap] {HEAP_LIMIT_DIAGNOSTIC}"));
+    finish(cap, RuntimeOutcome::Terminated, None)
+}
+
+fn execution_deadline_capture_report(cap: Rc<RefCell<CaptureState>>) -> CaptureReport {
+    cap.borrow_mut()
+        .push_log(&format!("[raze.watchdog] {EXECUTION_DEADLINE_DIAGNOSTIC}"));
+    finish(cap, RuntimeOutcome::Terminated, None)
 }
 
 // ===================================================================
@@ -1631,12 +2457,227 @@ fn quiesce_tick_ms(quiesce_ms: u64) -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn one_shot_isolate_lifecycle_is_balanced() {
+        let test_binary = std::env::current_exe().expect("current test binary path");
+        let output = std::process::Command::new(test_binary)
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::one_shot_isolate_lifecycle_subprocess",
+                "--nocapture",
+            ])
+            .output()
+            .expect("run isolated lifecycle test");
+        assert!(
+            output.status.success(),
+            "isolated lifecycle test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn one_shot_isolate_lifecycle_subprocess() {
+        let before = isolate_stats();
+        let _ = run_capture(
+            "https://lifecycle.example/",
+            "<main>stable</main>",
+            &CaptureConfig {
+                capture_window_ms: 20,
+                quiesce_ms: 3,
+                max_intercepts: 1,
+                stub_response_json: "{}".to_string(),
+            },
+            null_fetcher(),
+        );
+        let after = isolate_stats();
+
+        assert_eq!(after.created, before.created + 1);
+        assert_eq!(after.dropped, before.dropped + 1);
+        assert_eq!(after.active, before.active);
+        assert_eq!(after.active, after.created.saturating_sub(after.dropped));
+    }
+
+    #[test]
+    fn shared_source_clones_share_the_payload_allocation() {
+        let source: SharedSource = Arc::from(&b"console.log('shared')"[..]);
+        let cloned = Arc::clone(&source);
+
+        assert!(Arc::ptr_eq(&source, &cloned));
+    }
+
+    #[test]
+    fn capture_heap_policy_caps_v8_growth() {
+        ensure_v8_flags();
+        let mut runtime = JsRuntime::new(RuntimeOptions {
+            create_params: Some(capture_create_params()),
+            ..Default::default()
+        });
+        let effective_limit = runtime.v8_isolate().get_heap_statistics().heap_size_limit();
+        assert!(
+            effective_limit <= CAPTURE_MAX_HEAP_BYTES + 8 * MIB,
+            "V8 effective heap limit {effective_limit} exceeded the configured cap plus overhead"
+        );
+    }
+
+    #[test]
+    fn capture_default_heap_limit_is_192_mib() {
+        assert_eq!(CAPTURE_MAX_HEAP_BYTES, 192 * 1024 * 1024);
+    }
+
+    #[test]
+    fn near_heap_limit_guard_terminates_execution_before_abort() {
+        let test_binary = std::env::current_exe().expect("current test binary path");
+        let output = std::process::Command::new(test_binary)
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::near_heap_limit_guard_subprocess",
+                "--nocapture",
+            ])
+            .output()
+            .expect("run isolated heap-limit test");
+        assert!(
+            output.status.success(),
+            "isolated heap-limit test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// Deliberately exhausting a tiny V8 heap is process-global stress that can
+    /// destabilize other isolates running concurrently in Rust's unit-test process.
+    /// The public test above runs this exact ignored test in a dedicated subprocess.
+    #[test]
+    #[ignore]
+    fn near_heap_limit_guard_subprocess() {
+        ensure_v8_flags();
+        let mut runtime = JsRuntime::new(RuntimeOptions {
+            create_params: Some(
+                deno_core::v8::CreateParams::default().heap_limits(0, 5 * 1024 * 1024),
+            ),
+            ..Default::default()
+        });
+        let guard = install_near_heap_limit_guard(&mut runtime);
+
+        let err = runtime
+            .execute_script(
+                "draco:test:heap-limit",
+                r#"let s = ""; while (true) { s += "Hello"; }"#,
+            )
+            .expect_err("allocation loop must be terminated at the heap limit");
+
+        assert_eq!(
+            err.exception_message,
+            "Uncaught Error: execution terminated"
+        );
+        assert!(guard.is_tripped(), "near-heap callback was not invoked");
+
+        let second_script_ran = Rc::new(Cell::new(false));
+        let second_script_ran_inner = second_script_ran.clone();
+        let second = guard.run(|| {
+            second_script_ran_inner.set(true);
+            runtime.execute_script("draco:test:must-not-run", "globalThis.afterOom = true")
+        });
+        assert!(
+            second.is_err(),
+            "poisoned isolate must reject another boundary"
+        );
+        assert!(
+            !second_script_ran.get(),
+            "second script ran after heap limit"
+        );
+        drop(runtime);
+    }
+
+    #[test]
+    fn phase_memory_logs_are_ordered() {
+        let script_url = "https://memory.example.com/app.js";
+        let report = run_capture(
+            "https://memory.example.com/",
+            r#"<html><body><script src="/app.js"></script></body></html>"#,
+            &CaptureConfig {
+                capture_window_ms: 100,
+                quiesce_ms: 10,
+                max_intercepts: 8,
+                stub_response_json: "{}".to_string(),
+            },
+            map_fetcher(HashMap::from([(
+                script_url.to_string(),
+                b"globalThis.__memory_test_loaded = true;".to_vec(),
+            )])),
+        );
+
+        let memory_lines: Vec<&str> = report
+            .logs
+            .iter()
+            .map(String::as_str)
+            .filter(|line| line.starts_with("[raze.memory] "))
+            .collect();
+        assert_eq!(
+            memory_lines.len(),
+            6,
+            "expected exactly six memory lines: {memory_lines:?}"
+        );
+
+        let numeric_keys = [
+            "used_heap_size",
+            "total_heap_size",
+            "total_physical_size",
+            "external_memory",
+            "heap_size_limit",
+            "module_registry_bytes",
+            "retained_external_script_bytes",
+        ];
+        let phases: Vec<&str> = memory_lines
+            .iter()
+            .map(|line| {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                assert_eq!(
+                    fields.len(),
+                    2 + numeric_keys.len(),
+                    "unexpected field count in {line}"
+                );
+                assert_eq!(fields[0], "[raze.memory]", "unexpected prefix in {line}");
+                let phase = fields[1]
+                    .strip_prefix("phase=")
+                    .filter(|phase| !phase.is_empty())
+                    .unwrap_or_else(|| panic!("invalid phase field in {line}"));
+
+                for (field, expected_key) in fields[2..].iter().zip(numeric_keys) {
+                    let (key, value) = field
+                        .split_once('=')
+                        .unwrap_or_else(|| panic!("invalid key/value field {field} in {line}"));
+                    assert_eq!(key, expected_key, "unexpected field in {line}");
+                    value.parse::<usize>().unwrap_or_else(|_| {
+                        panic!("nonnumeric value for {expected_key} in {line}")
+                    });
+                }
+                phase
+            })
+            .collect();
+
+        assert_eq!(
+            phases,
+            [
+                "snapshot",
+                "dom",
+                "scripts-fetched",
+                "scripts-run",
+                "settled",
+                "serialized",
+            ]
+        );
+    }
+
     /// Test [`ScriptFetcher`] backed by a fixed `{ url -> bytes }` map, returning a
     /// ready future per lookup — the offline stand-in for the net+cache fetcher.
-    struct MapFetcher(HashMap<String, Vec<u8>>);
+    struct MapFetcher(HashMap<String, SharedSource>);
     impl ScriptFetcher for MapFetcher {
-        fn fetch<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, Option<Vec<u8>>> {
-            let hit = self.0.get(url).cloned();
+        fn fetch<'a>(&'a self, url: &'a str) -> LocalBoxFuture<'a, Option<SharedSource>> {
+            let hit = self.0.get(url).map(Arc::clone);
             Box::pin(async move { hit })
         }
     }
@@ -1646,7 +2687,12 @@ mod tests {
     }
     /// A fetcher serving a fixed `{ url -> bytes }` set.
     fn map_fetcher(entries: HashMap<String, Vec<u8>>) -> Rc<dyn ScriptFetcher> {
-        Rc::new(MapFetcher(entries))
+        Rc::new(MapFetcher(
+            entries
+                .into_iter()
+                .map(|(url, bytes)| (url, bytes.into()))
+                .collect(),
+        ))
     }
 
     /// Test [`ApiFetcher`] serving a fixed `{ url -> (status, json_body) }` map as
@@ -2303,6 +3349,96 @@ mod tests {
             cs.logs
         );
         assert!(cs.logs[1].contains("animate"), "{:?}", cs.logs);
+    }
+
+    #[test]
+    fn finish_moves_capture_buffers_out_of_shared_state() {
+        let cap = Rc::new(RefCell::new(CaptureState {
+            requests: vec![CapturedRequest {
+                method: "GET".to_string(),
+                url: "https://example.test/api".to_string(),
+                headers: Vec::new(),
+                body: None,
+                via: InterceptVia::Fetch,
+            }],
+            max_intercepts: 8,
+            stub_body: "{}".to_string(),
+            fetcher: null_fetcher(),
+            api_fetcher: None,
+            inflight: Rc::new(Cell::new(0)),
+            content_activity: Rc::new(Cell::new(0)),
+            rendered_html: Some("<html>unused on boot failure</html>".to_string()),
+            logs: vec!["boot diagnostic".to_string()],
+            exec_result: None,
+            started: Instant::now(),
+        }));
+
+        let report = finish(cap.clone(), RuntimeOutcome::Threw, None);
+
+        assert_eq!(report.requests.len(), 1);
+        assert_eq!(report.logs, ["boot diagnostic"]);
+        assert_eq!(report.rendered_html, None);
+        let state = cap.borrow();
+        assert!(state.requests.is_empty(), "requests must be moved out");
+        assert!(
+            state.rendered_html.is_none(),
+            "rendered HTML must be released"
+        );
+        assert!(state.logs.is_empty(), "logs must be moved out");
+    }
+
+    #[test]
+    fn memory_logs_survive_ordinary_log_saturation() {
+        let mut cs = CaptureState {
+            requests: Vec::new(),
+            max_intercepts: 8,
+            stub_body: "{}".to_string(),
+            fetcher: null_fetcher(),
+            api_fetcher: None,
+            inflight: Rc::new(Cell::new(0)),
+            content_activity: Rc::new(Cell::new(0)),
+            rendered_html: None,
+            logs: Vec::new(),
+            exec_result: None,
+            started: Instant::now(),
+        };
+        let phases = [
+            "snapshot",
+            "dom",
+            "scripts-fetched",
+            "scripts-run",
+            "settled",
+            "serialized",
+        ];
+
+        for (phase_index, phase) in phases.iter().enumerate() {
+            for ordinary_index in 0..MAX_RUNTIME_LOGS {
+                cs.push_log(&format!("[ordinary] {phase_index}:{ordinary_index}"));
+            }
+            cs.push_log(&format!(
+                "[raze.memory] phase={phase} used_heap_size=0 total_heap_size=0 \
+                 total_physical_size=0 external_memory=0 heap_size_limit=0 \
+                 module_registry_bytes=0 retained_external_script_bytes=0"
+            ));
+        }
+
+        let memory_phases: Vec<&str> = cs
+            .logs
+            .iter()
+            .filter_map(|line| {
+                line.strip_prefix("[raze.memory] phase=")
+                    .and_then(|rest| rest.split_whitespace().next())
+            })
+            .collect();
+        assert_eq!(memory_phases, phases);
+        assert_eq!(cs.logs.len(), MAX_RUNTIME_LOGS);
+        assert_eq!(
+            cs.logs
+                .iter()
+                .filter(|line| !line.starts_with("[raze.memory] "))
+                .count(),
+            MAX_RUNTIME_LOGS - phases.len()
+        );
     }
 
     #[test]

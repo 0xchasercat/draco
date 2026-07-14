@@ -114,6 +114,183 @@ async fn open_exec_serialize_close() {
     session.close().await.expect("close");
 }
 
+#[tokio::test]
+async fn exec_busy_loop_is_terminated_and_session_closes() {
+    let mut config = test_config(SMOKE_HTML);
+    config.capture.capture_window_ms = 100;
+    config.capture.quiesce_ms = 20;
+    let session = Session::open(config, Box::new(observe_fetchers))
+        .await
+        .expect("session opens");
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(1),
+        session.exec("while (true) {}".to_string(), ExecOptions::default()),
+    )
+    .await
+    .expect("exec watchdog returned promptly")
+    .expect("termination report delivered");
+
+    assert!(!report.ok);
+    assert!(
+        report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("execution deadline")),
+        "missing watchdog error: {:?}",
+        report.error
+    );
+    assert!(
+        session.serialize().await.is_err(),
+        "terminated isolate remained available for reuse"
+    );
+}
+
+#[tokio::test]
+async fn session_open_busy_page_is_terminated() {
+    let mut config =
+        test_config("<!doctype html><html><body><script>while (true) {}</script></body></html>");
+    config.capture.capture_window_ms = 100;
+    config.capture.quiesce_ms = 20;
+
+    let opened = tokio::time::timeout(
+        Duration::from_secs(1),
+        Session::open(config, Box::new(observe_fetchers)),
+    )
+    .await
+    .expect("session hydration watchdog returned promptly");
+    let error = match opened {
+        Ok(_) => panic!("busy-loop page unexpectedly opened"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("execution deadline"),
+        "unexpected hydration failure: {error}"
+    );
+}
+
+#[tokio::test]
+async fn session_open_busy_module_page_is_terminated() {
+    let mut config = test_config(
+        "<!doctype html><html><body><script type=\"module\">while (true) {}</script></body></html>",
+    );
+    config.capture.capture_window_ms = 100;
+    config.capture.quiesce_ms = 20;
+
+    let opened = tokio::time::timeout(
+        Duration::from_secs(1),
+        Session::open(config, Box::new(observe_fetchers)),
+    )
+    .await
+    .expect("module hydration watchdog returned promptly");
+    let error = match opened {
+        Ok(_) => panic!("busy-loop module page unexpectedly opened"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("execution deadline"), "unexpected: {error}");
+}
+
+#[tokio::test]
+async fn exec_microtask_busy_loop_is_terminated_and_session_closes() {
+    let mut config = test_config(SMOKE_HTML);
+    config.capture.capture_window_ms = 100;
+    config.capture.quiesce_ms = 20;
+    let session = Session::open(config, Box::new(observe_fetchers))
+        .await
+        .expect("session opens");
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(1),
+        session.exec(
+            "queueMicrotask(() => { while (true) {} }); 1".to_string(),
+            ExecOptions {
+                settle: false,
+                ..ExecOptions::default()
+            },
+        ),
+    )
+    .await
+    .expect("microtask watchdog returned promptly")
+    .expect("termination report delivered");
+
+    assert!(!report.ok);
+    assert!(
+        report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("execution deadline")),
+        "missing watchdog error: {:?}",
+        report.error
+    );
+    assert!(session.serialize().await.is_err());
+}
+
+#[tokio::test]
+async fn idle_timer_busy_loop_closes_session() {
+    let mut config = test_config(SMOKE_HTML);
+    config.capture.capture_window_ms = 100;
+    config.capture.quiesce_ms = 20;
+    let session = Session::open(config, Box::new(observe_fetchers))
+        .await
+        .expect("session opens");
+
+    let armed = session
+        .exec(
+            "setTimeout(() => { while (true) {} }, 25); 1".to_string(),
+            ExecOptions {
+                settle: false,
+                ..ExecOptions::default()
+            },
+        )
+        .await
+        .expect("timer arm delivered");
+    assert!(armed.ok, "timer arm failed: {:?}", armed.error);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), session.serialize())
+            .await
+            .expect("idle watchdog did not hang caller")
+            .is_err(),
+        "actor reused isolate after idle callback termination"
+    );
+}
+
+#[tokio::test]
+async fn multi_megabyte_dom_serializes_identically_twice() {
+    let payload = "x".repeat(3 * 1024 * 1024);
+    let html = format!(
+        "<!doctype html><html><head><title>Large DOM</title></head>\
+         <body><main id=\"payload\">{payload}</main></body></html>"
+    );
+    let session = Session::open(test_config(&html), Box::new(observe_fetchers))
+        .await
+        .expect("large session opens");
+
+    let first = session
+        .serialize()
+        .await
+        .expect("first serialize delivered")
+        .expect("first rendered HTML");
+    let second = session
+        .serialize()
+        .await
+        .expect("second serialize delivered")
+        .expect("second rendered HTML");
+
+    assert_eq!(
+        first, second,
+        "serialization must repopulate from the live DOM"
+    );
+    assert!(
+        first.len() >= payload.len(),
+        "large body was truncated: {} bytes",
+        first.len()
+    );
+
+    session.close().await.expect("close");
+}
+
 /// The slice-2 core proof: a timer armed in turn 1 (without settling) fires
 /// *between* commands — driven only by the actor's idle event-loop pump — so its
 /// DOM mutation is present by the time we serialize, with no command in flight to

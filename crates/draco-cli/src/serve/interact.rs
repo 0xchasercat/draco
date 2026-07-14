@@ -92,6 +92,10 @@ impl SessionStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    pub(crate) fn active_count(&self) -> usize {
+        self.lock_sessions().len()
+    }
+
     fn spawn_reaper(&self) {
         let inner = Arc::downgrade(&self.inner);
         tokio::spawn(async move {

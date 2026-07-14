@@ -158,7 +158,14 @@ pub(crate) async fn start_handler(
         None => state.defaults.respect_robots,
     };
 
-    let id = state.batch.create_with_total(valid.len());
+    let id = match state.batch.create_with_total(valid.len()) {
+        Ok(id) => id,
+        Err(_) => {
+            let mut body = error_body("async job capacity exhausted");
+            body["status"] = json!("saturated");
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(body));
+        }
+    };
     let sink = super::webhook::WebhookSink::new(req.webhook, id.clone(), "batch_scrape");
     tokio::spawn(run_batch(state.clone(), id.clone(), valid, config, sink));
 
@@ -295,6 +302,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_state() -> Arc<AppState> {
+        let (crawl, batch) = crate::serve::jobs::JobStore::shared_pair();
         Arc::new(AppState {
             defaults: Config {
                 force_render: false,
@@ -303,9 +311,30 @@ mod tests {
                 ..Config::default()
             },
             gate: Semaphore::new(2),
+            max_concurrency: 2,
             tier2_pool: draco_core::Tier2Pool::new(1, 100, true, false),
-            crawl: Default::default(),
-            batch: Default::default(),
+            crawl,
+            batch,
+            #[cfg(feature = "tier2")]
+            sessions: Default::default(),
+        })
+    }
+
+    fn test_state_with_job_limit(max_jobs: usize) -> Arc<AppState> {
+        let (crawl, batch) =
+            crate::serve::jobs::JobStore::shared_pair_with_limits_for_test(max_jobs, usize::MAX);
+        Arc::new(AppState {
+            defaults: Config {
+                force_render: false,
+                tier_max: 0,
+                respect_robots: false,
+                ..Config::default()
+            },
+            gate: Semaphore::new(2),
+            max_concurrency: 2,
+            tier2_pool: draco_core::Tier2Pool::new(1, 100, true, false),
+            crawl,
+            batch,
             #[cfg(feature = "tier2")]
             sessions: Default::default(),
         })
@@ -392,6 +421,21 @@ mod tests {
         let invalid = body["invalidURLs"].as_array().unwrap();
         assert_eq!(invalid.len(), 1);
         assert_eq!(invalid[0], "not a url");
+    }
+
+    #[tokio::test]
+    async fn combined_running_job_capacity_maps_to_service_unavailable() {
+        let state = test_state_with_job_limit(1);
+        let _crawl_job = state.crawl.create_seeded().unwrap();
+        let app = batch_router(state);
+
+        let resp = post_batch(&app, json!({ "urls": ["https://valid.example/"] })).await;
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_json(resp).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["status"], "saturated");
+        assert_eq!(body["error"], "async job capacity exhausted");
     }
 
     #[tokio::test]

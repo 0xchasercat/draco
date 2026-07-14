@@ -1557,12 +1557,14 @@ mod tests {
     // ---- HTTP binding -------------------------------------------------------
 
     fn mcp_router() -> Router {
+        let (crawl, batch) = crate::serve::jobs::JobStore::shared_pair();
         let state = Arc::new(AppState {
             defaults: defaults(),
             gate: Semaphore::new(2),
+            max_concurrency: 2,
             tier2_pool: draco_core::Tier2Pool::new(1, 100, true, false),
-            crawl: Default::default(),
-            batch: Default::default(),
+            crawl,
+            batch,
             #[cfg(feature = "tier2")]
             sessions: crate::serve::interact::SessionStore::new(1),
         });

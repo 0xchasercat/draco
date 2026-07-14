@@ -610,6 +610,7 @@ mod tests {
     // ---- end-to-end ---------------------------------------------------------
 
     fn test_state() -> Arc<AppState> {
+        let (crawl, batch) = crate::serve::jobs::JobStore::shared_pair();
         Arc::new(AppState {
             defaults: Config {
                 force_render: false,
@@ -618,9 +619,10 @@ mod tests {
                 ..Config::default()
             },
             gate: Semaphore::new(2),
+            max_concurrency: 2,
             tier2_pool: draco_core::Tier2Pool::new(1, 100, true, false),
-            crawl: Default::default(),
-            batch: Default::default(),
+            crawl,
+            batch,
             #[cfg(feature = "tier2")]
             sessions: Default::default(),
         })

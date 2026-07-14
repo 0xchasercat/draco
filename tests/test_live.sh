@@ -10,6 +10,7 @@
 #   ./tests/test_live.sh                  # run all tests
 #   ./tests/test_live.sh --quick          # run only the 10 core site tests
 #   ./tests/test_live.sh --daemon         # run daemon REST API tests
+#   ./tests/test_live.sh --plateau        # repeated local Tier-2 ownership/RSS plateau
 #   ./tests/test_live.sh --features       # run only feature-flag tests
 #   ./tests/test_live.sh --errors         # run only error-handling tests
 #   ./tests/test_live.sh --filter md      # run tests whose name contains "md"
@@ -20,6 +21,7 @@
 DRACO="${DRACO_BIN:-./target/release/draco}"
 PASS=0
 FAIL=0
+SKIP=0
 FAILED_TESTS=()
 TIMEOUT_SEC=30
 
@@ -34,6 +36,7 @@ fi
 # Daemon config
 DAEMON_PORT="${DRACO_PORT:-3002}"
 DAEMON_PID=""
+FIXTURE_PID=""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -52,12 +55,14 @@ RUN_ERROR=false
 RUN_HARD=false
 RUN_QUICK=false
 RUN_DAEMON=false
+RUN_PLATEAU=false
 
 i=1
 for arg in "$@"; do
   case "$arg" in
     --quick) RUN_QUICK=true; RUN_ALL=false ;;
     --daemon) RUN_DAEMON=true; RUN_ALL=false ;;
+    --plateau) RUN_PLATEAU=true; RUN_ALL=false ;;
     --sites) RUN_SITE=true; RUN_ALL=false ;;
     --features) RUN_FEATURE=true; RUN_ALL=false ;;
     --errors) RUN_ERROR=true; RUN_ALL=false ;;
@@ -307,6 +312,328 @@ stop_daemon() {
     wait "$DAEMON_PID" 2>/dev/null || true
     DAEMON_PID=""
   fi
+}
+
+plateau_skip() {
+  printf "    ${YELLOW}SKIP${NC}: %s\n" "$1"
+  SKIP=$((SKIP + 1))
+}
+
+plateau_fail() {
+  printf "    ${RED}FAIL${NC}: %s\n" "$1"
+  FAIL=$((FAIL + 1))
+  FAILED_TESTS+=("$2")
+}
+
+start_plateau_fixture() {
+  local port="$1"
+  python3 -m http.server "$port" --bind 127.0.0.1 --directory tests/fixtures \
+    >/dev/null 2>&1 &
+  FIXTURE_PID=$!
+  local waited=0
+  while [[ "$waited" -lt 20 ]]; do
+    if curl -sf "http://127.0.0.1:$port/plateau_tier2.html" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+stop_plateau_fixture() {
+  if [[ -n "$FIXTURE_PID" ]]; then
+    kill "$FIXTURE_PID" 2>/dev/null || true
+    wait "$FIXTURE_PID" 2>/dev/null || true
+    FIXTURE_PID=""
+  fi
+}
+
+cleanup_background_processes() {
+  stop_daemon
+  stop_plateau_fixture
+}
+
+trap cleanup_background_processes EXIT
+trap 'cleanup_background_processes; exit 130' INT
+trap 'cleanup_background_processes; exit 143' TERM
+
+daemon_thread_count() {
+  local count
+  count=$(ps -o nlwp= -p "$DAEMON_PID" 2>/dev/null | tr -d ' ')
+  if [[ "$count" =~ ^[0-9]+$ ]]; then
+    echo "$count"
+    return
+  fi
+  count=$(ps -M -p "$DAEMON_PID" 2>/dev/null | awk 'NR > 1 { n++ } END { print n + 0 }')
+  echo "$count"
+}
+
+daemon_descendants() {
+  local frontier="$DAEMON_PID"
+  local descendants=""
+  local parent children child
+  while [[ -n "$frontier" ]]; do
+    local next=""
+    for parent in $frontier; do
+      children=$(pgrep -P "$parent" 2>/dev/null || true)
+      for child in $children; do
+        descendants="$descendants $child"
+        next="$next $child"
+      done
+    done
+    frontier="$next"
+  done
+  echo "$descendants"
+}
+
+health_sample() {
+  curl -sf "http://127.0.0.1:$DAEMON_PORT/health" | python3 -c '
+import json, sys
+h = json.load(sys.stdin)
+jobs = h.get("jobs", {}).get("total", {})
+cache = h.get("cache", {})
+isolates = h.get("isolates", {})
+sessions = h.get("sessions", {})
+values = (
+    h.get("availableSlots"),
+    h.get("activeCaptures"),
+    jobs.get("jobs"),
+    jobs.get("running"),
+    jobs.get("retainedBytes"),
+    cache.get("entries"),
+    cache.get("payloadBytes"),
+    cache.get("keyBytes"),
+    cache.get("capacity"),
+    isolates.get("created"),
+    isolates.get("dropped"),
+    isolates.get("active"),
+    sessions.get("active"),
+)
+if any(type(value) is not int or value < 0 for value in values):
+    raise SystemExit(42)
+print(*values)
+'
+}
+
+plateau_request() {
+  local fixture_url="$1"
+  curl -sf -X POST "http://127.0.0.1:$DAEMON_PORT/v1/scrape" \
+    -H 'content-type: application/json' \
+    -d "{\"url\":\"$fixture_url\",\"formats\":[\"markdown\"],\"tierMax\":2,\"captureWindowMs\":250,\"noJail\":true,\"ignoreRobots\":true,\"runtimeLog\":true}" \
+    | python3 -c '
+import json, sys
+body = json.load(sys.stdin)
+markdown = body.get("data", {}).get("markdown", "")
+source_tier = body.get("draco", {}).get("sourceTier")
+if (body.get("success") is not True
+        or source_tier != "runtime_interception"
+        or "Tier 2 plateau stable content" not in markdown):
+    raise SystemExit(1)
+'
+}
+
+plateau_tests() {
+  banner "DAEMON PLATEAU — LOCAL TIER-2 REPEATED REQUESTS"
+
+  local missing=""
+  for tool in curl python3 ps pgrep; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+  done
+  if [[ -n "$missing" ]]; then
+    plateau_skip "platform tooling unavailable:$missing"
+    return 0
+  fi
+  if ! ps -o rss= -p $$ >/dev/null 2>&1; then
+    plateau_skip "this ps implementation cannot report resident memory"
+    return 0
+  fi
+
+  local requests="${DRACO_PLATEAU_REQUESTS:-200}"
+  local warmups="${DRACO_PLATEAU_WARMUPS:-5}"
+  local slope_limit="${DRACO_PLATEAU_MAX_RSS_SLOPE_KB:-64}"
+  if [[ ! "$requests" =~ ^[0-9]+$ || ! "$warmups" =~ ^[0-9]+$ || "$requests" -lt 2 ]]; then
+    plateau_fail "DRACO_PLATEAU_REQUESTS must be an integer >= 2 and WARMUPS must be non-negative" \
+      "daemon plateau configuration"
+    return 1
+  fi
+
+  local fixture_port="${DRACO_FIXTURE_PORT:-3012}"
+  local fixture_url="http://127.0.0.1:$fixture_port/plateau_tier2.html"
+  local work_dir
+  work_dir=$(mktemp -d "${TMPDIR:-/tmp}/draco-plateau.XXXXXX") || {
+    plateau_skip "mktemp is unavailable"
+    return 0
+  }
+  local rss_file="$work_dir/rss-kb.txt"
+  local samples_file="$work_dir/samples.csv"
+  printf 'request,rss_kb,threads,descendants,available,active_captures,jobs,running_jobs,retained_bytes,cache_entries,cache_payload,cache_key_bytes,cache_capacity,isolates_created,isolates_dropped,isolates_active,sessions\n' >"$samples_file"
+
+  if ! start_plateau_fixture "$fixture_port"; then
+    plateau_fail "could not start the local Tier-2 fixture server" \
+      "daemon plateau fixture startup"
+    rm -rf "$work_dir"
+    return 1
+  fi
+  if ! start_daemon "$DAEMON_PORT"; then
+    stop_plateau_fixture
+    rm -rf "$work_dir"
+    FAIL=$((FAIL + 1))
+    FAILED_TESTS+=("daemon plateau startup")
+    return 1
+  fi
+
+  local run_kind="definitive"
+  (( requests < 100 )) && run_kind="smoke"
+  printf "  warmups: %s; measured requests: %s (%s)\n" "$warmups" "$requests" "$run_kind"
+  local i
+  for ((i = 1; i <= warmups; i++)); do
+    if ! plateau_request "$fixture_url"; then
+      FAIL=$((FAIL + 1))
+      FAILED_TESTS+=("daemon plateau warmup $i")
+      stop_daemon; stop_plateau_fixture; rm -rf "$work_dir"
+      return 1
+    fi
+  done
+
+  local baseline
+  baseline=$(health_sample) || baseline=""
+  if [[ -z "$baseline" ]]; then
+    plateau_fail "required daemon ownership telemetry is missing or invalid" \
+      "daemon plateau telemetry"
+    stop_daemon
+    stop_plateau_fixture
+    rm -rf "$work_dir"
+    return 1
+  fi
+  local base_available base_active base_jobs base_running base_retained
+  local base_cache_entries base_cache_payload base_cache_key_bytes base_cache_capacity
+  local base_isolates_created base_isolates_dropped base_isolates_active base_sessions
+  read -r base_available base_active base_jobs base_running base_retained \
+    base_cache_entries base_cache_payload base_cache_key_bytes base_cache_capacity \
+    base_isolates_created base_isolates_dropped base_isolates_active base_sessions <<<"$baseline"
+  local base_threads
+  base_threads=$(daemon_thread_count)
+
+  local failed=0
+  local telemetry_missing=0
+  for ((i = 1; i <= requests; i++)); do
+    if ! plateau_request "$fixture_url"; then
+      printf "    ${RED}request %s failed semantic validation${NC}\n" "$i"
+      failed=1
+      break
+    fi
+    local rss threads descendants health
+    rss=$(ps -o rss= -p "$DAEMON_PID" 2>/dev/null | tr -d ' ')
+    threads=$(daemon_thread_count)
+    descendants=$(daemon_descendants)
+    local descendant_count=0
+    [[ -n "$descendants" ]] && descendant_count=$(wc -w <<<"$descendants" | tr -d ' ')
+    health=$(health_sample) || health=""
+    if [[ -z "$health" ]]; then
+      telemetry_missing=1
+      break
+    fi
+    local available active jobs running retained cache_entries cache_payload
+    local cache_key_bytes cache_capacity isolates_created isolates_dropped isolates_active sessions
+    read -r available active jobs running retained cache_entries cache_payload \
+      cache_key_bytes cache_capacity isolates_created isolates_dropped isolates_active sessions <<<"$health"
+    printf '%s\n' "$rss" >>"$rss_file"
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+      "$i" "$rss" "$threads" "$descendant_count" "$available" "$active" \
+      "$jobs" "$running" "$retained" "$cache_entries" "$cache_payload" \
+      "$cache_key_bytes" "$cache_capacity" "$isolates_created" "$isolates_dropped" \
+      "$isolates_active" "$sessions" >>"$samples_file"
+    if [[ "$available" != "$base_available" || "$active" != "$base_active" || \
+          "$jobs" != "$base_jobs" || "$running" != "$base_running" || \
+          "$retained" != "$base_retained" || "$descendant_count" != 0 ]]; then
+      failed=1
+      printf "    ${RED}ownership did not return to baseline at request %s${NC}\n" "$i"
+      break
+    fi
+    if (( jobs > 1024 || retained > 268435456 )); then
+      failed=1
+      printf "    ${RED}job ownership exceeded process caps at request %s${NC}\n" "$i"
+      break
+    fi
+    if (( cache_entries > 4096 )); then
+      failed=1
+      printf "    ${RED}cache entry cap exceeded at request %s${NC}\n" "$i"
+      break
+    fi
+    if (( cache_payload > 33554432 )); then
+      failed=1
+      printf "    ${RED}cache payload cap exceeded at request %s${NC}\n" "$i"
+      break
+    fi
+    if [[ "$cache_entries" != "$base_cache_entries" || \
+          "$cache_payload" != "$base_cache_payload" || \
+          "$cache_key_bytes" != "$base_cache_key_bytes" || \
+          "$cache_capacity" != "$base_cache_capacity" ]]; then
+      failed=1
+      printf "    ${RED}cache ownership changed after warmup at request %s${NC}\n" "$i"
+      break
+    fi
+    if (( isolates_active != base_isolates_active || \
+          isolates_created - isolates_dropped != base_isolates_created - base_isolates_dropped )); then
+      failed=1
+      printf "    ${RED}isolate ownership did not return to baseline at request %s${NC}\n" "$i"
+      break
+    fi
+    if (( sessions != base_sessions )); then
+      failed=1
+      printf "    ${RED}session ownership changed from %s to %s at request %s${NC}\n" \
+        "$base_sessions" "$sessions" "$i"
+      break
+    fi
+  done
+
+  if [[ "$telemetry_missing" -eq 1 ]]; then
+    plateau_fail "required daemon ownership telemetry disappeared during sampling" \
+      "daemon plateau telemetry"
+    stop_daemon
+    stop_plateau_fixture
+    rm -rf "$work_dir"
+    return 1
+  fi
+
+  local final_threads slope
+  final_threads=$(daemon_thread_count)
+  slope=$(python3 - "$rss_file" <<'PY'
+import pathlib, sys
+values = [float(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if line]
+values = values[-100:]
+if len(values) < 2:
+    print(0.0)
+else:
+    xs = list(range(len(values)))
+    xbar = sum(xs) / len(xs)
+    ybar = sum(values) / len(values)
+    denom = sum((x - xbar) ** 2 for x in xs)
+    print(sum((x - xbar) * (y - ybar) for x, y in zip(xs, values)) / denom)
+PY
+  )
+  if ! python3 -c 'import sys; raise SystemExit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)' "$slope" "$slope_limit"; then
+    failed=1
+    printf "    ${RED}continuing RSS slope %.2f KiB/request exceeds %s${NC}\n" "$slope" "$slope_limit"
+  fi
+  if (( final_threads > base_threads + 2 )); then
+    failed=1
+    printf "    ${RED}thread count grew from %s to %s${NC}\n" "$base_threads" "$final_threads"
+  fi
+
+  if [[ "$failed" -eq 0 ]]; then
+    printf "    ${GREEN}PASS${NC}: cache, isolate, session, job, and capture ownership returned to baseline; RSS slope %.2f KiB/request\n" "$slope"
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILED_TESTS+=("daemon local Tier-2 plateau")
+    printf "    samples retained for diagnosis: %s\n" "$samples_file"
+  fi
+
+  stop_daemon
+  stop_plateau_fixture
+  [[ "$failed" -eq 0 ]] && rm -rf "$work_dir"
 }
 
 daemon_scrape() {
@@ -624,6 +951,8 @@ elif [[ "$RUN_HARD" == true ]]; then
   hardmode_tests
 elif [[ "$RUN_DAEMON" == true ]]; then
   daemon_tests
+elif [[ "$RUN_PLATEAU" == true ]]; then
+  plateau_tests
 elif [[ "$RUN_QUICK" == true ]]; then
   banner "QUICK MODE — Representative subset"
   run_test "example.com" "https://example.com" "Example Domain"
@@ -644,7 +973,7 @@ fi
 echo ""
 printf "${CYAN}══════════════════════════════════════════════════════════════${NC}\n"
 if [[ "$FAIL" -eq 0 ]]; then
-  printf "  ${GREEN}✓${NC} All %s tests passed!\n" "$PASS"
+  printf "  ${GREEN}✓${NC} All %s tests passed! (%s skipped)\n" "$PASS" "$SKIP"
 else
   printf "  ${RED}✗${NC} %s tests failed, %s passed\n" "$FAIL" "$PASS"
   echo ""

@@ -449,7 +449,9 @@ pub(crate) mod prod {
         fn fetch<'a>(
             &'a self,
             url: &'a str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + 'a>> {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<draco_runtime::SharedSource>> + 'a>,
+        > {
             Box::pin(async move {
                 // Code chunks carry content-hashed filenames, so a URL is an
                 // immutable key: serve from cache when present (this is what makes a
@@ -459,8 +461,8 @@ pub(crate) mod prod {
                 }
                 match draco_net::fetch_target(url, &self.opts).await {
                     Ok(resp) if (200..300).contains(&resp.meta.status) => {
-                        let bytes = resp.body.to_vec();
-                        self.cache.put(url, &bytes);
+                        let bytes: draco_runtime::SharedSource = resp.body.to_vec().into();
+                        self.cache.put(url, std::sync::Arc::clone(&bytes));
                         Some(bytes)
                     }
                     // 403 → bot-wall, 404 → moved/renamed chunk, others verbatim:
@@ -683,6 +685,36 @@ pub(crate) mod prod {
 
         /// No warm children to retire; kept for daemon API compatibility.
         pub fn shutdown(&self) {}
+
+        async fn run_blocking<T, F>(&self, job: F) -> Result<T, DracoError>
+        where
+            T: Send + 'static,
+            F: FnOnce() -> T + Send + 'static,
+        {
+            let permit =
+                self.permits.clone().acquire_owned().await.map_err(|e| {
+                    jail_error(JailKind::Spawn, format!("pool semaphore closed: {e}"))
+                })?;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                job()
+            })
+            .await
+            .map_err(|e| {
+                jail_error(
+                    JailKind::Spawn,
+                    format!("capture task panicked/cancelled: {e}"),
+                )
+            })
+        }
+
+        #[cfg(test)]
+        pub(super) async fn run_blocking_for_test<F>(&self, job: F) -> Result<(), DracoError>
+        where
+            F: FnOnce() + Send + 'static,
+        {
+            self.run_blocking(job).await
+        }
     }
 
     #[async_trait]
@@ -695,16 +727,11 @@ pub(crate) mod prod {
             opts: &draco_net::SessionOpts,
             mode: CaptureMode,
         ) -> Result<CaptureResult, DracoError> {
-            // Cap concurrent isolates. The permit is held for the whole capture and
-            // released on drop. The semaphore is never closed, so `acquire_owned`
-            // only errors in impossible conditions — treat as a spawn error, don't
-            // panic.
-            let _permit =
-                self.permits.clone().acquire_owned().await.map_err(|e| {
-                    jail_error(JailKind::Spawn, format!("pool semaphore closed: {e}"))
-                })?;
-            ProdTier2Capture
-                .capture(url, html, config, opts, mode)
+            let url = url.to_owned();
+            let html = html.to_vec();
+            let config = config.clone();
+            let opts = opts.clone();
+            self.run_blocking(move || capture_blocking(&url, &html, &config, &opts, mode))
                 .await
         }
     }
@@ -758,6 +785,53 @@ mod tests {
     use crate::testutil::MockFetcher;
     use draco_types::InterceptVia;
     use serde_json::json;
+
+    #[cfg(feature = "tier2")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tier2_pool_abort_keeps_capacity_until_blocking_exit() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let pool = prod::Tier2Pool::new(1, 1, true, false);
+        let (first_entered_tx, first_entered_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let first_pool = pool.clone();
+        let first = tokio::spawn(async move {
+            first_pool
+                .run_blocking_for_test(move || {
+                    first_entered_tx.send(()).unwrap();
+                    release_first_rx.recv().unwrap();
+                })
+                .await
+        });
+
+        first_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first blocking closure entered");
+        first.abort();
+
+        let (second_entered_tx, second_entered_rx) = mpsc::channel();
+        let second_pool = pool.clone();
+        let second = tokio::spawn(async move {
+            second_pool
+                .run_blocking_for_test(move || {
+                    second_entered_tx.send(()).unwrap();
+                })
+                .await
+        });
+        assert!(
+            second_entered_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "aborting the waiter released pool capacity while its blocking closure was active"
+        );
+
+        release_first_tx.send(()).unwrap();
+        second_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second closure entered after first exited");
+        second.await.unwrap().unwrap();
+    }
 
     fn cand(url: &str, accept_json: bool, via: InterceptVia) -> Candidate {
         Candidate {

@@ -352,22 +352,36 @@
     try { return ops.op_resolve_url(base, String(u)); } catch (_) { return String(u); }
   }
   // Async: op_raze_fetch records the request (always) and, in Render mode, may
-  // fetch it live via draco-net and return the REAL {status,headers,body}. Awaits
-  // that op and parses its JSON; on any failure falls back to the synthetic stub.
+  // fetch it live via draco-net and return the REAL {status,headers,body}. The op
+  // crosses the V8 boundary as a structured serde value; on any failure, fall
+  // back to the synthetic stub.
   async function record(via, method, u, headers, bodyStr) {
     const req = { via, method: (method || "GET").toUpperCase(), url: absolutize(u), headers: headers || [], body: bodyStr == null ? null : String(bodyStr) };
-    let respJson;
-    try { respJson = await ops.op_raze_fetch(JSON.stringify(req)); } catch (_) { respJson = null; }
-    if (!respJson) return { status: 200, headers: [["content-type", "application/json"]], body: stubBody };
-    try { return JSON.parse(respJson); } catch (_) { return { status: 200, headers: [["content-type", "application/json"]], body: stubBody }; }
+    let response;
+    try { response = await ops.op_raze_fetch(JSON.stringify(req)); } catch (_) { response = null; }
+    if (!response || typeof response !== "object") return { status: 200, headers: [["content-type", "application/json"]], body: stubBody };
+    return response;
   }
   const HeadersCtor = g.Headers || class { constructor(i){ this._m = new Map(); for (const [k,v] of headersToPairs(i)) this._m.set(String(k).toLowerCase(), String(v)); } get(k){ const v=this._m.get(String(k).toLowerCase()); return v==null?null:v; } has(k){ return this._m.has(String(k).toLowerCase()); } forEach(cb){ this._m.forEach((v,k)=>cb(v,k,this)); } };
+  const responseBodyStates = new WeakMap();
+  function responseBodyState(receiver) {
+    const state = responseBodyStates.get(receiver);
+    if (!state) throw new TypeError("Illegal invocation");
+    return state;
+  }
+  function consumeResponseBody(receiver, convert) {
+    const state = responseBodyState(receiver);
+    if (state.used) throw new TypeError("body already consumed");
+    state.used = true;
+    const text = state.text;
+    state.text = null;
+    return convert(text);
+  }
   function makeResponse(stub, finalUrl) {
-    const status = (stub && stub.status) || 200;
+    const status = stub && typeof stub.status === "number" ? stub.status : 200;
+    const headerPairs = (stub && stub.headers) || [];
+    const headers = new HeadersCtor(headerPairs);
     const bodyText = stub && typeof stub.body === "string" ? stub.body : "{}";
-    const headers = new HeadersCtor((stub && stub.headers) || []);
-    let used = false;
-    const guard = () => { if (used) throw new TypeError("body already consumed"); used = true; };
     // Minimal ReadableStream stand-in for `response.body`. Streaming-fetch code
     // (`res.body.getReader().read()`, common in SvelteKit data loaders and
     // fetch-based SSE) throws `Cannot read properties of undefined (reading
@@ -387,16 +401,32 @@
       },
       cancel() { return Promise.resolve(); },
     });
-    return {
+    const response = {
       ok: status >= 200 && status < 300, status, statusText: status === 200 ? "OK" : "",
-      url: finalUrl, redirected: false, type: "basic", headers, bodyUsed: false,
+      url: finalUrl, redirected: false, type: "basic", headers,
+      get bodyUsed() { return responseBodyState(this).used; },
       body: emptyStreamBody(),
-      async text() { guard(); return bodyText; },
-      async json() { guard(); return JSON.parse(bodyText); },
-      async arrayBuffer() { guard(); return new TextEncoder().encode(bodyText).buffer; },
-      async blob() { guard(); return { size: bodyText.length, type: "", text: async () => bodyText }; },
-      clone() { return makeResponse(stub, finalUrl); },
+      async text() { return consumeResponseBody(this, (text) => text); },
+      async json() { return consumeResponseBody(this, (text) => JSON.parse(text)); },
+      async arrayBuffer() { return consumeResponseBody(this, (text) => new TextEncoder().encode(text).buffer); },
+      async blob() { return consumeResponseBody(this, (text) => ({ size: text.length, type: "", text: async () => text })); },
+      clone() {
+        const state = responseBodyState(this);
+        if (state.used) throw new TypeError("body already consumed");
+        return makeResponse(
+          { status: state.status, headers: state.headerPairs, body: state.text },
+          state.finalUrl,
+        );
+      },
     };
+    responseBodyStates.set(response, {
+      used: false,
+      text: bodyText,
+      status,
+      headerPairs,
+      finalUrl,
+    });
+    return response;
   }
   const doFetch = async function fetch(input, init) {
     init = init || {};
@@ -421,7 +451,7 @@
     _emit(t) { const ev = { type: t, target: this, currentTarget: this }; const d = this["on" + t]; if (typeof d === "function") { try { d.call(this, ev); } catch (_) {} } const a = this._l[t]; if (a) for (const fn of a.slice()) { try { fn.call(this, ev); } catch (_) {} } }
     open(m, u) { this._m = m || "GET"; this._u = u || ""; this.readyState = OPENED; this._emit("readystatechange"); }
     setRequestHeader(k, v) { this._h.push([String(k), String(v)]); }
-    getResponseHeader(k) { const kk = String(k).toLowerCase(); const hit = this._rh.find((p) => p[0].toLowerCase() === kk); return hit ? hit[1] : null; }
+    getResponseHeader(k) { const kk = String(k).toLowerCase(); const values = this._rh.filter((p) => p[0].toLowerCase() === kk).map((p) => p[1]); return values.length ? values.join(", ") : null; }
     getAllResponseHeaders() { return this._rh.map(([k, v]) => k + ": " + v).join("\r\n") + "\r\n"; }
     overrideMimeType() {}
     abort() { this._ab = true; this._emit("abort"); }
@@ -432,11 +462,19 @@
       // same observable ordering as the old queueMicrotask path.
       record("xhr", this._m, this._u, this._h, body == null ? null : bodyToString(body)).then((stub) => {
         if (this._ab) return;
-        this.status = (stub && stub.status) || 200; this.statusText = this.status === 200 ? "OK" : "";
+        this.status = stub && typeof stub.status === "number" ? stub.status : 200; this.statusText = this.status === 200 ? "OK" : "";
         this._rh = (stub && stub.headers) || [];
         const bt = stub && typeof stub.body === "string" ? stub.body : "{}";
         this.responseText = bt; this.responseURL = absolutize(this._u);
-        this.response = this.responseType === "json" ? (() => { try { return JSON.parse(bt); } catch (_) { return null; } })() : bt;
+        if (this.responseType === "json") {
+          this.response = (() => { try { return JSON.parse(bt); } catch (_) { return null; } })();
+        } else if (this.responseType === "arraybuffer") {
+          this.response = new TextEncoder().encode(bt).buffer;
+        } else if (this.responseType === "blob") {
+          this.response = { size: bt.length, type: "", text: async () => bt };
+        } else {
+          this.response = bt;
+        }
         this.readyState = DONE; this._emit("readystatechange"); this._emit("load"); this._emit("loadend");
       });
     }

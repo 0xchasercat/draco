@@ -20,9 +20,15 @@
 //! `Promise.all([import(), import()])` route nodes -> nested `import()` inside
 //! chunk top-level evaluation.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use draco_runtime::{run_capture, CaptureConfig};
+use draco_runtime::{run_capture, CaptureConfig, ScriptFetcher, SharedSource};
 
 mod common;
 use common::{fn_fetcher, map_fetcher};
@@ -45,6 +51,46 @@ fn res(pairs: &[(&str, &str)]) -> HashMap<String, Vec<u8>> {
 
 fn urls(report: &draco_runtime::CaptureReport) -> Vec<String> {
     report.requests.iter().map(|r| r.url.clone()).collect()
+}
+
+struct DelayedCountingFetcher {
+    resources: HashMap<String, SharedSource>,
+    counts: Rc<RefCell<HashMap<String, usize>>>,
+}
+
+struct CancellationFetcher;
+
+impl ScriptFetcher for CancellationFetcher {
+    fn fetch<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Option<SharedSource>> + 'a>> {
+        Box::pin(async move {
+            if url.ends_with("/slow.js") {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                return Some(SharedSource::from(&b"export const slow = true;"[..]));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            None
+        })
+    }
+}
+
+impl ScriptFetcher for DelayedCountingFetcher {
+    fn fetch<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Option<SharedSource>> + 'a>> {
+        *self.counts.borrow_mut().entry(url.to_string()).or_default() += 1;
+        let source = self.resources.get(url).map(Arc::clone);
+        let delayed = url.ends_with("/x.js");
+        Box::pin(async move {
+            if delayed {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            source
+        })
+    }
 }
 
 /// chaser.sh shape: inline module bootstrap statically imports the entry, whose
@@ -133,15 +179,20 @@ fetch("/api/from-lazy-a");"#,
 fn interleaved_classic_and_module_dynamic_imports_do_not_abort() {
     let html = r#"<!doctype html><html><body>
 <script>
-  Promise.all([import("/app/x.js"), import("/app/y.js")]).then(() => {});
+  Promise.all([import("/app/x.js"), import("/app/y.js")]).then(
+    () => fetch("/api/classic-imports-ok"),
+    () => fetch("/api/classic-imports-failed")
+  );
 </script>
 <script type="module">
-  import("/app/x.js");
-  import("/app/z.js");
+  Promise.all([import("/app/x.js"), import("/app/z.js")]).then(
+    () => fetch("/api/module-imports-ok"),
+    () => fetch("/api/module-imports-failed")
+  );
 </script>
 </body></html>"#;
 
-    let resources = res(&[
+    let resources: HashMap<String, SharedSource> = res(&[
         (
             "https://interleave.test/app/x.js",
             r#"import("/app/z.js"); fetch("/api/from-x");"#,
@@ -154,22 +205,71 @@ fn interleaved_classic_and_module_dynamic_imports_do_not_abort() {
             "https://interleave.test/app/z.js",
             r#"fetch("/api/from-z");"#,
         ),
-    ]);
+    ])
+    .into_iter()
+    .map(|(url, source)| (url, source.into()))
+    .collect();
+    let fetch_counts = Rc::new(RefCell::new(HashMap::<String, usize>::new()));
 
     let report = run_capture(
         "https://interleave.test/",
         html,
         &cfg(),
-        map_fetcher(resources),
+        Rc::new(DelayedCountingFetcher {
+            resources,
+            counts: Rc::clone(&fetch_counts),
+        }),
     );
     let got = urls(&report);
-    for want in ["/api/from-x", "/api/from-y", "/api/from-z"] {
+    for want in [
+        "/api/from-x",
+        "/api/from-y",
+        "/api/from-z",
+        "/api/classic-imports-ok",
+        "/api/module-imports-ok",
+    ] {
         assert!(
             got.iter().any(|u| u.contains(want)),
             "missing {want}; got {got:?}; logs: {:?}",
             report.logs
         );
     }
+    assert!(
+        !got.iter().any(|url| url.contains("imports-failed")),
+        "a concurrent import promise rejected: {got:?}"
+    );
+    assert_eq!(
+        fetch_counts
+            .borrow()
+            .get("https://interleave.test/app/x.js")
+            .copied(),
+        Some(1),
+        "shared module source should be fetched once"
+    );
+    assert!(
+        !report
+            .logs
+            .iter()
+            .any(|line| line.contains("module loader was asked to reload")
+                || line.contains("[raze.module] MISS")),
+        "concurrent import hit a loader error path: {:?}",
+        report.logs
+    );
+    let scripts_run = report
+        .logs
+        .iter()
+        .find(|line| line.starts_with("[raze.memory] phase=scripts-run "))
+        .expect("scripts-run memory sample");
+    assert!(scripts_run.contains("module_registry_bytes=0"));
+    let coalescer_settled = report
+        .logs
+        .iter()
+        .find(|line| line.starts_with("[raze.module-fetches] phase=settled "))
+        .expect("settled module-fetch coalescer telemetry");
+    assert!(
+        coalescer_settled.contains("entries=0") && coalescer_settled.contains("retained_bytes=0"),
+        "module fetch coalescer retained state after settle: {coalescer_settled}"
+    );
 }
 
 /// stake.com shape *without* a supervisor loader: a dynamically imported chunk
@@ -293,4 +393,152 @@ fn dynamic_import_of_unprefetched_chunk_uses_script_loader() {
             report.logs
         );
     }
+}
+
+#[test]
+fn duplicate_static_and_dynamic_imports_use_v8_module_map_without_refetch() {
+    let html = r#"<!doctype html><html><body>
+<script type="module">
+  import { a } from "/app/a.js";
+  import { b } from "/app/b.js";
+  Promise.all([import("/app/shared.js"), import("/app/shared.js")])
+    .then(([first, second]) => fetch(`/api/done?v=${a + b + first.value + second.value}`));
+</script>
+</body></html>"#;
+    let resources = Rc::new(res(&[
+        (
+            "https://dedup.test/app/a.js",
+            r#"import { value } from "/app/shared.js"; export const a = value;"#,
+        ),
+        (
+            "https://dedup.test/app/b.js",
+            r#"import { value } from "/app/shared.js"; export const b = value;"#,
+        ),
+        (
+            "https://dedup.test/app/shared.js",
+            "export const value = 3;",
+        ),
+    ]));
+    let fetch_counts = Rc::new(RefCell::new(HashMap::<String, usize>::new()));
+    let resources_for_fetch = Rc::clone(&resources);
+    let counts_for_fetch = Rc::clone(&fetch_counts);
+
+    let report = run_capture(
+        "https://dedup.test/",
+        html,
+        &cfg(),
+        fn_fetcher(move |url| {
+            *counts_for_fetch
+                .borrow_mut()
+                .entry(url.to_string())
+                .or_default() += 1;
+            resources_for_fetch.get(url).cloned()
+        }),
+    );
+
+    assert!(
+        urls(&report)
+            .iter()
+            .any(|url| url.contains("/api/done?v=12")),
+        "duplicate imports did not evaluate correctly: {:?}",
+        report.logs
+    );
+    assert_eq!(
+        fetch_counts
+            .borrow()
+            .get("https://dedup.test/app/shared.js")
+            .copied(),
+        Some(1),
+        "V8's module map should own duplicate imports after the first load"
+    );
+    let scripts_run = report
+        .logs
+        .iter()
+        .find(|line| line.starts_with("[raze.memory] phase=scripts-run "))
+        .expect("scripts-run memory sample");
+    assert!(
+        scripts_run.contains("module_registry_bytes=0"),
+        "raw module sources remained after V8 accepted them: {scripts_run}"
+    );
+}
+
+#[test]
+fn failed_module_graph_does_not_retain_raw_entry_source() {
+    let html = r#"<!doctype html><html><body>
+<script type="module" src="/app/bad-entry.js"></script>
+</body></html>"#;
+    let resources = res(&[(
+        "https://failed-load.test/app/bad-entry.js",
+        r#"import "/app/missing.js"; export const unreachable = true;"#,
+    )]);
+
+    let report = run_capture(
+        "https://failed-load.test/",
+        html,
+        &cfg(),
+        map_fetcher(resources),
+    );
+    assert!(
+        report
+            .logs
+            .iter()
+            .any(|line| line.contains("failed to load module")),
+        "fixture did not exercise a module load failure: {:?}",
+        report.logs
+    );
+    let scripts_run = report
+        .logs
+        .iter()
+        .find(|line| line.starts_with("[raze.memory] phase=scripts-run "))
+        .expect("scripts-run memory sample");
+    assert!(
+        scripts_run.contains("module_registry_bytes=0"),
+        "failed graph retained its raw entry source: {scripts_run}"
+    );
+}
+
+#[test]
+fn failed_graph_cancels_sibling_fetch_without_leaking_inflight_state() {
+    let html = r#"<!doctype html><html><body>
+<script type="module">
+  import "/app/missing.js";
+  import "/app/slow.js";
+</script>
+</body></html>"#;
+    let mut config = cfg();
+    config.capture_window_ms = 800;
+    config.quiesce_ms = 50;
+
+    let started = Instant::now();
+    let report = run_capture(
+        "https://cancel.test/",
+        html,
+        &config,
+        Rc::new(CancellationFetcher),
+    );
+
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "cancelled sibling pinned capture until the hard cap: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        report
+            .logs
+            .iter()
+            .any(|line| line.contains("failed to load module")),
+        "fixture did not fail its module graph: {:?}",
+        report.logs
+    );
+    let settled = report
+        .logs
+        .iter()
+        .find(|line| line.starts_with("[raze.module-fetches] phase=settled "))
+        .expect("settled coalescer telemetry");
+    assert!(
+        settled.contains("entries=0")
+            && settled.contains("retained_bytes=0")
+            && settled.contains("inflight=0"),
+        "cancelled module fetch leaked state: {settled}"
+    );
 }

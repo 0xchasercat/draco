@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+  <head><title>Tier 2 plateau fixture</title></head>
+  <body>
+    <main id="app"></main>
+    <script>
+      fetch("/plateau_data.json")
+        .then((response) => response.json())
+        .then((data) => {
+          document.getElementById("app").innerHTML =
+            "<article><h1>" + data.title + "</h1><p>" + data.body + "</p></article>";
+        });
+    </script>
+  </body>
+</html>

@@ -70,6 +70,52 @@ pub use machine::{clamp_tier_max, session_opts, ProdStatic, StaticEngine, TIER_C
 /// [`extract_with_pool`].
 pub use tier2::Tier2Pool;
 
+/// Process-global RAM chunk-cache ownership counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChunkCacheStats {
+    pub entries: usize,
+    pub payload_bytes: usize,
+    pub key_bytes: usize,
+    pub capacity: usize,
+}
+
+/// Process-lifetime V8 isolate lifecycle counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IsolateStats {
+    pub created: u64,
+    pub dropped: u64,
+    pub active: u64,
+}
+
+/// Snapshot the shared RAM chunk cache. Lean builds return a typed zero value.
+pub fn chunk_cache_stats() -> ChunkCacheStats {
+    #[cfg(feature = "tier2")]
+    {
+        chunk_cache::shared_stats()
+    }
+    #[cfg(not(feature = "tier2"))]
+    {
+        ChunkCacheStats::default()
+    }
+}
+
+/// Snapshot V8 isolate lifecycle ownership. Lean builds return typed zeros.
+pub fn isolate_stats() -> IsolateStats {
+    #[cfg(feature = "tier2")]
+    {
+        let stats = draco_runtime::isolate_stats();
+        IsolateStats {
+            created: stats.created,
+            dropped: stats.dropped,
+            active: stats.active,
+        }
+    }
+    #[cfg(not(feature = "tier2"))]
+    {
+        IsolateStats::default()
+    }
+}
+
 pub use ranking::{
     best_candidate, best_replayable, is_read_style_post, is_safe_method, score_request, Candidate,
     MIN_VIABLE_SCORE, PENALTY_ANALYTICS, PENALTY_STATIC_ASSET, SCORE_API_PATH, SCORE_JSON,
@@ -286,6 +332,27 @@ mod tests {
     fn timing_default_is_zeroed() {
         let t = Timing::default();
         assert_eq!(t.total_ms, 0);
+    }
+
+    #[test]
+    fn telemetry_snapshots_are_stable_and_bounded() {
+        let cache = chunk_cache_stats();
+        assert!(cache.entries <= 4096);
+        assert!(cache.payload_bytes <= 32 * 1024 * 1024);
+        assert!(cache.capacity >= cache.entries);
+
+        let isolates = isolate_stats();
+        assert_eq!(
+            isolates.active,
+            isolates.created.saturating_sub(isolates.dropped)
+        );
+    }
+
+    #[cfg(not(feature = "tier2"))]
+    #[test]
+    fn lean_build_telemetry_is_zero_without_v8() {
+        assert_eq!(chunk_cache_stats(), ChunkCacheStats::default());
+        assert_eq!(isolate_stats(), IsolateStats::default());
     }
 
     // The production `extract` path drives the real (stubbed) draco-net, which

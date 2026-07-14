@@ -211,7 +211,10 @@ pub fn detect_challenge(
     let tiny = body.len() < 2_048;
 
     if let Some(signature) = phrase {
-        if blocking || marker.is_some() || tiny {
+        if blocking
+            || tiny
+            || (marker.is_some() && runtime_challenge_dominates(Some(body.as_str())))
+        {
             return Some(marker.unwrap_or(signature.kind));
         }
     }
@@ -261,6 +264,21 @@ pub(crate) fn detect_network_challenge(url: &str) -> Option<ChallengeKind> {
     None
 }
 
+/// Whether runtime-only challenge telemetry represents the page rather than an
+/// embedded widget or background bot-management request. A missing DOM remains
+/// conservative; when serialization succeeded, substantial visible content is
+/// proof that the vendor request did not replace the page with a wall.
+pub(crate) fn runtime_challenge_dominates(rendered_html: Option<&str>) -> bool {
+    const MAX_WALL_CONTENT_CHARS: usize = 1_000;
+
+    let Some(html) = rendered_html else {
+        return true;
+    };
+    let rendered =
+        draco_static::content::scrape(html, "about:blank", 200, "text/html; charset=utf-8", false);
+    draco_static::content::is_thin_content(&rendered.markdown, MAX_WALL_CONTENT_CHARS)
+}
+
 /// Return a trace detail when hydration collapses below 20% of the shell's
 /// visible, non-whitespace character count.
 pub(crate) fn hydration_collapse_detail(
@@ -293,6 +311,19 @@ mod tests {
             detect_challenge(200, &[], body),
             Some(ChallengeKind::PerimeterX)
         );
+    }
+
+    #[test]
+    fn target_captcha_widget_does_not_override_content_rich_page() {
+        let body = format!(
+            "<html><body><main><h1>Homepage</h1>{}</main>\
+             <aside><p>Please verify you are a human</p><div id=\"px-captcha\"></div></aside>\
+             <script src=\"https://captcha.px-cdn.net/PXabc/captcha.js\"></script>\
+             </body></html>",
+            "<p>Real products, promotions, categories, and store information.</p>".repeat(40)
+        );
+
+        assert_eq!(detect_challenge(200, &[], &body), None);
     }
 
     #[test]
@@ -421,6 +452,21 @@ mod tests {
             detect_network_challenge("https://example.com/api/products"),
             None
         );
+    }
+
+    #[test]
+    fn runtime_network_signal_requires_a_content_poor_render() {
+        let rich = format!(
+            "<html><body><main><h1>Store homepage</h1>{}</main>\
+             <iframe src=\"https://captcha.example/challenge\"></iframe></body></html>",
+            "<p>Real products, promotions, categories, and store information.</p>".repeat(40)
+        );
+        let wall = "<html><body><h1>Pardon the interruption</h1>\
+                    <p>Press and hold to confirm you are a human.</p></body></html>";
+
+        assert!(!runtime_challenge_dominates(Some(&rich)));
+        assert!(runtime_challenge_dominates(Some(wall)));
+        assert!(runtime_challenge_dominates(None));
     }
 
     #[test]
