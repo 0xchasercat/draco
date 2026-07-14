@@ -8,7 +8,9 @@
 
 #![cfg(test)]
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -27,6 +29,7 @@ use draco_types::RuntimeOutcome;
 /// (or was not) exercised.
 pub struct MockFetcher {
     fetch_result: Result<HtmlResponse, DracoError>,
+    fetch_sequence: Mutex<VecDeque<Result<HtmlResponse, DracoError>>>,
     replay_result: Result<HtmlResponse, DracoError>,
     fetch_calls: AtomicUsize,
     replay_calls: AtomicUsize,
@@ -39,6 +42,7 @@ impl MockFetcher {
     pub fn ok_html(status: u16, body: &str) -> Self {
         Self {
             fetch_result: Ok(html_response(status, body.as_bytes(), &[])),
+            fetch_sequence: Mutex::new(VecDeque::new()),
             replay_result: Ok(html_response(404, b"", &[])),
             fetch_calls: AtomicUsize::new(0),
             replay_calls: AtomicUsize::new(0),
@@ -50,6 +54,19 @@ impl MockFetcher {
         if let Ok(resp) = &mut self.fetch_result {
             resp.meta.headers.push((k.to_string(), v.to_string()));
         }
+        self
+    }
+
+    /// Queue a second fetch response, then repeat that response if the caller
+    /// fetches again. This models a transient first response without changing
+    /// the behavior of existing single-response tests.
+    pub fn then_html(mut self, status: u16, body: &str) -> Self {
+        let next = Ok(html_response(status, body.as_bytes(), &[]));
+        self.fetch_sequence
+            .get_mut()
+            .unwrap()
+            .extend([self.fetch_result.clone(), next.clone()]);
+        self.fetch_result = next;
         self
     }
 
@@ -82,6 +99,9 @@ impl MockFetcher {
 impl PageFetcher for MockFetcher {
     async fn fetch(&self, _url: &str, _opts: &SessionOpts) -> Result<HtmlResponse, DracoError> {
         self.fetch_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(result) = self.fetch_sequence.lock().unwrap().pop_front() {
+            return result;
+        }
         self.fetch_result.clone()
     }
 
@@ -99,6 +119,7 @@ impl PageFetcher for MockFetcher {
 pub fn err_fetcher(e: DracoError) -> MockFetcher {
     MockFetcher {
         fetch_result: Err(e),
+        fetch_sequence: Mutex::new(VecDeque::new()),
         replay_result: Ok(html_response(404, b"", &[])),
         fetch_calls: AtomicUsize::new(0),
         replay_calls: AtomicUsize::new(0),
@@ -110,6 +131,7 @@ pub fn err_fetcher(e: DracoError) -> MockFetcher {
 pub fn err_replay_fetcher(e: DracoError) -> MockFetcher {
     MockFetcher {
         fetch_result: Ok(html_response(200, b"", &[])),
+        fetch_sequence: Mutex::new(VecDeque::new()),
         replay_result: Err(e),
         fetch_calls: AtomicUsize::new(0),
         replay_calls: AtomicUsize::new(0),

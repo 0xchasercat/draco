@@ -6,7 +6,7 @@
 //!     │         │         │         └─ (Slice 4) V8 intercept + ranked replay
 //!     │         │         └─ Next.js build-id `_next/data` replay
 //!     │         └─ static embedded state (__NEXT_DATA__, JSON-LD, __NUXT__)
-//!     └─ single Tier-0 GET; challenge short-circuit runs on this response
+//!     └─ Tier-0 GET; a transient 403 challenge gets one cooldown retry
 //! ```
 //!
 //! Each transition appends a [`TraceStep`] and folds its wall time into the
@@ -26,7 +26,7 @@
 //! sequencing, challenge short-circuit, `tier_max` clamp, trace/timing
 //! assembly — with no network and no live extractor.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use draco_net::SessionOpts;
 use draco_static::content::ScrapeResult;
@@ -65,6 +65,10 @@ const THIN_CONTENT_CHARS: usize = 200;
 /// result was itself content-poor. Above this bar, the proven static extraction
 /// is retained instead of letting a worse happy-dom render erase it.
 const CHALLENGE_FALLBACK_CONTENT_CHARS: usize = 1_000;
+/// Cool down before the single lightweight retry of a challenged 403. Stake's
+/// edge rate limit clears after roughly 1–2 seconds; retrying immediately just
+/// repeats the wall and needlessly boots a browser.
+const CHALLENGE_RETRY_DELAY: Duration = Duration::from_millis(1_500);
 
 /// Clamp a caller-supplied `tier_max` into the implemented range `0..=2`.
 ///
@@ -374,7 +378,7 @@ where
 
     // ---- Fetch ---------------------------------------------------------
     let fetch_started = Instant::now();
-    let resp = match fetcher.fetch(url, &opts).await {
+    let mut resp = match fetcher.fetch(url, &opts).await {
         Ok(resp) => {
             let elapsed = fetch_started.elapsed().as_millis() as u64;
             // Prefer the network layer's own measured elapsed if present.
@@ -407,10 +411,74 @@ where
         }
     };
 
-    let body = String::from_utf8_lossy(&resp.body).into_owned();
+    let mut body = String::from_utf8_lossy(&resp.body).into_owned();
 
     // ---- Challenge short-circuit (spec §3) -----------------------------
-    if let Some(kind) = detect_challenge(resp.meta.status, &resp.meta.headers, &body) {
+    let mut challenge = detect_challenge(resp.meta.status, &resp.meta.headers, &body);
+    // WAF-backed sites can return one transient 403 and accept the next request
+    // from the same cookie-bearing session. One lightweight retry is far cheaper
+    // than booting Chromium; a second challenge still escalates exactly as before.
+    // Keep this scoped to 403: draco-net already retries 429/503, and 200
+    // interstitials are deliberate challenge documents rather than status noise.
+    if let Some(first_kind) = challenge {
+        if resp.meta.status == 403 {
+            let retry_started = Instant::now();
+            tokio::time::sleep(CHALLENGE_RETRY_DELAY).await;
+            match fetcher.fetch(url, &opts).await {
+                Ok(retry_resp) => {
+                    let net_ms = retry_started.elapsed().as_millis() as u64;
+                    let retry_body = String::from_utf8_lossy(&retry_resp.body).into_owned();
+                    let retry_challenge = detect_challenge(
+                        retry_resp.meta.status,
+                        &retry_resp.meta.headers,
+                        &retry_body,
+                    );
+                    let cleared =
+                        (200..400).contains(&retry_resp.meta.status) && retry_challenge.is_none();
+                    challenge = if cleared {
+                        None
+                    } else {
+                        retry_challenge.or(Some(first_kind))
+                    };
+                    run.record(
+                        SourceTier::Static,
+                        "net.challenge_retry",
+                        if challenge.is_some() {
+                            StepOutcome::Missed
+                        } else {
+                            StepOutcome::Matched
+                        },
+                        net_ms,
+                        Bucket::Network,
+                        Some(format!(
+                            "{} {} ({} {})",
+                            retry_resp.meta.status,
+                            retry_resp.meta.final_url,
+                            if challenge.is_some() {
+                                "still"
+                            } else {
+                                "cleared"
+                            },
+                            challenge.unwrap_or(first_kind).as_str(),
+                        )),
+                    );
+                    resp = retry_resp;
+                    body = retry_body;
+                }
+                Err(error) => {
+                    run.record(
+                        SourceTier::Static,
+                        "net.challenge_retry",
+                        StepOutcome::Failed,
+                        retry_started.elapsed().as_millis() as u64,
+                        Bucket::Network,
+                        Some(error_summary(&error)),
+                    );
+                }
+            }
+        }
+    }
+    if let Some(kind) = challenge {
         run.record(
             SourceTier::Static,
             "core.challenge",
@@ -1694,6 +1762,100 @@ mod tests {
         let actions: Vec<&str> = r.trace.iter().map(|t| t.action.as_str()).collect();
         assert_eq!(actions, vec!["net.fetch", "core.challenge"]);
         assert_eq!(r.trace[1].detail.as_deref(), Some("cloudflare"));
+        assert_eq!(
+            fetcher.fetch_calls(),
+            1,
+            "non-403 challenges are not retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_403_challenge_retries_before_browser_escalation() {
+        let challenge = r#"<html><head><title>Just a moment...</title></head>
+            <body>cloudflare challenge-platform cf_chl_opt</body></html>"#;
+        let fetcher = MockFetcher::ok_html(403, challenge)
+            .with_header("server", "cloudflare")
+            .then_html(200, "<html><body>normal application content</body></html>");
+
+        let r = run_ladder(
+            "https://x.com/p",
+            &cfg(2),
+            &fetcher,
+            &MockStatic::hit_next_data(),
+            &noop_capture(),
+        )
+        .await;
+
+        assert_eq!(r.status, Status::Success);
+        assert_eq!(r.source_tier, Some(SourceTier::Static));
+        assert_eq!(fetcher.fetch_calls(), 2);
+        let retry = r
+            .trace
+            .iter()
+            .find(|step| step.action == "net.challenge_retry")
+            .expect("lightweight challenge retry trace");
+        assert_eq!(retry.outcome, StepOutcome::Matched);
+        assert_eq!(
+            retry.detail.as_deref(),
+            Some("200 https://x.com/ (cleared cloudflare)")
+        );
+        assert!(r.trace.iter().all(|step| step.action != "core.challenge"));
+    }
+
+    #[tokio::test]
+    async fn persistent_403_challenge_retries_once_then_needs_browser() {
+        let challenge = r#"<html><head><title>Just a moment...</title></head>
+            <body>cloudflare challenge-platform cf_chl_opt</body></html>"#;
+        let fetcher = MockFetcher::ok_html(403, challenge).with_header("server", "cloudflare");
+
+        let r = run_ladder(
+            "https://x.com/p",
+            &cfg(2),
+            &fetcher,
+            &MockStatic::hit_next_data(),
+            &noop_capture(),
+        )
+        .await;
+
+        assert_eq!(r.status, Status::NeedsBrowser);
+        assert_eq!(fetcher.fetch_calls(), 2, "challenge retry must be bounded");
+        let actions: Vec<&str> = r.trace.iter().map(|step| step.action.as_str()).collect();
+        assert_eq!(
+            actions,
+            vec!["net.fetch", "net.challenge_retry", "core.challenge"]
+        );
+        assert_eq!(r.trace[1].outcome, StepOutcome::Missed);
+        assert_eq!(
+            r.trace[1].detail.as_deref(),
+            Some("403 https://x.com/ (still cloudflare)")
+        );
+    }
+
+    #[tokio::test]
+    async fn challenge_retry_requires_a_non_error_response_to_clear() {
+        let challenge = r#"<html><head><title>Just a moment...</title></head>
+            <body>cloudflare challenge-platform cf_chl_opt</body></html>"#;
+        let fetcher = MockFetcher::ok_html(403, challenge)
+            .with_header("server", "cloudflare")
+            .then_html(500, "<html><body>generic origin error</body></html>");
+
+        let r = run_ladder(
+            "https://x.com/p",
+            &cfg(2),
+            &fetcher,
+            &MockStatic::hit_next_data(),
+            &noop_capture(),
+        )
+        .await;
+
+        assert_eq!(r.status, Status::NeedsBrowser);
+        assert_eq!(fetcher.fetch_calls(), 2);
+        assert_eq!(r.trace[1].action, "net.challenge_retry");
+        assert_eq!(r.trace[1].outcome, StepOutcome::Missed);
+        assert_eq!(
+            r.trace[1].detail.as_deref(),
+            Some("500 https://x.com/ (still cloudflare)")
+        );
     }
 
     #[tokio::test]
