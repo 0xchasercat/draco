@@ -1,0 +1,67 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create (for example, v0.19.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.asset }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: namespace-profile-draco-macos-arm64
+            asset: draco-macos-arm64.tar.gz
+          - runs-on: namespace-profile-draco-linux-x86-64
+            asset: draco-linux-x86-64.tar.gz
+          - runs-on: namespace-profile-draco-linux-arm64
+            asset: draco-linux-arm64.tar.gz
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked --release --package draco-cli
+      - name: Package
+        run: tar -C target/release -czf "${{ runner.temp }}/${{ matrix.asset }}" draco
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ runner.temp }}/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: namespace-profile-draco-linux-x86-64
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: draco-*
+          merge-multiple: true
+          path: dist
+      - name: Generate checksums
+        run: cd dist && sha256sum draco-*.tar.gz > SHA256SUMS
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/draco-*.tar.gz
+            dist/SHA256SUMS
