@@ -10,14 +10,8 @@ pub(crate) async fn maybe_escalate(
     if result.status != draco_types::Status::NeedsBrowser {
         return result;
     }
-    // The open-core local path intentionally uses the user's own IP. A caller
-    // that explicitly selected a proxy keeps the original terminal result;
-    // proxy-bound browser routing belongs to the separate cloud gateway.
-    if config.proxy.is_some() {
-        return result;
-    }
 
-    match draco_heavy::mint_local(url).await {
+    match draco_heavy::mint_local_with_proxy(url, config.proxy.as_deref()).await {
         Ok(heavy) => heavy,
         Err(error) => {
             result.trace.push(draco_types::TraceStep {

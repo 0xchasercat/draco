@@ -3,6 +3,16 @@
 All notable changes to Draco are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer.
 
+## Unreleased
+
+### Added
+- **Proxy-aware local browser fallback.** Regular `draco` CLI and `draco serve`
+  builds with the default `heavy-local` feature now carry HTTP(S), SOCKS5, and
+  SOCKS5H proxy settings into Chromium when the extraction ladder reaches its
+  built-in browser. Authenticated SOCKS5 uses a short-lived loopback relay so
+  credentials never appear in Chromium's command line; a failed local browser
+  attempt still returns `needs_browser` for an upstream gateway to escalate.
+
 ## [0.19.0] — 2026-07-12
 
 ### Added

@@ -995,11 +995,14 @@ dependencies = [
  "draco-static",
  "draco-types",
  "futures",
+ "percent-encoding",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-socks",
  "tower",
+ "url",
 ]
 
 [[package]]

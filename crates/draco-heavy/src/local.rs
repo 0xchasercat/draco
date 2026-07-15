@@ -40,6 +40,7 @@ pub enum LocalMintError {
     NoBrowser,
     NoSupportedLaunchMode,
     WallNotCleared(Vec<AttemptFailure>),
+    Proxy(String),
 }
 
 impl std::fmt::Display for LocalMintError {
@@ -59,6 +60,7 @@ impl std::fmt::Display for LocalMintError {
                 }
                 Ok(())
             }
+            Self::Proxy(detail) => write!(formatter, "browser proxy setup failed: {detail}"),
         }
     }
 }
@@ -68,8 +70,26 @@ impl std::error::Error for LocalMintError {}
 /// Resolve the cached host/browser configuration once and use the portable
 /// default driver. CLI and serve callers share this in-process fast path.
 pub async fn mint_local(url: &str) -> Result<ExtractionResult, LocalMintError> {
+    mint_local_with_proxy(url, None).await
+}
+
+/// Run the portable local browser fallback through the same proxy as the cheap
+/// extraction tiers. Authenticated SOCKS5 URLs are adapted through a loopback
+/// relay because Chromium does not accept SOCKS credentials in `--proxy-server`.
+pub async fn mint_local_with_proxy(
+    url: &str,
+    proxy: Option<&str>,
+) -> Result<ExtractionResult, LocalMintError> {
     let host = LOCAL_HOST.get_or_init(|| resolve(&default_cache_path(), DEFAULT_CACHE_TTL, false));
-    let driver = crate::browser::CommandBrowserDriver::default();
+    let driver = match proxy {
+        Some(proxy) => {
+            let prepared = crate::proxy::PreparedBrowserProxy::prepare(proxy)
+                .await
+                .map_err(LocalMintError::Proxy)?;
+            crate::browser::CommandBrowserDriver::proxied(prepared)
+        }
+        None => crate::browser::CommandBrowserDriver::default(),
+    };
     mint_local_with(&driver, &host.config, &LocalMintConfig::default(), url).await
 }
 

@@ -3,6 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use chaser_oxide::auth::Credentials;
 use chaser_oxide::cdp::browser_protocol::browser::{
     Bounds, GetWindowForTargetParams, SetWindowBoundsParams, WindowState,
 };
@@ -11,6 +12,7 @@ use chaser_oxide::{Browser, BrowserConfig, ChaserPage};
 use futures::StreamExt;
 
 use crate::discovery::DetectedBrowser;
+use crate::proxy::PreparedBrowserProxy;
 
 pub type DriverFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type CleanupFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
@@ -114,14 +116,25 @@ pub trait BrowserSession: Send {
 /// It relies on chaser-oxide's protocol-level execution behavior and installs
 /// only tell-removal. It deliberately never applies ChaserProfile or native
 /// profile scripts because those fabricate OS, plugin, and WebGL identity.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CommandBrowserDriver {
     timeout: Duration,
+    proxy: Option<PreparedBrowserProxy>,
 }
 
 impl CommandBrowserDriver {
     pub fn new(timeout: Duration) -> Self {
-        Self { timeout }
+        Self {
+            timeout,
+            proxy: None,
+        }
+    }
+
+    pub(crate) fn proxied(proxy: PreparedBrowserProxy) -> Self {
+        Self {
+            timeout: Duration::from_secs(45),
+            proxy: Some(proxy),
+        }
     }
 }
 
@@ -145,12 +158,26 @@ impl BrowserDriver for CommandBrowserDriver {
             is_landscape: true,
             has_touch: false,
         };
-        let builder = BrowserConfig::builder()
+        let mut builder = BrowserConfig::builder()
             .chrome_executable(&browser.path)
             .window_size(VIEWPORT_WIDTH, VIEWPORT_HEIGHT)
             .viewport(viewport)
             .launch_timeout(self.timeout)
             .request_timeout(self.timeout);
+        if std::env::var_os("DRACO_BROWSER_NO_SANDBOX").is_some() {
+            builder = builder.no_sandbox();
+        }
+        let credentials = self.proxy.as_ref().and_then(|proxy| {
+            proxy.credentials().map(|(username, password)| Credentials {
+                username: username.to_owned(),
+                password: password.to_owned(),
+            })
+        });
+        if let Some(proxy) = &self.proxy {
+            builder = builder
+                .arg(format!("--proxy-server={}", proxy.server()))
+                .arg("--disable-quic");
+        }
         let builder = match mode {
             LaunchMode::HeadlessNew => builder.new_headless_mode(),
             LaunchMode::HeadedMinimized | LaunchMode::Headed => builder.with_head(),
@@ -160,6 +187,7 @@ impl BrowserDriver for CommandBrowserDriver {
             config: Some(config),
             mode,
             timeout: self.timeout,
+            credentials,
         }))
     }
 }
@@ -168,6 +196,7 @@ struct ChaserSession {
     config: Option<BrowserConfig>,
     mode: LaunchMode,
     timeout: Duration,
+    credentials: Option<Credentials>,
 }
 
 impl BrowserSession for ChaserSession {
@@ -181,7 +210,15 @@ impl BrowserSession for ChaserSession {
                 .config
                 .take()
                 .ok_or_else(|| BrowserError::Drive("browser session already consumed".into()))?;
-            drive_once(config, self.mode, url, wait_strategy, self.timeout).await
+            drive_once(
+                config,
+                self.mode,
+                url,
+                wait_strategy,
+                self.timeout,
+                self.credentials.as_ref(),
+            )
+            .await
         })
     }
 }
@@ -357,6 +394,7 @@ async fn drive_once(
     url: &str,
     wait_strategy: &WaitStrategy,
     total_timeout: Duration,
+    credentials: Option<&Credentials>,
 ) -> Result<DriveOutput, BrowserError> {
     let started = tokio::time::Instant::now();
     // BrowserConfig carries the same bounded launch timeout. Await it directly so
@@ -373,12 +411,15 @@ async fn drive_once(
     });
 
     let remaining = remaining_request_budget(total_timeout, started.elapsed());
-    let completion =
-        match tokio::time::timeout(remaining, drive_page(&browser, mode, url, wait_strategy)).await
-        {
-            Ok(result) => DriveCompletion::Completed(result),
-            Err(_) => DriveCompletion::TimedOut,
-        };
+    let completion = match tokio::time::timeout(
+        remaining,
+        drive_page(&browser, mode, url, wait_strategy, credentials),
+    )
+    .await
+    {
+        Ok(result) => DriveCompletion::Completed(result),
+        Err(_) => DriveCompletion::TimedOut,
+    };
     finalize_drive(&mut browser, handler_task, completion, CLEANUP_STEP_TIMEOUT).await
 }
 
@@ -387,11 +428,17 @@ async fn drive_page(
     mode: LaunchMode,
     url: &str,
     wait_strategy: &WaitStrategy,
+    credentials: Option<&Credentials>,
 ) -> Result<DriveOutput, BrowserError> {
     let page = browser
         .new_page("about:blank")
         .await
         .map_err(|error| BrowserError::Drive(error.to_string()))?;
+    if let Some(credentials) = credentials {
+        page.authenticate(credentials.clone())
+            .await
+            .map_err(|error| BrowserError::Drive(error.to_string()))?;
+    }
     install_minimal_tell_removal(&page).await?;
     if mode == LaunchMode::HeadedMinimized {
         minimize_window(browser, &page).await?;
