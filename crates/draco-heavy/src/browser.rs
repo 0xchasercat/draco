@@ -18,6 +18,29 @@ pub type DriverFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type CleanupFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
 const VIEWPORT_WIDTH: u32 = 1365;
+#[cfg(any(target_os = "linux", test))]
+fn linux_status_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|uids| uids.split_whitespace().next())
+        .and_then(|uid| uid.parse().ok())
+}
+
+fn should_disable_sandbox() -> bool {
+    if std::env::var_os("DRACO_BROWSER_NO_SANDBOX").is_some() {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| linux_status_uid(&status))
+            .is_some_and(|uid| uid == 0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
+}
 const VIEWPORT_HEIGHT: u32 = 768;
 const CLEANUP_STEP_TIMEOUT: Duration = Duration::from_secs(2);
 const MINIMAL_TELL_REMOVAL: &str = r#"
@@ -164,7 +187,7 @@ impl BrowserDriver for CommandBrowserDriver {
             .viewport(viewport)
             .launch_timeout(self.timeout)
             .request_timeout(self.timeout);
-        if std::env::var_os("DRACO_BROWSER_NO_SANDBOX").is_some() {
+        if should_disable_sandbox() {
             builder = builder.no_sandbox();
         }
         let credentials = self.proxy.as_ref().and_then(|proxy| {
@@ -649,6 +672,19 @@ mod tests {
             html: "<html></html>".to_string(),
             cookies: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn linux_status_uid_uses_the_real_uid() {
+        assert_eq!(
+            linux_status_uid("Name:\tdraco\nUid:\t0\t1000\t1000\t1000\n"),
+            Some(0)
+        );
+        assert_eq!(
+            linux_status_uid("Name:\tdraco\nUid:\t1001\t1001\t1001\t1001\n"),
+            Some(1001)
+        );
+        assert_eq!(linux_status_uid("Name:\tdraco\nUid:\tnot-a-number\n"), None);
     }
 
     #[test]

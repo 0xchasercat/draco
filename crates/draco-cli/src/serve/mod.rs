@@ -34,11 +34,12 @@
 //! node; `GET /health` reports `availableSlots` for proactive avoidance.
 
 use std::sync::Arc;
+use std::time::Instant;
 
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{middleware, Json, Router};
 use draco_core::{extract_with_pool, Config, FormatSet, Tier2Pool};
 use draco_types::{DracoError, ExtractionResult, Status};
 use serde::Deserialize;
@@ -50,6 +51,8 @@ use tokio::sync::{oneshot, Semaphore};
 pub(crate) mod batch;
 /// `POST /v1/crawl` + `GET|DELETE /v1/crawl/{id}` — async whole-site crawl jobs.
 pub(crate) mod crawl;
+/// Bounded in-memory request diagnostics exposed to the protected fleet admin.
+pub(crate) mod diagnostics;
 /// `POST /v1/discover` — JSON/XHR API endpoint discovery + winner replay.
 pub(crate) mod discover;
 /// Resumable V8 sessions + `POST /v1/interact` REST surface.
@@ -191,7 +194,8 @@ fn router(state: Arc<AppState>) -> Router {
             get(batch::status_handler).delete(batch::cancel_handler),
         )
         .route("/v1/batch/scrape/{id}/errors", get(batch::errors_handler))
-        .route("/mcp", post(crate::mcp::http_handler));
+        .route("/mcp", post(crate::mcp::http_handler))
+        .route("/admin/logs", get(diagnostics::logs_handler));
     #[cfg(feature = "tier2")]
     let router = router
         .route("/v1/interact", post(interact::open_handler))
@@ -206,7 +210,9 @@ fn router(state: Arc<AppState>) -> Router {
             "/v1/interact/{id}",
             axum::routing::delete(interact::close_handler),
         );
-    router.with_state(state)
+    router
+        .layer(middleware::from_fn(diagnostics::access_log))
+        .with_state(state)
 }
 
 async fn shutdown_signal() {
@@ -338,8 +344,10 @@ struct ScrapeRequest {
 
 async fn scrape(
     State(state): State<Arc<AppState>>,
+    Extension(request_id): Extension<diagnostics::RequestId>,
     Json(req): Json<ScrapeRequest>,
 ) -> (StatusCode, Json<Value>) {
+    let started = Instant::now();
     let formats = match parse_formats(&req.formats) {
         Ok(f) => f,
         Err(rej) => {
@@ -407,6 +415,13 @@ async fn scrape(
     let result = extract_with_pool(&req.url, &config, &state.tier2_pool).await;
     let result = crate::heavy_local::maybe_escalate(&req.url, &config, result).await;
     let (code, body) = to_firecrawl(&result);
+    diagnostics::record_scrape(
+        request_id,
+        &req.url,
+        &result,
+        code,
+        started.elapsed().as_millis(),
+    );
     (code, Json(body))
 }
 
@@ -1097,6 +1112,48 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp).await;
         assert_eq!(body["success"], false);
+    }
+
+    #[tokio::test]
+    async fn request_diagnostics_are_available_from_admin_endpoint() {
+        let app = router(test_state(Config::default()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/scrape")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "url": "https://example.com", "formats": ["bogus"] }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let request_id = response
+            .headers()
+            .get("x-draco-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let logs = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/logs?limit=50")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(logs).await;
+        assert!(body["logs"].as_array().unwrap().iter().any(|entry| {
+            entry["id"] == request_id && entry["path"] == "/v1/scrape" && entry["status"] == 400
+        }));
     }
 
     #[tokio::test]
