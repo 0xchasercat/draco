@@ -80,12 +80,16 @@ pub(crate) async fn access_log(mut request: Request, next: Next) -> Response {
 pub(crate) fn record_scrape(
     request_id: RequestId,
     url: &str,
+    proxy: Option<&str>,
     result: &ExtractionResult,
     status: StatusCode,
     duration_ms: u128,
 ) {
     let target_host = url::Url::parse(url)
         .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_owned));
+    let proxy_host = proxy
+        .and_then(|value| url::Url::parse(value).ok())
         .and_then(|parsed| parsed.host_str().map(str::to_owned));
     let trace: Vec<Value> = result
         .trace
@@ -109,6 +113,7 @@ pub(crate) fn record_scrape(
         "status": status.as_u16(),
         "durationMs": duration_ms,
         "targetHost": target_host,
+        "proxyHost": proxy_host,
         "outcome": result.status,
         "tier": result.source_tier,
         "error": (result.status != Status::Success)

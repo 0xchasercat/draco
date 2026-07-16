@@ -418,6 +418,7 @@ async fn scrape(
     diagnostics::record_scrape(
         request_id,
         &req.url,
+        config.proxy.as_deref(),
         &result,
         code,
         started.elapsed().as_millis(),

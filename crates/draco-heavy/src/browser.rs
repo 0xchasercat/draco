@@ -18,6 +18,8 @@ use crate::discovery::DetectedBrowser;
 use crate::proxy::PreparedBrowserProxy;
 
 pub type DriverFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+type LaunchFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Box<dyn BrowserSession>, BrowserError>> + Send + 'a>>;
 #[cfg(test)]
 type CleanupFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
@@ -122,11 +124,7 @@ impl std::fmt::Display for BrowserError {
 impl std::error::Error for BrowserError {}
 
 pub trait BrowserDriver: Send + Sync {
-    fn launch(
-        &self,
-        browser: &DetectedBrowser,
-        mode: LaunchMode,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn BrowserSession>, BrowserError>> + Send + '_>>;
+    fn launch(&self, browser: &DetectedBrowser, mode: LaunchMode) -> LaunchFuture<'_>;
 }
 
 pub trait BrowserSession: Send {
@@ -171,12 +169,7 @@ impl Default for CommandBrowserDriver {
 }
 
 impl BrowserDriver for CommandBrowserDriver {
-    fn launch(
-        &self,
-        browser: &DetectedBrowser,
-        mode: LaunchMode,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn BrowserSession>, BrowserError>> + Send + '_>>
-    {
+    fn launch(&self, browser: &DetectedBrowser, mode: LaunchMode) -> LaunchFuture<'_> {
         let executable = browser.path.clone();
         Box::pin(async move {
             let mut args: Vec<String> = Vec::new();

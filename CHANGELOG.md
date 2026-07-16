@@ -13,9 +13,10 @@ All notable changes to Draco are documented here. Format loosely follows
   credentials never appear in Chromium's command line; a failed local browser
   attempt still returns `needs_browser` for an upstream gateway to escalate.
 - **Fleet-visible daemon diagnostics.** `draco serve` now writes structured,
-  credential-redacted access and scrape failure records to stderr/journald and
-  retains a bounded 500-entry buffer at `GET /admin/logs` for the protected
-  fleet-admin control plane.
+  credential-redacted access and scrape failure records to stderr/journald,
+  records the selected proxy hostname without credentials, and retains a
+  bounded 500-entry buffer at `GET /admin/logs` for the protected fleet-admin
+  control plane.
 - **Root-safe local Chromium launch.** Linux browser fallback now disables the
   Chromium sandbox automatically when Draco runs as UID 0; explicit
   `DRACO_BROWSER_NO_SANDBOX` remains available for service configurations.
