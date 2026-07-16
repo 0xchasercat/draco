@@ -7,8 +7,8 @@ use chaser_oxide::auth::Credentials;
 use chaser_oxide::cdp::browser_protocol::browser::{
     Bounds, GetWindowForTargetParams, SetWindowBoundsParams, WindowState,
 };
-use chaser_oxide::handler::HandlerConfig;
 use chaser_oxide::handler::viewport::Viewport;
+use chaser_oxide::handler::HandlerConfig;
 use chaser_oxide::{Browser, ChaserPage};
 use futures::StreamExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -175,7 +175,8 @@ impl BrowserDriver for CommandBrowserDriver {
         &self,
         browser: &DetectedBrowser,
         mode: LaunchMode,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn BrowserSession>, BrowserError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn BrowserSession>, BrowserError>> + Send + '_>>
+    {
         let executable = browser.path.clone();
         Box::pin(async move {
             let mut args: Vec<String> = Vec::new();
@@ -281,7 +282,13 @@ impl BrowserSession for ChaserSession {
             let remaining = remaining_request_budget(self.timeout, Duration::ZERO);
             let completion = match tokio::time::timeout(
                 remaining,
-                drive_page(&self.browser, self.mode, url, wait_strategy, self.credentials.as_ref()),
+                drive_page(
+                    &self.browser,
+                    self.mode,
+                    url,
+                    wait_strategy,
+                    self.credentials.as_ref(),
+                ),
             )
             .await
             {

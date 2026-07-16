@@ -208,9 +208,8 @@ mod tests {
             mode: LaunchMode,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<
-                        Output = Result<Box<dyn BrowserSession>, BrowserError>,
-                    > + Send
+                dyn std::future::Future<Output = Result<Box<dyn BrowserSession>, BrowserError>>
+                    + Send
                     + '_,
             >,
         > {
