@@ -7,14 +7,18 @@ use chaser_oxide::auth::Credentials;
 use chaser_oxide::cdp::browser_protocol::browser::{
     Bounds, GetWindowForTargetParams, SetWindowBoundsParams, WindowState,
 };
+use chaser_oxide::handler::HandlerConfig;
 use chaser_oxide::handler::viewport::Viewport;
-use chaser_oxide::{Browser, BrowserConfig, ChaserPage};
+use chaser_oxide::{Browser, ChaserPage};
 use futures::StreamExt;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 
 use crate::discovery::DetectedBrowser;
 use crate::proxy::PreparedBrowserProxy;
 
 pub type DriverFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+#[cfg(test)]
 type CleanupFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
 const VIEWPORT_WIDTH: u32 = 1365;
@@ -42,7 +46,6 @@ fn should_disable_sandbox() -> bool {
     false
 }
 const VIEWPORT_HEIGHT: u32 = 768;
-const CLEANUP_STEP_TIMEOUT: Duration = Duration::from_secs(2);
 const MINIMAL_TELL_REMOVAL: &str = r#"
 (() => {
   const proto = Object.getPrototypeOf(navigator);
@@ -123,7 +126,7 @@ pub trait BrowserDriver: Send + Sync {
         &self,
         browser: &DetectedBrowser,
         mode: LaunchMode,
-    ) -> Result<Box<dyn BrowserSession>, BrowserError>;
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn BrowserSession>, BrowserError>> + Send + '_>>;
 }
 
 pub trait BrowserSession: Send {
@@ -172,51 +175,97 @@ impl BrowserDriver for CommandBrowserDriver {
         &self,
         browser: &DetectedBrowser,
         mode: LaunchMode,
-    ) -> Result<Box<dyn BrowserSession>, BrowserError> {
-        let viewport = Viewport {
-            width: VIEWPORT_WIDTH,
-            height: VIEWPORT_HEIGHT,
-            device_scale_factor: None,
-            emulating_mobile: false,
-            is_landscape: true,
-            has_touch: false,
-        };
-        let mut builder = BrowserConfig::builder()
-            .chrome_executable(&browser.path)
-            .window_size(VIEWPORT_WIDTH, VIEWPORT_HEIGHT)
-            .viewport(viewport)
-            .launch_timeout(self.timeout)
-            .request_timeout(self.timeout);
-        if should_disable_sandbox() {
-            builder = builder.no_sandbox();
-        }
-        let credentials = self.proxy.as_ref().and_then(|proxy| {
-            proxy.credentials().map(|(username, password)| Credentials {
-                username: username.to_owned(),
-                password: password.to_owned(),
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn BrowserSession>, BrowserError>> + Send + '_>> {
+        let executable = browser.path.clone();
+        Box::pin(async move {
+            let mut args: Vec<String> = Vec::new();
+            if should_disable_sandbox() {
+                args.push("--no-sandbox".into());
+                args.push("--disable-setuid-sandbox".into());
+            }
+            args.push(match mode {
+                LaunchMode::HeadlessNew => "--headless=new".into(),
+                LaunchMode::HeadedMinimized | LaunchMode::Headed => "--headless".into(),
+            });
+            args.push("--remote-debugging-port=0".into());
+            args.push("--no-first-run".into());
+            if let Some(proxy) = &self.proxy {
+                args.push(format!("--proxy-server={}", proxy.server()));
+            }
+            args.push("about:blank".into());
+
+            let credentials = self.proxy.as_ref().and_then(|proxy| {
+                proxy.credentials().map(|(username, password)| Credentials {
+                    username: username.to_owned(),
+                    password: password.to_owned(),
+                })
+            });
+
+            let mut child = Command::new(&executable)
+                .args(&args)
+                .stderr(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|error| BrowserError::Launch(error.to_string()))?;
+
+            let stderr = child.stderr.take().expect("stderr piped");
+            let mut lines = BufReader::new(stderr).lines();
+            let ws_url = tokio::time::timeout(self.timeout, async {
+                while let Some(line) = lines.next_line().await.transpose() {
+                    let line = line.map_err(|e| BrowserError::Launch(e.to_string()))?;
+                    if let Some(ws) = line.rsplit_once("listening on ").map(|(_, ws)| ws) {
+                        if ws.starts_with("ws") && ws.contains("devtools/browser") {
+                            return Ok(ws.trim().to_string());
+                        }
+                    }
+                }
+                Err(BrowserError::Launch(
+                    "browser exited before WebSocket URL appeared".into(),
+                ))
             })
-        });
-        if let Some(proxy) = &self.proxy {
-            builder = builder
-                .arg(format!("--proxy-server={}", proxy.server()))
-                .arg("--disable-quic");
-        }
-        let builder = match mode {
-            LaunchMode::HeadlessNew => builder.new_headless_mode(),
-            LaunchMode::HeadedMinimized | LaunchMode::Headed => builder.with_head(),
-        };
-        let config = builder.build().map_err(BrowserError::Launch)?;
-        Ok(Box::new(ChaserSession {
-            config: Some(config),
-            mode,
-            timeout: self.timeout,
-            credentials,
-        }))
+            .await
+            .map_err(|_| BrowserError::Launch("launch timeout".into()))??;
+
+            let (browser, mut handler) = Browser::connect_with_config(
+                &ws_url,
+                HandlerConfig {
+                    viewport: Some(Viewport {
+                        width: VIEWPORT_WIDTH,
+                        height: VIEWPORT_HEIGHT,
+                        device_scale_factor: None,
+                        emulating_mobile: false,
+                        is_landscape: true,
+                        has_touch: false,
+                    }),
+                    ..HandlerConfig::default()
+                },
+            )
+            .await
+            .map_err(|error| BrowserError::Launch(error.to_string()))?;
+
+            let handler_task = tokio::spawn(async move {
+                while let Some(event) = handler.next().await {
+                    if event.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            Ok(Box::new(ChaserSession {
+                browser,
+                handler_task: Some(handler_task),
+                mode,
+                timeout: self.timeout,
+                credentials,
+            }) as Box<dyn BrowserSession>)
+        })
     }
 }
 
 struct ChaserSession {
-    config: Option<BrowserConfig>,
+    browser: Browser,
+    handler_task: Option<tokio::task::JoinHandle<()>>,
     mode: LaunchMode,
     timeout: Duration,
     credentials: Option<Credentials>,
@@ -229,29 +278,41 @@ impl BrowserSession for ChaserSession {
         wait_strategy: &'a WaitStrategy,
     ) -> DriverFuture<'a, Result<DriveOutput, BrowserError>> {
         Box::pin(async move {
-            let config = self
-                .config
-                .take()
-                .ok_or_else(|| BrowserError::Drive("browser session already consumed".into()))?;
-            drive_once(
-                config,
-                self.mode,
-                url,
-                wait_strategy,
-                self.timeout,
-                self.credentials.as_ref(),
+            let remaining = remaining_request_budget(self.timeout, Duration::ZERO);
+            let completion = match tokio::time::timeout(
+                remaining,
+                drive_page(&self.browser, self.mode, url, wait_strategy, self.credentials.as_ref()),
             )
             .await
+            {
+                Ok(result) => DriveCompletion::Completed(result),
+                Err(_) => DriveCompletion::TimedOut,
+            };
+            if let Some(task) = self.handler_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            match completion {
+                DriveCompletion::Completed(result) => result,
+                DriveCompletion::TimedOut => Err(BrowserError::Timeout),
+            }
         })
     }
 }
 
+enum DriveCompletion {
+    Completed(Result<DriveOutput, BrowserError>),
+    TimedOut,
+}
+
+#[cfg(test)]
 trait BrowserProcess {
     fn close_process(&mut self) -> CleanupFuture<'_>;
     fn kill_process(&mut self) -> CleanupFuture<'_>;
     fn wait_process(&mut self) -> CleanupFuture<'_>;
 }
 
+#[cfg(test)]
 impl BrowserProcess for Browser {
     fn close_process(&mut self) -> CleanupFuture<'_> {
         Box::pin(async move {
@@ -281,17 +342,14 @@ impl BrowserProcess for Browser {
     }
 }
 
-enum DriveCompletion {
-    Completed(Result<DriveOutput, BrowserError>),
-    TimedOut,
-}
-
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CleanupIssue {
     Error { step: &'static str, detail: String },
     Timeout { step: &'static str },
 }
 
+#[cfg(test)]
 impl std::fmt::Display for CleanupIssue {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -301,12 +359,14 @@ impl std::fmt::Display for CleanupIssue {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CleanupFailure {
     graceful_issues: Vec<CleanupIssue>,
     forced_issues: Vec<CleanupIssue>,
 }
 
+#[cfg(test)]
 impl std::fmt::Display for CleanupFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut first = true;
@@ -326,6 +386,7 @@ impl std::fmt::Display for CleanupFailure {
     }
 }
 
+#[cfg(test)]
 async fn cleanup_step(
     step: &'static str,
     step_timeout: Duration,
@@ -338,6 +399,7 @@ async fn cleanup_step(
     }
 }
 
+#[cfg(test)]
 async fn cleanup_browser<B: BrowserProcess>(
     browser: &mut B,
     force: bool,
@@ -373,6 +435,7 @@ async fn cleanup_browser<B: BrowserProcess>(
     }
 }
 
+#[cfg(test)]
 async fn finalize_drive<B: BrowserProcess>(
     browser: &mut B,
     handler_task: tokio::task::JoinHandle<()>,
@@ -409,41 +472,6 @@ async fn finalize_drive<B: BrowserProcess>(
 
 fn remaining_request_budget(total: Duration, elapsed: Duration) -> Duration {
     total.saturating_sub(elapsed)
-}
-
-async fn drive_once(
-    config: BrowserConfig,
-    mode: LaunchMode,
-    url: &str,
-    wait_strategy: &WaitStrategy,
-    total_timeout: Duration,
-    credentials: Option<&Credentials>,
-) -> Result<DriveOutput, BrowserError> {
-    let started = tokio::time::Instant::now();
-    // BrowserConfig carries the same bounded launch timeout. Await it directly so
-    // a successful launch always hands Browser ownership back for explicit cleanup.
-    let (mut browser, mut handler) = Browser::launch(config)
-        .await
-        .map_err(|error| BrowserError::Launch(error.to_string()))?;
-    let handler_task = tokio::spawn(async move {
-        while let Some(event) = handler.next().await {
-            if event.is_err() {
-                break;
-            }
-        }
-    });
-
-    let remaining = remaining_request_budget(total_timeout, started.elapsed());
-    let completion = match tokio::time::timeout(
-        remaining,
-        drive_page(&browser, mode, url, wait_strategy, credentials),
-    )
-    .await
-    {
-        Ok(result) => DriveCompletion::Completed(result),
-        Err(_) => DriveCompletion::TimedOut,
-    };
-    finalize_drive(&mut browser, handler_task, completion, CLEANUP_STEP_TIMEOUT).await
 }
 
 async fn drive_page(

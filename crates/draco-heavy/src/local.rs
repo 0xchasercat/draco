@@ -109,7 +109,7 @@ pub async fn mint_local_with<D: BrowserDriver + ?Sized>(
 
     let mut attempts = Vec::new();
     for mode in modes {
-        let mut session = match driver.launch(browser, mode) {
+        let mut session = match driver.launch(browser, mode).await {
             Ok(session) => session,
             Err(error) => {
                 attempts.push(failed_attempt(mode, error));
@@ -206,9 +206,16 @@ mod tests {
             &self,
             _browser: &DetectedBrowser,
             mode: LaunchMode,
-        ) -> Result<Box<dyn BrowserSession>, BrowserError> {
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Box<dyn BrowserSession>, BrowserError>,
+                    > + Send
+                    + '_,
+            >,
+        > {
             self.seen.lock().unwrap().push(mode);
-            Ok(Box::new(FakeSession { mode }))
+            Box::pin(async move { Ok(Box::new(FakeSession { mode }) as Box<dyn BrowserSession>) })
         }
     }
 
